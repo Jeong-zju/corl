@@ -31,23 +31,10 @@ def create_h_shape_grid(
     ys = np.linspace(ymin, ymax, rows)
     X, Y = np.meshgrid(xs, ys)
 
-    left_inner = (
-        (X > -hw + wt)
-        & (X < -hw + bt - wt)
-        & (Y > -hh + wt)
-        & (Y < hh - wt)
-    )
-    right_inner = (
-        (X > hw - bt + wt)
-        & (X < hw - wt)
-        & (Y > -hh + wt)
-        & (Y < hh - wt)
-    )
+    left_inner = (X > -hw + wt) & (X < -hw + bt - wt) & (Y > -hh + wt) & (Y < hh - wt)
+    right_inner = (X > hw - bt + wt) & (X < hw - wt) & (Y > -hh + wt) & (Y < hh - wt)
     mid_inner = (
-        (X > -hw + bt - wt)
-        & (X < hw - bt + wt)
-        & (Y > -mh + wt)
-        & (Y < mh - wt)
+        (X > -hw + bt - wt) & (X < hw - bt + wt) & (Y > -mh + wt) & (Y < mh - wt)
     )
 
     free = left_inner | right_inner | mid_inner
@@ -164,14 +151,10 @@ def make_base_image(grid, image_hw):
     return np.stack([gray, gray, gray], axis=-1)
 
 
-def render_frame(base_img, extent, agent_pos, goal_pos, start_pos):
+def render_frame(base_img, extent, agent_pos):
     frame = base_img.copy()
     h, w = frame.shape[:2]
-    goal_px = world_to_pixel(goal_pos, extent, (h, w))
-    start_px = world_to_pixel(start_pos, extent, (h, w))
     agent_px = world_to_pixel(agent_pos, extent, (h, w))
-    draw_disk(frame, goal_px, max(2, int(min(h, w) * 0.03)), (70, 220, 80))
-    draw_disk(frame, start_px, max(2, int(min(h, w) * 0.02)), (80, 130, 255))
     draw_disk(frame, agent_px, max(2, int(min(h, w) * 0.025)), (240, 70, 70))
     return frame
 
@@ -250,19 +233,20 @@ def resolve_policy_dir(policy_path: Path) -> Path:
 
 
 def build_eval_observation(
-    state_xy_goal,
+    state_xy,
     rgb_frame,
     state_key,
     image_key,
     state_dim,
 ):
     state_vec = np.zeros((state_dim,), dtype=np.float32)
-    copy_n = min(4, state_dim)
-    state_vec[:copy_n] = np.asarray(state_xy_goal[:copy_n], dtype=np.float32)
+    copy_n = min(2, state_dim)
+    state_vec[:copy_n] = np.asarray(state_xy[:copy_n], dtype=np.float32)
 
     obs = {
         state_key: torch.from_numpy(state_vec),
-        image_key: torch.from_numpy(rgb_frame).permute(2, 0, 1).contiguous().float() / 255.0,
+        image_key: torch.from_numpy(rgb_frame).permute(2, 0, 1).contiguous().float()
+        / 255.0,
     }
     return obs
 
@@ -274,7 +258,12 @@ def build_args():
             "Start/goal selection matches dataset generation exactly."
         )
     )
-    parser.add_argument("--policy-path", type=Path, required=True, help="Checkpoint dir or pretrained_model dir.")
+    parser.add_argument(
+        "--policy-path",
+        type=Path,
+        required=True,
+        help="Checkpoint dir or pretrained_model dir.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -318,6 +307,7 @@ def main():
     # Load through policy class so config parsing is done via PreTrainedConfig choice registry.
     policy = ACTPolicy.from_pretrained(policy_dir)
     cfg = policy.config
+    # cfg.temporal_ensemble_coeff = 1.0
     cfg.device = args.device
     policy.eval()
     policy.to(args.device)
@@ -333,7 +323,9 @@ def main():
     )
 
     if len(cfg.image_features) == 0:
-        raise RuntimeError("ACT policy has no image input feature; this eval script assumes visual input.")
+        raise RuntimeError(
+            "ACT policy has no image input feature; this eval script assumes visual input."
+        )
     image_key = list(cfg.image_features.keys())[0]
     image_shape = tuple(cfg.image_features[image_key].shape)  # (C, H, W)
     image_hw = (int(image_shape[1]), int(image_shape[2]))
@@ -353,7 +345,7 @@ def main():
     for ep_idx in range(args.num_rollouts):
         # Keep start/goal selection identical to data generation script:
         # even episode -> upper-left to upper-right, odd episode -> lower-left to lower-right.
-        use_upper = (ep_idx % 2 == 0)
+        use_upper = ep_idx % 2 == 0
         if use_upper:
             start = corners["upper_left"]
             goal = corners["upper_right"]
@@ -370,12 +362,12 @@ def main():
 
         trajectory = [agent]
         for step in range(args.max_steps):
-            frame = render_frame(base_img, extent, agent, goal, start)
+            frame = render_frame(base_img, extent, agent)
             writer.stdin.write(frame.astype(np.uint8).tobytes())
 
-            obs_values = [agent[0], agent[1], goal[0], goal[1]]
+            obs_values = [agent[0], agent[1]]
             obs = build_eval_observation(
-                state_xy_goal=obs_values,
+                state_xy=obs_values,
                 rgb_frame=frame,
                 state_key=state_key,
                 image_key=image_key,
@@ -415,14 +407,16 @@ def main():
 
             episode_reward += reward
             if done:
-                final_frame = render_frame(base_img, extent, agent, goal, start)
+                final_frame = render_frame(base_img, extent, agent)
                 writer.stdin.write(final_frame.astype(np.uint8).tobytes())
                 break
 
         writer.stdin.close()
         code = writer.wait()
         if code != 0:
-            raise RuntimeError(f"ffmpeg failed on rollout {ep_idx} with exit code {code}")
+            raise RuntimeError(
+                f"ffmpeg failed on rollout {ep_idx} with exit code {code}"
+            )
 
         if success:
             success_count += 1
@@ -458,11 +452,15 @@ def main():
         "results": results,
     }
     summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     print(f"\nSaved {args.num_rollouts} rollout videos to: {output_dir}")
     print(f"Summary: {summary_path}")
-    print(f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})")
+    print(
+        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})"
+    )
 
 
 if __name__ == "__main__":

@@ -37,6 +37,15 @@ def build_args():
         help="Root folder for training outputs.",
     )
     parser.add_argument("--job-name", type=str, default="act_rrt_connect_h")
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit Weights & Biases run name. "
+            "Defaults to '<job-name>_s<seed>_<timestamp>'."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -149,6 +158,14 @@ def main():
     output_dir = (args.output_root / run_stamp).resolve()
 
     wandb_enable = (not args.disable_wandb) and (args.wandb_mode != "disabled")
+    resolved_job_name = args.job_name
+    if wandb_enable:
+        resolved_job_name = (
+            args.wandb_run_name
+            if args.wandb_run_name
+            else f"{args.job_name}_s{args.seed}_{run_stamp}"
+        )
+
     if wandb_enable and args.wandb_mode == "online":
         if "WANDB_API_KEY" not in os.environ:
             print(
@@ -179,7 +196,7 @@ def main():
         dataset=dataset_cfg,
         policy=policy_cfg,
         output_dir=output_dir,
-        job_name=args.job_name,
+        job_name=resolved_job_name,
         seed=args.seed,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
@@ -195,6 +212,7 @@ def main():
     print(f"- dataset_repo_id: {args.dataset_repo_id}")
     print(f"- output_dir: {output_dir}")
     print(f"- device: {args.device}")
+    print(f"- job_name: {resolved_job_name}")
     print(f"- steps: {args.steps}")
     print(f"- batch_size: {args.batch_size}")
     print(f"- use_imagenet_stats: {use_imagenet_stats}")

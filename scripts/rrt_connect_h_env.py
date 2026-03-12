@@ -276,19 +276,13 @@ def draw_disk(img, center, radius, color):
     img[mask] = np.array(color, dtype=np.uint8)
 
 
-def render_frame(base_img, extent, agent_pos, goal_pos, start_pos):
+def render_frame(base_img, extent, agent_pos):
     frame = base_img.copy()
     h, w = frame.shape[:2]
-    r_goal = max(2, int(min(h, w) * 0.03))
     r_agent = max(2, int(min(h, w) * 0.025))
-    r_start = max(2, int(min(h, w) * 0.02))
 
-    goal_px = world_to_pixel(goal_pos, extent, (h, w))
-    start_px = world_to_pixel(start_pos, extent, (h, w))
     agent_px = world_to_pixel(agent_pos, extent, (h, w))
 
-    draw_disk(frame, goal_px, r_goal, (70, 220, 80))
-    draw_disk(frame, start_px, r_start, (80, 130, 255))
     draw_disk(frame, agent_px, r_agent, (240, 70, 70))
 
     return frame
@@ -496,7 +490,8 @@ def generate_lerobot_v30_dataset(
             ts = frame_idx / fps
             nxt = trajectory[min(frame_idx + 1, ep_len - 1)]
             act = [float(nxt[0] - pos[0]), float(nxt[1] - pos[1])]
-            obs = [float(pos[0]), float(pos[1]), float(goal[0]), float(goal[1])]
+            # Do not expose goal as privileged state; policy should infer from visual observation.
+            obs = [float(pos[0]), float(pos[1])]
             dist_to_goal = distance(pos, goal)
             done = frame_idx == ep_len - 1
             success = done and (dist_to_goal < 0.2)
@@ -513,7 +508,7 @@ def generate_lerobot_v30_dataset(
             records["next.done"].append(bool(done))
             records["next.success"].append(bool(success))
 
-            frame = render_frame(base_img, extent, pos, goal, start)
+            frame = render_frame(base_img, extent, pos)
             ffmpeg_proc.stdin.write(frame.astype(np.uint8).tobytes())
 
             global_index += 1
@@ -556,7 +551,7 @@ def generate_lerobot_v30_dataset(
 
     data_table = pa.Table.from_arrays(
         [
-            fixed_size_list(state_arr, 4),
+            fixed_size_list(state_arr, 2),
             fixed_size_list(action_arr, 2),
             pa.array(records["next.reward"], type=pa.float32()),
             pa.array(records["next.done"], type=pa.bool_()),
@@ -648,8 +643,8 @@ def generate_lerobot_v30_dataset(
         "features": {
             "observation.state": {
                 "dtype": "float32",
-                "shape": [4],
-                "names": ["agent_x", "agent_y", "goal_x", "goal_y"],
+                "shape": [2],
+                "names": ["agent_x", "agent_y"],
             },
             "action": {
                 "dtype": "float32",
