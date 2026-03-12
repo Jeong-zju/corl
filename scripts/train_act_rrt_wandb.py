@@ -57,7 +57,7 @@ def build_args():
     )
     parser.add_argument("--device", type=str, default="cuda", help="cuda / cpu / mps")
     parser.add_argument(
-        "--chunk-size", type=int, default=30, help="ACT action chunk size."
+        "--chunk-size", type=int, default=5, help="ACT action chunk size."
     )
     parser.add_argument(
         "--disable-imagenet-stats",
