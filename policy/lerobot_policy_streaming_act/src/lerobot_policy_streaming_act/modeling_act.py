@@ -293,6 +293,21 @@ class StreamingACT(nn.Module):
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
+        self.use_path_signature = config.use_path_signature
+
+        if self.use_path_signature:
+            assert config.signature_dim > 0, (
+                "`signature_dim` must be > 0 when `use_path_signature=True` so that "
+                "`self.signature_proj` can be initialized."
+            )
+            self.signature_proj = nn.Sequential(
+                nn.Linear(config.signature_dim, config.signature_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.signature_dropout),
+                nn.Linear(config.signature_hidden_dim, config.dim_model),
+            )
+        else:
+            self.signature_proj = None
 
         if self.config.use_vae:
             self.vae_encoder = StreamingACTEncoder(config, is_vae_encoder=True)
@@ -401,6 +416,33 @@ class StreamingACT(nn.Module):
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
+        if self.use_path_signature:
+            path_signature_key = "observation.path_signature"
+            assert path_signature_key in batch, (
+                f"`{path_signature_key}` is required when `use_path_signature=True`."
+            )
+            path_signature = batch[path_signature_key]
+            assert path_signature.ndim == 2, (
+                f"`{path_signature_key}` must have shape (batch_size, signature_dim). "
+                f"Got ndim={path_signature.ndim}, shape={tuple(path_signature.shape)}."
+            )
+            assert path_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{path_signature_key}`: expected {batch_size}, "
+                f"got {path_signature.shape[0]}."
+            )
+            assert path_signature.shape[1] == self.config.signature_dim, (
+                f"`{path_signature_key}` second dim must be `signature_dim={self.config.signature_dim}`. "
+                f"Got {path_signature.shape[1]}."
+            )
+
+            path_signature = path_signature.to(dtype=self.signature_proj[0].weight.dtype)
+            signature_embed = self.signature_proj(path_signature)
+            assert signature_embed.shape == (batch_size, self.config.dim_model), (
+                f"`signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(signature_embed.shape)}."
+            )
+            signature_embed = signature_embed.unsqueeze(1)  # (B, 1, D)
+
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
@@ -489,6 +531,23 @@ class StreamingACT(nn.Module):
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+
+        if self.use_path_signature:
+            signature_token = signature_embed.transpose(0, 1).to(
+                device=encoder_out.device, dtype=encoder_out.dtype
+            )  # (1, B, D)
+            signature_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            encoder_out = torch.cat([signature_token, encoder_out], dim=0)
+            encoder_in_pos_embed = torch.cat([signature_pos_embed, encoder_in_pos_embed], dim=0)
+            assert encoder_out.shape[0] == encoder_in_pos_embed.shape[0], (
+                "Encoder token length and positional embedding length must match after "
+                "signature token injection."
+            )
+
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),

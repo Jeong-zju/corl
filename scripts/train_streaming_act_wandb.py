@@ -60,6 +60,44 @@ def build_args():
         "--chunk-size", type=int, default=5, help="ACT action chunk size."
     )
     parser.add_argument(
+        "--disable-path-signature",
+        action="store_true",
+        help="Disable path-signature token injection in StreamingACT.",
+    )
+    parser.add_argument(
+        "--history-length",
+        type=int,
+        default=10,
+        help="History window size used by path-signature settings in config.",
+    )
+    parser.add_argument(
+        "--signature-dim",
+        type=int,
+        default=0,
+        help=(
+            "Path-signature feature dim. "
+            "Set 0 to auto-read from meta/info.json -> features['observation.path_signature'].shape[0]."
+        ),
+    )
+    parser.add_argument(
+        "--signature-depth",
+        type=int,
+        default=3,
+        help="Path-signature truncation depth.",
+    )
+    parser.add_argument(
+        "--signature-hidden-dim",
+        type=int,
+        default=512,
+        help="Hidden dim of signature projection MLP.",
+    )
+    parser.add_argument(
+        "--signature-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout of signature projection MLP.",
+    )
+    parser.add_argument(
         "--disable-imagenet-stats",
         action="store_true",
         help="Disable replacing visual stats with ImageNet stats.",
@@ -100,7 +138,7 @@ def patch_lerobot_act_factory(streaming_policy_cls, streaming_config_cls):
     original_get_policy_class = policy_factory.get_policy_class
 
     def get_policy_class_with_streaming_act(name: str):
-        if name == "streaming_act":
+        if name in {"act", "streaming_act"}:
             return streaming_policy_cls
         return original_get_policy_class(name)
 
@@ -155,6 +193,43 @@ def resolve_use_imagenet_stats(
     return True
 
 
+def resolve_signature_dim(
+    dataset_root: Path,
+    use_path_signature: bool,
+    signature_dim: int,
+) -> int:
+    if not use_path_signature:
+        return signature_dim
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    sig_key = "observation.path_signature"
+    sig_spec = info.get("features", {}).get(sig_key)
+    if sig_spec is None:
+        raise KeyError(
+            f"Dataset feature '{sig_key}' not found in {dataset_root / 'meta/info.json'}. "
+            "Please run path-signature preprocessing first or disable path signature."
+        )
+
+    shape = sig_spec.get("shape")
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) != 1
+        or int(shape[0]) <= 0
+    ):
+        raise ValueError(
+            f"Invalid shape for '{sig_key}' in dataset info: {shape}. Expected [signature_dim]."
+        )
+    dataset_sig_dim = int(shape[0])
+
+    if signature_dim > 0 and signature_dim != dataset_sig_dim:
+        raise ValueError(
+            f"signature_dim mismatch: cli={signature_dim} vs dataset={dataset_sig_dim} "
+            f"for feature '{sig_key}'."
+        )
+
+    return dataset_sig_dim if signature_dim <= 0 else signature_dim
+
+
 def main():
     args = build_args()
 
@@ -187,6 +262,12 @@ def main():
         dataset_root=dataset_root,
         disable_imagenet_stats=args.disable_imagenet_stats,
     )
+    use_path_signature = not args.disable_path_signature
+    signature_dim = resolve_signature_dim(
+        dataset_root=dataset_root,
+        use_path_signature=use_path_signature,
+        signature_dim=args.signature_dim,
+    )
 
     run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (args.output_root / run_stamp).resolve()
@@ -218,6 +299,12 @@ def main():
         pretrained_backbone_weights=None,
         chunk_size=args.chunk_size,
         n_action_steps=args.chunk_size,
+        use_path_signature=use_path_signature,
+        history_length=args.history_length,
+        signature_dim=signature_dim,
+        signature_depth=args.signature_depth,
+        signature_hidden_dim=args.signature_hidden_dim,
+        signature_dropout=args.signature_dropout,
     )
     wandb_cfg = WandBConfig(
         enable=wandb_enable,
@@ -250,6 +337,13 @@ def main():
     print(f"- steps: {args.steps}")
     print(f"- batch_size: {args.batch_size}")
     print(f"- use_imagenet_stats: {use_imagenet_stats}")
+    print(f"- use_path_signature: {use_path_signature}")
+    if use_path_signature:
+        print(
+            f"- signature: dim={signature_dim}, depth={args.signature_depth}, "
+            f"history={args.history_length}, hidden={args.signature_hidden_dim}, "
+            f"dropout={args.signature_dropout}"
+        )
     print(
         f"- wandb: enable={wandb_enable}, project={args.wandb_project}, mode={args.wandb_mode}"
     )

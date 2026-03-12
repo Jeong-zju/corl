@@ -72,6 +72,15 @@ class StreamingACTConfig(PreTrainedConfig):
             documentation in the policy class).
         latent_dim: The VAE's latent dimension.
         n_vae_encoder_layers: The number of transformer layers to use for the VAE's encoder.
+        use_path_signature: Whether to enable path-signature-based historical context encoding for
+            streaming inference/training.
+        history_length: Number of past timesteps to include when computing path signatures.
+        signature_dim: Dimension of the computed signature feature vector. This is often determined by
+            signature channels and truncation depth; set to 0 to indicate "infer from implementation".
+        signature_depth: Truncation level used when computing the path signature.
+        signature_hidden_dim: Hidden dimension used by the projection MLP that maps high-dimensional
+            signature vectors into model-friendly embeddings.
+        signature_dropout: Dropout used in the signature projection MLP for regularization.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
@@ -115,6 +124,16 @@ class StreamingACTConfig(PreTrainedConfig):
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
+    # Streaming path-signature history module.
+    use_path_signature: bool = True
+    history_length: int = 10
+    # Signature output dimensionality is typically a function of channels and truncation depth.
+    # Set to 0 to infer automatically in the model implementation.
+    signature_dim: int = 0
+    signature_depth: int = 3
+    signature_hidden_dim: int = 512
+    signature_dropout: float = 0.1
+
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
@@ -149,6 +168,20 @@ class StreamingACTConfig(PreTrainedConfig):
         if self.n_obs_steps != 1:
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
+            )
+        if self.history_length <= 0:
+            raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
+        if self.signature_dim < 0:
+            raise ValueError(f"`signature_dim` must be >= 0. Got {self.signature_dim}.")
+        if self.signature_depth <= 0:
+            raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
+        if self.signature_hidden_dim <= 0:
+            raise ValueError(
+                f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}."
+            )
+        if not (0.0 <= self.signature_dropout <= 1.0):
+            raise ValueError(
+                f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:

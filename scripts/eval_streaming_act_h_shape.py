@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 import json
 import math
 import subprocess
@@ -251,6 +252,105 @@ def build_eval_observation(
     return obs
 
 
+def compute_logsignature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:
+    """Compute log-signature with signatory backend."""
+    if window.ndim != 2:
+        raise ValueError(f"Window must be 2D, got shape={window.shape}")
+
+    try:
+        import signatory
+    except ImportError as exc:
+        raise ImportError(
+            "`signatory` is required for signatory backend. "
+            "Install it first or switch to --signature-backend simple."
+        ) from exc
+
+    path = torch.from_numpy(window).unsqueeze(0)  # (1, T, C)
+    with torch.no_grad():
+        logsig = signatory.logsignature(path, depth=sig_depth)  # (1, sig_dim)
+    return logsig.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def compute_simple_signature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:
+    """Pure-numpy fallback signature-like features used in offline preprocessing."""
+    if window.ndim != 2:
+        raise ValueError(f"Window must be 2D, got shape={window.shape}")
+    if sig_depth <= 0:
+        raise ValueError(f"sig_depth must be > 0, got {sig_depth}")
+
+    deltas = np.diff(window, axis=0, prepend=window[:1]).astype(np.float32)
+    feats = [np.sum(np.power(deltas, k, dtype=np.float32), axis=0) for k in range(1, sig_depth + 1)]
+    return np.concatenate(feats, axis=0).astype(np.float32)
+
+
+def check_signatory_usable() -> tuple[bool, str]:
+    """Probe signatory in a subprocess to avoid hard-crashing eval on import/runtime failures."""
+    probe = (
+        "import torch\n"
+        "import signatory\n"
+        "x = torch.randn(1, 8, 2)\n"
+        "y = signatory.logsignature(x, depth=2)\n"
+        "print(tuple(y.shape))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ok = proc.returncode == 0
+    detail = proc.stderr.strip() if proc.stderr.strip() else proc.stdout.strip()
+    if not detail:
+        detail = f"probe exited with returncode={proc.returncode}"
+    return ok, detail
+
+
+def resolve_signature_backend(requested_backend: str) -> str:
+    if requested_backend == "simple":
+        return "simple"
+
+    ok, detail = check_signatory_usable()
+    if requested_backend == "signatory":
+        if not ok:
+            raise RuntimeError(
+                "signatory backend requested but precheck failed. "
+                f"Detail: {detail or 'unknown error'}"
+            )
+        return "signatory"
+
+    # auto mode: same behavior as offline precompute script.
+    if ok:
+        return "signatory"
+    print(
+        "[WARN] signatory precheck failed; falling back to simple backend. "
+        f"Detail: {detail or 'unknown error'}"
+    )
+    return "simple"
+
+
+def compute_online_signature(
+    state_history: deque[np.ndarray],
+    history_length: int,
+    sig_depth: int,
+    signature_backend: str,
+) -> np.ndarray:
+    """Build padded history window and compute online signature vector."""
+    if history_length <= 0:
+        raise ValueError(f"history_length must be > 0, got {history_length}")
+    if len(state_history) == 0:
+        raise ValueError("state_history is empty; cannot compute path signature.")
+
+    window = np.stack(list(state_history), axis=0).astype(np.float32, copy=False)
+    if window.shape[0] < history_length:
+        pad_len = history_length - window.shape[0]
+        pad = np.repeat(window[:1], pad_len, axis=0)
+        window = np.concatenate([pad, window], axis=0)
+
+    if signature_backend == "signatory":
+        return compute_logsignature_np(window, sig_depth)
+    return compute_simple_signature_np(window, sig_depth)
+
+
 def build_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -282,6 +382,16 @@ def build_args():
     parser.add_argument("--success-threshold", type=float, default=0.20)
     parser.add_argument("--max-action-step", type=float, default=0.30)
     parser.add_argument("--device", type=str, default="cuda", help="cuda/cpu/mps")
+    parser.add_argument(
+        "--signature-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "signatory", "simple"],
+        help=(
+            "Backend for online path-signature in eval. "
+            "Use the same backend as your offline preprocessing."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -357,6 +467,25 @@ def main():
     state_key = "observation.state"
     state_dim = int(cfg.robot_state_feature.shape[0])
 
+    signature_key = "observation.path_signature"
+    signature_backend = None
+    if cfg.use_path_signature:
+        signature_backend = resolve_signature_backend(args.signature_backend)
+        if cfg.history_length <= 0:
+            raise ValueError(f"Invalid cfg.history_length={cfg.history_length}. Must be > 0.")
+        if cfg.signature_depth <= 0:
+            raise ValueError(f"Invalid cfg.signature_depth={cfg.signature_depth}. Must be > 0.")
+        if cfg.signature_dim <= 0:
+            raise ValueError(
+                f"Invalid cfg.signature_dim={cfg.signature_dim}. "
+                "Expected positive signature dimension when use_path_signature=True."
+            )
+        print(
+            "[info] online path-signature enabled: "
+            f"backend={signature_backend}, history={cfg.history_length}, "
+            f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+
     grid, extent = create_h_shape_grid()
     base_img = make_base_image(grid, image_hw)
     corners = find_fixed_h_corners(grid, extent)
@@ -383,6 +512,7 @@ def main():
         writer = start_ffmpeg_writer(video_path, image_hw[1], image_hw[0], args.fps)
 
         trajectory = [agent]
+        state_history = deque(maxlen=int(cfg.history_length)) if cfg.use_path_signature else None
         for step in range(args.max_steps):
             frame = render_frame(base_img, extent, agent)
             writer.stdin.write(frame.astype(np.uint8).tobytes())
@@ -395,7 +525,43 @@ def main():
                 image_key=image_key,
                 state_dim=state_dim,
             )
+
+            if cfg.use_path_signature:
+                state_now = obs[state_key].detach().cpu().numpy().astype(np.float32, copy=False)
+                state_history.append(state_now.copy())
+                signature_vec = compute_online_signature(
+                    state_history=state_history,
+                    history_length=int(cfg.history_length),
+                    sig_depth=int(cfg.signature_depth),
+                    signature_backend=signature_backend,
+                )
+                if signature_vec.shape[0] != int(cfg.signature_dim):
+                    raise RuntimeError(
+                        "Online signature dimension mismatch: "
+                        f"got {signature_vec.shape[0]}, expected cfg.signature_dim={cfg.signature_dim}. "
+                        "Check --signature-backend and offline preprocessing settings."
+                    )
+                obs[signature_key] = torch.from_numpy(signature_vec.astype(np.float32, copy=False))
+
             obs = preprocessor(obs)
+            if cfg.use_path_signature:
+                if signature_key not in obs:
+                    raise KeyError(
+                        f"`{signature_key}` missing after preprocessor; "
+                        "cannot run policy with use_path_signature=True."
+                    )
+                path_signature = obs[signature_key]
+                if path_signature.ndim == 1:
+                    path_signature = path_signature.unsqueeze(0)
+                elif path_signature.ndim != 2:
+                    raise RuntimeError(
+                        f"`{signature_key}` must be 1D/2D after preprocessing, got "
+                        f"shape={tuple(path_signature.shape)}"
+                    )
+                obs[signature_key] = path_signature.to(
+                    device=obs[state_key].device,
+                    dtype=obs[state_key].dtype,
+                )
 
             with torch.no_grad():
                 action = policy.select_action(obs)
