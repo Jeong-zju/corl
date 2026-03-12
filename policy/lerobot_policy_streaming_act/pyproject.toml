@@ -1,0 +1,18 @@
+[project]
+name = "lerobot_policy_streaming_act"
+version = "0.1.0"
+description = "Streaming ACT policy package for LeRobot."
+dependencies = [
+    "lerobot",
+]
+requires-python = ">= 3.12"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
