@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import warnings
 
 warnings.filterwarnings(
@@ -67,8 +68,11 @@ def build_args():
     parser.add_argument(
         "--history-length",
         type=int,
-        default=10,
-        help="History window size used by path-signature settings in config.",
+        default=0,
+        help=(
+            "History window size used by path-signature settings in config. "
+            "Set 0 to auto-read the maximum episode length from the dataset."
+        ),
     )
     parser.add_argument(
         "--signature-dim",
@@ -146,6 +150,20 @@ def patch_lerobot_act_factory(streaming_policy_cls, streaming_config_cls):
     # Also treat StreamingACTConfig as ACTConfig for processor selection.
     policy_factory.get_policy_class = get_policy_class_with_streaming_act
     policy_factory.ACTConfig = streaming_config_cls
+
+
+def teardown_wandb_safely(exit_code: int) -> None:
+    """Best-effort W&B shutdown that unregisters the service atexit hook."""
+
+    try:
+        import wandb
+    except Exception:
+        return
+
+    try:
+        wandb.teardown(exit_code=exit_code)
+    except BaseException as exc:
+        print(f"[WARN] wandb teardown failed during shutdown: {exc}")
 
 
 def validate_dataset_root(dataset_root: Path):
@@ -230,6 +248,45 @@ def resolve_signature_dim(
     return dataset_sig_dim if signature_dim <= 0 else signature_dim
 
 
+def resolve_history_length(
+    dataset_root: Path,
+    history_length: int,
+) -> int:
+    if history_length > 0:
+        return history_length
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    episodes_file = dataset_root / "meta/episodes/chunk-000/file-000.parquet"
+
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError:
+        pq = None
+
+    if pq is not None and episodes_file.exists():
+        episode_table = pq.read_table(episodes_file, columns=["length"])
+        episode_lengths = np.asarray(episode_table["length"].to_pylist(), dtype=np.int64)
+        if episode_lengths.size == 0:
+            raise ValueError(f"No episode lengths found in {episodes_file}.")
+        return int(episode_lengths.max())
+
+    total_frames = int(info.get("total_frames", 0))
+    total_episodes = int(info.get("total_episodes", 0))
+    if total_frames > 0 and total_episodes > 0 and total_frames % total_episodes == 0:
+        inferred_length = total_frames // total_episodes
+        if inferred_length > 0:
+            print(
+                "[WARN] pyarrow is unavailable, so max episode length was inferred "
+                f"from info.json as total_frames / total_episodes = {inferred_length}."
+            )
+            return int(inferred_length)
+
+    raise RuntimeError(
+        "Could not auto-resolve history_length from dataset metadata. "
+        "Install pyarrow or pass --history-length explicitly."
+    )
+
+
 def main():
     args = build_args()
 
@@ -263,6 +320,10 @@ def main():
         disable_imagenet_stats=args.disable_imagenet_stats,
     )
     use_path_signature = not args.disable_path_signature
+    resolved_history_length = resolve_history_length(
+        dataset_root=dataset_root,
+        history_length=args.history_length,
+    )
     signature_dim = resolve_signature_dim(
         dataset_root=dataset_root,
         use_path_signature=use_path_signature,
@@ -300,7 +361,7 @@ def main():
         chunk_size=args.chunk_size,
         n_action_steps=args.chunk_size,
         use_path_signature=use_path_signature,
-        history_length=args.history_length,
+        history_length=resolved_history_length,
         signature_dim=signature_dim,
         signature_depth=args.signature_depth,
         signature_hidden_dim=args.signature_hidden_dim,
@@ -341,14 +402,19 @@ def main():
     if use_path_signature:
         print(
             f"- signature: dim={signature_dim}, depth={args.signature_depth}, "
-            f"history={args.history_length}, hidden={args.signature_hidden_dim}, "
+            f"history={resolved_history_length}, hidden={args.signature_hidden_dim}, "
             f"dropout={args.signature_dropout}"
         )
     print(
         f"- wandb: enable={wandb_enable}, project={args.wandb_project}, mode={args.wandb_mode}"
     )
 
-    train(cfg)
+    try:
+        train(cfg)
+    except KeyboardInterrupt:
+        print("\n[WARN] Training interrupted by user. Cleaning up wandb before exit.")
+        teardown_wandb_safely(exit_code=130)
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

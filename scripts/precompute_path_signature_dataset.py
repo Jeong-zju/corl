@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Add sliding-window log-signature to a local LeRobot-format dataset.
+"""Add prefix-history log-signature to a local LeRobot-format dataset.
 
 This script:
 1. Loads LeRobot parquet data with `datasets.load_dataset`.
-2. Builds a per-frame history window over `observation.state` within each episode.
+2. Builds a per-frame prefix history over `observation.state` within each episode.
 3. Computes log-signature features using `signatory`.
 4. Adds a new column `observation.path_signature`.
 5. Writes a new LeRobot dataset directory preserving chunked parquet layout.
@@ -32,7 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True, help="Output LeRobot dataset root.")
     parser.add_argument("--state-key", type=str, default="observation.state")
     parser.add_argument("--output-key", type=str, default="observation.path_signature")
-    parser.add_argument("--window-size", type=int, default=20)
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=0,
+        help="History window size. Use 0 to include all frames up to the current frame.",
+    )
     parser.add_argument("--sig-depth", type=int, default=3)
     parser.add_argument("--map-batch-size", type=int, default=256)
     parser.add_argument("--num-proc", type=int, default=1)
@@ -219,8 +224,6 @@ def build_signature_mapper(
     output_key: str,
     signature_backend: str,
 ):
-    if window_size <= 0:
-        raise ValueError(f"window_size must be > 0, got {window_size}")
     if sig_depth <= 0:
         raise ValueError(f"sig_depth must be > 0, got {sig_depth}")
 
@@ -233,13 +236,15 @@ def build_signature_mapper(
             ep_states = episode_states[ep_idx]
             local_t = int(row_pos_in_episode[abs_row_idx])
 
-            start = max(0, local_t - window_size + 1)
-            window = ep_states[start : local_t + 1]  # newest included
-
-            if window.shape[0] < window_size:
-                pad_len = window_size - window.shape[0]
-                pad = np.repeat(ep_states[0:1], pad_len, axis=0)
-                window = np.concatenate([pad, window], axis=0)
+            if window_size <= 0:
+                window = ep_states[: local_t + 1]
+            else:
+                start = max(0, local_t - window_size + 1)
+                window = ep_states[start : local_t + 1]
+                if window.shape[0] < window_size:
+                    pad_len = window_size - window.shape[0]
+                    pad = np.repeat(ep_states[0:1], pad_len, axis=0)
+                    window = np.concatenate([pad, window], axis=0)
 
             if signature_backend == "signatory":
                 sig = compute_logsignature_np(window, sig_depth)
@@ -369,6 +374,7 @@ def update_info_json(
     info["path_signature"] = {
         "key": output_key,
         "window_size": int(window_size),
+        "window_mode": "full_prefix" if int(window_size) <= 0 else "sliding_window",
         "sig_depth": int(sig_depth),
         "signature_dim": int(signature_dim),
         "kind": "logsignature",
@@ -396,8 +402,6 @@ def main() -> None:
 
     if not input_root.exists():
         raise FileNotFoundError(f"Input dataset root does not exist: {input_root}")
-    if args.window_size <= 0:
-        raise ValueError(f"window_size must be > 0, got {args.window_size}")
     if args.sig_depth <= 0:
         raise ValueError(f"sig_depth must be > 0, got {args.sig_depth}")
 
@@ -420,7 +424,8 @@ def main() -> None:
     episode_states, row_pos_in_episode, state_dim = build_episode_state_cache(dataset, args.state_key)
     print(f"Cached {len(episode_states)} episodes, state_dim={state_dim}")
 
-    print("[3/7] computing path signatures with dataset.map")
+    window_label = "all_prefix" if args.window_size <= 0 else str(args.window_size)
+    print(f"[3/7] computing path signatures with dataset.map (window={window_label})")
     mapper = build_signature_mapper(
         episode_states=episode_states,
         row_pos_in_episode=row_pos_in_episode,

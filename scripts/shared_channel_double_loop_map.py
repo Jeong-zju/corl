@@ -142,7 +142,8 @@ class MapConfig:
     """Container for all geometry needed by the current static map."""
 
     workspace: RectangleRegion
-    start_region: RectangleRegion
+    start_region: "SemanticRegion"
+    task_start_regions: tuple[RectangleRegion, ...]
     shared_corridor_region: "SemanticRegion"
     decision_region_h1: "SemanticRegion"
     branch1_upper_region: "SemanticRegion"
@@ -169,6 +170,7 @@ class TaskSpec:
     task_id: int
     task_code: str
     task_bits: tuple[int, int]
+    start_region_name: str
     target_goal_name: str
 
 
@@ -280,91 +282,182 @@ def build_obstacles_from_free_rectangles(
 
 
 def build_default_map_config() -> MapConfig:
-    """Centralized geometry for the long-strip implicit-cue braided map."""
+    """Centralized geometry for the four-start implicit-cue braided map.
+
+    Topology:
+    - Four task-specific start rooms on the left encode the task implicitly.
+    - The starts merge into one long shared snake corridor.
+    - Two serial binary decisions (H1/H2) are separated by long shared segments.
+    - The final corridor fans out to four goal rooms on the right.
+    """
 
     workspace = RectangleRegion("workspace", xmin=0.0, xmax=100.0, ymin=0.0, ymax=60.0)
-    start_region = RectangleRegion("S", xmin=2.0, xmax=10.0, ymin=27.0, ymax=33.0)
 
-    stem_corridor = RectangleRegion(
-        "stem_corridor", xmin=10.0, xmax=28.0, ymin=28.0, ymax=32.0
+    start_s00 = RectangleRegion("S00", xmin=2.0, xmax=8.0, ymin=44.0, ymax=50.0)
+    start_s01 = RectangleRegion("S01", xmin=2.0, xmax=8.0, ymin=34.0, ymax=40.0)
+    start_s10 = RectangleRegion("S10", xmin=2.0, xmax=8.0, ymin=20.0, ymax=26.0)
+    start_s11 = RectangleRegion("S11", xmin=2.0, xmax=8.0, ymin=10.0, ymax=16.0)
+    task_start_regions = (start_s00, start_s01, start_s10, start_s11)
+
+    start_00_prefix = RectangleRegion(
+        "start_00_prefix", xmin=8.0, xmax=12.0, ymin=46.0, ymax=48.0
     )
-    h1_hub = RectangleRegion("H1_hub", xmin=28.0, xmax=32.0, ymin=20.0, ymax=40.0)
-    branch1_upper = RectangleRegion(
-        "branch1_upper", xmin=32.0, xmax=46.0, ymin=36.0, ymax=40.0
+    start_01_prefix = RectangleRegion(
+        "start_01_prefix", xmin=8.0, xmax=12.0, ymin=36.0, ymax=38.0
     )
-    branch1_lower = RectangleRegion(
-        "branch1_lower", xmin=32.0, xmax=46.0, ymin=20.0, ymax=24.0
+    start_10_prefix = RectangleRegion(
+        "start_10_prefix", xmin=8.0, xmax=12.0, ymin=22.0, ymax=24.0
     )
-    merge1_hub = RectangleRegion("merge1_hub", xmin=46.0, xmax=50.0, ymin=20.0, ymax=40.0)
-    middle_corridor = RectangleRegion(
-        "middle_corridor", xmin=50.0, xmax=66.0, ymin=28.0, ymax=32.0
+    start_11_prefix = RectangleRegion(
+        "start_11_prefix", xmin=8.0, xmax=12.0, ymin=12.0, ymax=14.0
     )
-    h2_hub = RectangleRegion("H2_hub", xmin=66.0, xmax=70.0, ymin=20.0, ymax=40.0)
-    branch2_upper = RectangleRegion(
-        "branch2_upper", xmin=70.0, xmax=84.0, ymin=36.0, ymax=40.0
+    start_collector = RectangleRegion(
+        "start_collector", xmin=12.0, xmax=14.0, ymin=12.0, ymax=48.0
     )
-    branch2_lower = RectangleRegion(
-        "branch2_lower", xmin=70.0, xmax=84.0, ymin=20.0, ymax=24.0
+    shared_entry = RectangleRegion(
+        "shared_entry", xmin=14.0, xmax=18.0, ymin=28.0, ymax=32.0
     )
-    merge2_hub = RectangleRegion("merge2_hub", xmin=84.0, xmax=88.0, ymin=20.0, ymax=40.0)
+
+    shared_snake_1 = RectangleRegion(
+        "shared_snake_1", xmin=18.0, xmax=24.0, ymin=28.0, ymax=32.0
+    )
+    shared_snake_2 = RectangleRegion(
+        "shared_snake_2", xmin=22.0, xmax=24.0, ymin=28.0, ymax=42.0
+    )
+    shared_snake_3 = RectangleRegion(
+        "shared_snake_3", xmin=24.0, xmax=30.0, ymin=38.0, ymax=42.0
+    )
+    shared_snake_4 = RectangleRegion(
+        "shared_snake_4", xmin=30.0, xmax=32.0, ymin=24.0, ymax=42.0
+    )
+    shared_snake_5 = RectangleRegion(
+        "shared_snake_5", xmin=32.0, xmax=34.0, ymin=24.0, ymax=28.0
+    )
+
+    h1_hub = RectangleRegion("H1_hub", xmin=34.0, xmax=38.0, ymin=20.0, ymax=36.0)
+    branch1_upper_top = RectangleRegion(
+        "branch1_upper_top", xmin=40.0, xmax=48.0, ymin=42.0, ymax=46.0
+    )
+    branch1_upper_rise = RectangleRegion(
+        "branch1_upper_rise", xmin=38.0, xmax=40.0, ymin=34.0, ymax=46.0
+    )
+    branch1_upper_drop = RectangleRegion(
+        "branch1_upper_drop", xmin=48.0, xmax=50.0, ymin=32.0, ymax=46.0
+    )
+    branch1_lower_bottom = RectangleRegion(
+        "branch1_lower_bottom", xmin=40.0, xmax=48.0, ymin=10.0, ymax=14.0
+    )
+    branch1_lower_drop = RectangleRegion(
+        "branch1_lower_drop", xmin=38.0, xmax=40.0, ymin=10.0, ymax=22.0
+    )
+    branch1_lower_rise = RectangleRegion(
+        "branch1_lower_rise", xmin=48.0, xmax=50.0, ymin=10.0, ymax=28.0
+    )
+    merge1_hub = RectangleRegion("merge1_hub", xmin=50.0, xmax=54.0, ymin=24.0, ymax=36.0)
+
+    middle_snake_1 = RectangleRegion(
+        "middle_snake_1", xmin=54.0, xmax=60.0, ymin=28.0, ymax=32.0
+    )
+    middle_snake_2 = RectangleRegion(
+        "middle_snake_2", xmin=60.0, xmax=62.0, ymin=28.0, ymax=40.0
+    )
+    middle_snake_3 = RectangleRegion(
+        "middle_snake_3", xmin=62.0, xmax=68.0, ymin=36.0, ymax=40.0
+    )
+    middle_snake_4 = RectangleRegion(
+        "middle_snake_4", xmin=68.0, xmax=70.0, ymin=18.0, ymax=40.0
+    )
+    middle_snake_5 = RectangleRegion(
+        "middle_snake_5", xmin=70.0, xmax=72.0, ymin=18.0, ymax=22.0
+    )
+
+    h2_hub = RectangleRegion("H2_hub", xmin=72.0, xmax=76.0, ymin=14.0, ymax=36.0)
+    branch2_upper_top = RectangleRegion(
+        "branch2_upper_top", xmin=78.0, xmax=86.0, ymin=40.0, ymax=44.0
+    )
+    branch2_upper_rise = RectangleRegion(
+        "branch2_upper_rise", xmin=76.0, xmax=78.0, ymin=32.0, ymax=44.0
+    )
+    branch2_upper_drop = RectangleRegion(
+        "branch2_upper_drop", xmin=86.0, xmax=88.0, ymin=30.0, ymax=44.0
+    )
+    branch2_lower_bottom = RectangleRegion(
+        "branch2_lower_bottom", xmin=78.0, xmax=86.0, ymin=8.0, ymax=12.0
+    )
+    branch2_lower_drop = RectangleRegion(
+        "branch2_lower_drop", xmin=76.0, xmax=78.0, ymin=8.0, ymax=16.0
+    )
+    branch2_lower_rise = RectangleRegion(
+        "branch2_lower_rise", xmin=86.0, xmax=88.0, ymin=8.0, ymax=28.0
+    )
+    merge2_hub = RectangleRegion("merge2_hub", xmin=88.0, xmax=92.0, ymin=24.0, ymax=36.0)
     final_corridor = RectangleRegion(
-        "final_corridor", xmin=88.0, xmax=94.0, ymin=28.0, ymax=32.0
+        "final_corridor", xmin=92.0, xmax=96.0, ymin=28.0, ymax=32.0
     )
-    terminal_hub = RectangleRegion("terminal_hub", xmin=94.0, xmax=96.0, ymin=10.0, ymax=48.0)
-
-    corridor_rectangles = (
-        stem_corridor,
-        h1_hub,
-        branch1_upper,
-        branch1_lower,
-        merge1_hub,
-        middle_corridor,
-        h2_hub,
-        branch2_upper,
-        branch2_lower,
-        merge2_hub,
-        final_corridor,
-        terminal_hub,
-    )
+    terminal_hub = RectangleRegion("terminal_hub", xmin=96.0, xmax=98.0, ymin=10.0, ymax=50.0)
 
     goal_regions = (
-        GoalRegion("G00", xmin=96.0, xmax=100.0, ymin=40.0, ymax=48.0),
-        GoalRegion("G01", xmin=96.0, xmax=100.0, ymin=30.0, ymax=38.0),
-        GoalRegion("G10", xmin=96.0, xmax=100.0, ymin=20.0, ymax=28.0),
-        GoalRegion("G11", xmin=96.0, xmax=100.0, ymin=10.0, ymax=18.0),
+        GoalRegion("G00", xmin=98.0, xmax=100.0, ymin=42.0, ymax=50.0),
+        GoalRegion("G01", xmin=98.0, xmax=100.0, ymin=32.0, ymax=38.0),
+        GoalRegion("G10", xmin=98.0, xmax=100.0, ymin=22.0, ymax=28.0),
+        GoalRegion("G11", xmin=98.0, xmax=100.0, ymin=10.0, ymax=16.0),
     )
 
     decision_points = (
-        DecisionPoint("H1", x=30.0, y=30.0),
-        DecisionPoint("H2", x=68.0, y=30.0),
+        DecisionPoint("H1", x=36.0, y=28.0),
+        DecisionPoint("H2", x=74.0, y=25.0),
     )
 
+    start_region = SemanticRegion(
+        "start_region",
+        rectangles=(
+            *task_start_regions,
+            start_00_prefix,
+            start_01_prefix,
+            start_10_prefix,
+            start_11_prefix,
+            start_collector,
+        ),
+    )
     shared_corridor_region = SemanticRegion(
         "shared_corridor_region",
-        rectangles=(stem_corridor,),
+        rectangles=(
+            shared_entry,
+            shared_snake_1,
+            shared_snake_2,
+            shared_snake_3,
+            shared_snake_4,
+            shared_snake_5,
+        ),
     )
     decision_region_h1 = SemanticRegion("decision_region_H1", rectangles=(h1_hub,))
     branch1_upper_region = SemanticRegion(
         "branch1_upper_region",
-        rectangles=(branch1_upper,),
+        rectangles=(branch1_upper_top, branch1_upper_rise, branch1_upper_drop),
     )
     branch1_lower_region = SemanticRegion(
         "branch1_lower_region",
-        rectangles=(branch1_lower,),
+        rectangles=(branch1_lower_bottom, branch1_lower_drop, branch1_lower_rise),
     )
     merge_region_1 = SemanticRegion("merge_region_1", rectangles=(merge1_hub,))
     middle_corridor_region = SemanticRegion(
         "middle_corridor_region",
-        rectangles=(middle_corridor,),
+        rectangles=(
+            middle_snake_1,
+            middle_snake_2,
+            middle_snake_3,
+            middle_snake_4,
+            middle_snake_5,
+        ),
     )
     decision_region_h2 = SemanticRegion("decision_region_H2", rectangles=(h2_hub,))
     branch2_upper_region = SemanticRegion(
         "branch2_upper_region",
-        rectangles=(branch2_upper,),
+        rectangles=(branch2_upper_top, branch2_upper_rise, branch2_upper_drop),
     )
     branch2_lower_region = SemanticRegion(
         "branch2_lower_region",
-        rectangles=(branch2_lower,),
+        rectangles=(branch2_lower_bottom, branch2_lower_drop, branch2_lower_rise),
     )
     merge_region_2 = SemanticRegion("merge_region_2", rectangles=(merge2_hub,))
     final_corridor_region = SemanticRegion(
@@ -372,22 +465,61 @@ def build_default_map_config() -> MapConfig:
         rectangles=(final_corridor, terminal_hub),
     )
 
-    free_space_rectangles = (start_region, *corridor_rectangles, *goal_regions)
+    free_space_rectangles = (
+        *task_start_regions,
+        start_00_prefix,
+        start_01_prefix,
+        start_10_prefix,
+        start_11_prefix,
+        start_collector,
+        shared_entry,
+        shared_snake_1,
+        shared_snake_2,
+        shared_snake_3,
+        shared_snake_4,
+        shared_snake_5,
+        h1_hub,
+        branch1_upper_rise,
+        branch1_upper_top,
+        branch1_upper_drop,
+        branch1_lower_drop,
+        branch1_lower_bottom,
+        branch1_lower_rise,
+        merge1_hub,
+        middle_snake_1,
+        middle_snake_2,
+        middle_snake_3,
+        middle_snake_4,
+        middle_snake_5,
+        h2_hub,
+        branch2_upper_rise,
+        branch2_upper_top,
+        branch2_upper_drop,
+        branch2_lower_drop,
+        branch2_lower_bottom,
+        branch2_lower_rise,
+        merge2_hub,
+        final_corridor,
+        terminal_hub,
+        *goal_regions,
+    )
     obstacle_rectangles = build_obstacles_from_free_rectangles(
         workspace, free_space_rectangles
     )
 
     path_labels = (
-        ("single_1", (19.0, 34.5)),
-        ("branch_1", (39.0, 43.0)),
-        ("single_2", (58.0, 34.5)),
-        ("branch_2", (77.0, 43.0)),
-        ("single_3", (91.0, 34.5)),
+        ("start cue", (8.0, 53.0)),
+        ("shared trunk 1", (25.0, 46.0)),
+        ("decision 1", (39.0, 50.0)),
+        ("shared trunk 2", (63.0, 44.0)),
+        ("decision 2", (82.0, 48.0)),
+        ("goal fan-out", (97.0, 54.0)),
     )
 
     return MapConfig(
         workspace=workspace,
         start_region=start_region,
+        task_start_regions=task_start_regions,
         shared_corridor_region=shared_corridor_region,
         decision_region_h1=decision_region_h1,
         branch1_upper_region=branch1_upper_region,
@@ -431,7 +563,24 @@ def build_task_spec(task_id: int) -> TaskSpec:
         task_id=task_id,
         task_code=task_code,
         task_bits=(int(task_code[0]), int(task_code[1])),
+        start_region_name=f"S{task_code}",
         target_goal_name=TASK_ID_TO_GOAL_NAME[task_id],
+    )
+
+
+def get_task_start_region(
+    task_id: int,
+    config: MapConfig | None = None,
+) -> RectangleRegion:
+    """Return the task-specific implicit-cue start room for a task id."""
+
+    resolved_config = _resolve_config(config)
+    start_region_name = build_task_spec(task_id).start_region_name
+    for start_region in resolved_config.task_start_regions:
+        if start_region.name == start_region_name:
+            return start_region
+    raise RuntimeError(
+        f"Start region {start_region_name} for task_id={task_id} was not found."
     )
 
 
@@ -675,32 +824,52 @@ def densify_polyline_path(
 def build_manual_upper_goal_test_path(
     step_size: float = DEFAULT_MANUAL_PHASE_STEP_SIZE,
 ) -> list[tuple[float, float]]:
-    """Construct a simple hand-made upper-upper trajectory from start to G00."""
+    """Construct a hand-made S00-to-G00 trajectory through both upper loops."""
 
     pre_bend_path = densify_polyline_path(
         [
-            (6.0, 30.0),
-            (18.0, 30.0),
-            (30.0, 30.0),
-            (30.0, 38.0),
-            (39.0, 38.0),
-            (48.0, 38.0),
-            (48.0, 30.0),
+            (5.0, 47.0),
+            (10.0, 47.0),
+            (13.0, 47.0),
+            (13.0, 30.0),
+            (21.0, 30.0),
+            (23.0, 30.0),
+            (23.0, 40.0),
+            (27.0, 40.0),
+            (31.0, 40.0),
+            (31.0, 26.0),
+            (35.0, 26.0),
+            (36.0, 35.0),
+            (39.0, 35.0),
+            (39.0, 41.0),
+            (44.0, 44.0),
+            (49.0, 44.0),
+            (49.0, 34.0),
+            (52.0, 30.0),
             (58.0, 30.0),
-            (68.0, 30.0),
-            (68.0, 38.0),
-            (77.0, 38.0),
-            (86.0, 38.0),
-            (86.0, 30.0),
+            (61.0, 30.0),
+            (61.0, 38.0),
+            (65.0, 38.0),
+            (69.0, 38.0),
+            (69.0, 20.0),
+            (73.0, 20.0),
+            (74.0, 33.0),
+            (77.0, 33.0),
+            (77.0, 42.0),
+            (82.0, 42.0),
+            (87.0, 42.0),
+            (87.0, 34.0),
+            (90.0, 34.0),
+            (90.0, 30.0),
+            (94.0, 30.0),
         ],
         step_size=step_size,
     )
     post_bend_path = densify_polyline_path(
         [
-            (91.0, 30.0),
-            (95.0, 30.0),
-            (95.0, 44.0),
-            (98.0, 44.0),
+            (97.0, 30.0),
+            (97.0, 46.0),
+            (99.0, 46.0),
         ],
         step_size=step_size,
     )
@@ -740,27 +909,28 @@ def plot_map(config: MapConfig, show: bool = True, ax=None):
             )
         )
 
-    ax.add_patch(
-        config.start_region.as_patch(
-            facecolor="#4c78a8",
-            edgecolor="#1f3552",
-            linewidth=1.5,
-            alpha=0.95,
-            zorder=3,
+    for start_region in config.task_start_regions:
+        ax.add_patch(
+            start_region.as_patch(
+                facecolor="#4c78a8",
+                edgecolor="#1f3552",
+                linewidth=1.2,
+                alpha=0.95,
+                zorder=3,
+            )
         )
-    )
-    start_x, start_y = config.start_region.center
-    ax.text(
-        start_x,
-        start_y,
-        "S",
-        ha="center",
-        va="center",
-        fontsize=12,
-        fontweight="bold",
-        color="white",
-        zorder=4,
-    )
+        start_x, start_y = start_region.center
+        ax.text(
+            start_x,
+            start_y,
+            start_region.name,
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="white",
+            zorder=4,
+        )
 
     goal_colors = {
         "G00": "#1b9e77",
@@ -811,7 +981,7 @@ def plot_map(config: MapConfig, show: bool = True, ax=None):
     ax.set_aspect("equal")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Long-Strip Implicit-Cue Map with Two Serial Binary Branches")
+    ax.set_title("Four-Start Implicit-Cue Map with Shared Snake Corridor and Two Serial Binary Branches")
     ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.4)
 
     fig.tight_layout()
@@ -833,7 +1003,7 @@ def build_base_legend_handles():
 
     return [
         Patch(facecolor="#4a4a4a", edgecolor="#2f2f2f", label="Obstacle"),
-        Patch(facecolor="#4c78a8", edgecolor="#1f3552", label="Start Region"),
+        Patch(facecolor="#4c78a8", edgecolor="#1f3552", label="Task Start Room"),
         Patch(facecolor="#1b9e77", edgecolor="black", label="Goal Region"),
     ]
 
@@ -1143,6 +1313,7 @@ class BraidedHub2DEnv:
         self.step_count = 0
         self.episode_task_id: int | None = None
         self.task_spec: TaskSpec | None = None
+        self.start_region_name: str | None = None
         self.target_goal_name: str | None = None
         self.target_goal_region: GoalRegion | None = None
         self.last_info: dict[str, Any] = {}
@@ -1152,16 +1323,18 @@ class BraidedHub2DEnv:
         self._render_ax = None
 
     def reset(self, task_id: int | None = None) -> tuple[float, float]:
-        """Start a new episode from a valid point inside the start region."""
+        """Start a new episode from a valid point inside the task's start room."""
 
         chosen_task_id = self.sample_task_id() if task_id is None else int(task_id)
         self.task_spec = build_task_spec(chosen_task_id)
         self.episode_task_id = self.task_spec.task_id
+        self.start_region_name = self.task_spec.start_region_name
         self.target_goal_name = self.task_spec.target_goal_name
         self.target_goal_region = self.goal_region_by_name[self.target_goal_name]
+        task_start_region = get_task_start_region(chosen_task_id, self.map_config)
 
         self.state = sample_valid_state_in_region(
-            self.start_region,
+            task_start_region,
             rng=self.rng,
             config=self.map_config,
         )
@@ -1172,6 +1345,7 @@ class BraidedHub2DEnv:
             "task_id": self.episode_task_id,
             "task_code": self.task_spec.task_code,
             "task_bits": self.task_spec.task_bits,
+            "start_region_name": self.start_region_name,
             "target_goal_name": self.target_goal_name,
             "reached_goal": None,
             "success": False,
@@ -1212,6 +1386,7 @@ class BraidedHub2DEnv:
             "task_id": self.task_spec.task_id,
             "task_code": self.task_spec.task_code,
             "task_bits": self.task_spec.task_bits,
+            "start_region_name": self.start_region_name,
             "target_goal_name": self.task_spec.target_goal_name,
             "target_goal_center": self.target_goal_region.center,
         }
@@ -1322,6 +1497,7 @@ class BraidedHub2DEnv:
             "task_id": self.episode_task_id,
             "task_code": self.task_spec.task_code,
             "task_bits": self.task_spec.task_bits,
+            "start_region_name": self.start_region_name,
             "target_goal_name": self.target_goal_name,
             "step_count": self.step_count,
             "action": (float(dx), float(dy)),
@@ -1408,6 +1584,7 @@ class BraidedHub2DEnv:
             "BraidedHub2DEnv\n"
             f"step={self.step_count}, task_id={self.episode_task_id}, "
             f"code={None if self.task_spec is None else self.task_spec.task_code}, "
+            f"start={self.start_region_name}, "
             f"target={self.target_goal_name}, "
             f"state=({self.state[0]:.2f}, {self.state[1]:.2f})"
         )
@@ -1510,6 +1687,7 @@ class BraidedHub2DEnv:
                 f"task_id={self.episode_task_id}, "
                 f"task_code={self.task_spec.task_code if self.task_spec else None}, "
                 f"task_bits={self.task_spec.task_bits if self.task_spec else None}, "
+                f"start={self.start_region_name}, "
                 f"target={self.target_goal_name}, "
                 f"state=({state[0]:.2f}, {state[1]:.2f})"
             )

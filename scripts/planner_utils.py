@@ -15,7 +15,10 @@ try:
         BraidedHub2DEnv,
         MapConfig,
         TASK_ID_TO_GOAL_NAME,
+        build_task_spec,
         build_default_map_config,
+        get_phase_name,
+        get_task_start_region,
         get_task_waypoint_centers,
         is_state_valid,
         plot_map,
@@ -27,7 +30,10 @@ except ImportError:
         BraidedHub2DEnv,
         MapConfig,
         TASK_ID_TO_GOAL_NAME,
+        build_task_spec,
         build_default_map_config,
+        get_phase_name,
+        get_task_start_region,
         get_task_waypoint_centers,
         is_state_valid,
         plot_map,
@@ -46,7 +52,7 @@ DEFAULT_RETRIES_PER_DEMO = 5
 DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD = 0.8
 DEFAULT_DATASET_VIS_SAMPLES = 12
 DEFAULT_DATASET_OUTPUT = (
-    "/home/jeong/zeno/corl/main/scripts/generated/braidedhub_implicit_cue_rrtconnect_demos.npz"
+    "/home/jeong/zeno/corl/main/scripts/braidedhub_fourstart_implicit_cue_rrtconnect_demos.npz"
 )
 TASK_COLOR_BY_ID = {
     0: "#1b9e77",
@@ -54,6 +60,10 @@ TASK_COLOR_BY_ID = {
     2: "#d95f02",
     3: "#7570b3",
 }
+BRANCH1_PHASE_BY_BIT = {0: "branch1_upper_region", 1: "branch1_lower_region"}
+BRANCH2_PHASE_BY_BIT = {0: "branch2_upper_region", 1: "branch2_lower_region"}
+BRANCH1_PHASES = frozenset(BRANCH1_PHASE_BY_BIT.values())
+BRANCH2_PHASES = frozenset(BRANCH2_PHASE_BY_BIT.values())
 
 
 @dataclass(slots=True)
@@ -310,6 +320,69 @@ def _get_goal_center_for_task(
     return goal_name, goal_region.center
 
 
+def _validate_task_conditioned_path(
+    task_id: int,
+    path_xy: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    config: MapConfig,
+) -> tuple[bool, str | None]:
+    """Check that a demonstration path follows the branch choices encoded by task_id.
+
+    Validation rule:
+    - The path must enter the task-matching branch at H1 and H2.
+    - The path must not enter the opposite branch at either decision stage.
+    """
+
+    task_spec = build_task_spec(task_id)
+    expected_branch1 = BRANCH1_PHASE_BY_BIT[int(task_spec.task_bits[0])]
+    expected_branch2 = BRANCH2_PHASE_BY_BIT[int(task_spec.task_bits[1])]
+    saw_expected_branch1 = False
+    saw_expected_branch2 = False
+
+    for point in path_xy:
+        phase_name = get_phase_name(float(point[0]), float(point[1]), config=config)
+        if phase_name in BRANCH1_PHASES:
+            if phase_name != expected_branch1:
+                return (
+                    False,
+                    f"H1 branch mismatch: expected {expected_branch1}, observed {phase_name}",
+                )
+            saw_expected_branch1 = True
+        if phase_name in BRANCH2_PHASES:
+            if phase_name != expected_branch2:
+                return (
+                    False,
+                    f"H2 branch mismatch: expected {expected_branch2}, observed {phase_name}",
+                )
+            saw_expected_branch2 = True
+
+    if not saw_expected_branch1:
+        return False, f"Path never entered expected H1 branch {expected_branch1}"
+    if not saw_expected_branch2:
+        return False, f"Path never entered expected H2 branch {expected_branch2}"
+    return True, None
+
+
+def _build_task_route_waypoints(
+    task_id: int,
+    start_xy: tuple[float, float],
+    goal_xy: tuple[float, float],
+    config: MapConfig,
+) -> tuple[tuple[float, float], ...]:
+    """Build a task-aligned waypoint chain through the correct start and branches."""
+
+    branch1_center, branch2_center = get_task_waypoint_centers(task_id, config)
+    return (
+        (float(start_xy[0]), float(start_xy[1])),
+        config.decision_region_h1.rectangles[0].center,
+        branch1_center,
+        config.merge_region_1.rectangles[0].center,
+        config.decision_region_h2.rectangles[0].center,
+        branch2_center,
+        config.merge_region_2.rectangles[0].center,
+        (float(goal_xy[0]), float(goal_xy[1])),
+    )
+
+
 def plan_path_rrtconnect(
     start_xy: tuple[float, float],
     goal_xy: tuple[float, float],
@@ -555,6 +628,8 @@ def generate_demonstrations(
     Route selection policy:
     - The path is forced through two intermediate branch waypoints derived from
       the task bits, so the trajectory itself carries the implicit 2-bit code.
+    - Generated paths are rejected unless their semantic branch phases strictly
+      match the task id at both H1 and H2.
     """
 
     if num_per_task <= 0:
@@ -572,6 +647,7 @@ def generate_demonstrations(
 
     episode_id = 0
     for task_id in sorted(TASK_ID_TO_GOAL_NAME):
+        task_spec = build_task_spec(task_id)
         target_goal_name, goal_xy = _get_goal_center_for_task(task_id, resolved_config)
         print(
             f"[task {task_id}] target={target_goal_name}, "
@@ -581,17 +657,40 @@ def generate_demonstrations(
         for sample_index in range(num_per_task):
             success_path: list[tuple[float, float]] | None = None
             start_xy: tuple[float, float] | None = None
-            branch_waypoints = get_task_waypoint_centers(task_id, resolved_config)
 
             for retry_index in range(max_retries_per_demo):
                 attempt_counts_by_task[task_id] += 1
                 start_xy = env.reset(task_id=task_id)
+                if env.start_region_name != task_spec.start_region_name:
+                    raise RuntimeError(
+                        "Environment reset returned a start region that does not match the task. "
+                        f"task_id={task_id}, expected={task_spec.start_region_name}, "
+                        f"got={env.start_region_name}"
+                    )
+                route_waypoints = _build_task_route_waypoints(
+                    task_id=task_id,
+                    start_xy=start_xy,
+                    goal_xy=goal_xy,
+                    config=resolved_config,
+                )
                 success_path = plan_path_rrtconnect_via_waypoints(
-                    waypoints_xy=(start_xy, *branch_waypoints, goal_xy),
+                    waypoints_xy=route_waypoints,
                     solve_time=solve_time,
                     config=resolved_config,
                 )
                 if success_path is not None:
+                    path_ok, reject_reason = _validate_task_conditioned_path(
+                        task_id=task_id,
+                        path_xy=success_path,
+                        config=resolved_config,
+                    )
+                    if not path_ok:
+                        success_path = None
+                        print(
+                            f"  retry {retry_index + 1}/{max_retries_per_demo} rejected "
+                            f"for sample {sample_index + 1}/{num_per_task}: {reject_reason}"
+                        )
+                        continue
                     break
 
                 print(
@@ -689,7 +788,7 @@ def save_demonstrations(
 
     np.savez_compressed(
         output_path,
-        format_version=np.asarray("braidedhub_rrtconnect_implicitcue_v2"),
+        format_version=np.asarray("braidedhub_rrtconnect_fourstart_implicitcue_v3"),
         seed=np.asarray(dataset.seed, dtype=np.int64),
         num_per_task_requested=np.asarray(dataset.num_per_task_requested, dtype=np.int64),
         solve_time=np.asarray(dataset.solve_time, dtype=np.float64),
@@ -808,17 +907,19 @@ def run_single_rrtconnect_demo(
 
     rng = random.Random(rng_seed)
     start_xy = sample_valid_state_in_region(
-        resolved_config.start_region,
+        get_task_start_region(goal_to_task_id[goal_name], resolved_config),
         rng=rng,
         config=resolved_config,
     )
     goal_xy = goal_region.center
-    branch_waypoints = get_task_waypoint_centers(
-        goal_to_task_id[goal_name],
+    route_waypoints = _build_task_route_waypoints(
+        task_id=goal_to_task_id[goal_name],
+        start_xy=start_xy,
+        goal_xy=goal_xy,
         config=resolved_config,
     )
     path = plan_path_rrtconnect_via_waypoints(
-        waypoints_xy=(start_xy, *branch_waypoints, goal_xy),
+        waypoints_xy=route_waypoints,
         solve_time=solve_time,
         config=resolved_config,
     )
@@ -839,7 +940,6 @@ def main() -> None:
         num_per_task=20,
         seed=DEFAULT_RANDOM_SEED,
     )
-    output_path = save_demonstrations(dataset, DEFAULT_DATASET_OUTPUT)
 
     try:
         visualize_dataset_samples(
@@ -851,9 +951,7 @@ def main() -> None:
     except RuntimeError as exc:
         print(f"Visualization skipped: {exc}")
 
-    print(
-        f"Dataset generation complete: {len(dataset)} saved episodes at {output_path}"
-    )
+    print(f"Dataset generation complete: {len(dataset)} episodes prepared in memory.")
 
 
 if __name__ == "__main__":

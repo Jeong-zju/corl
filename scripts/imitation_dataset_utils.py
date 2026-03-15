@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,11 +48,16 @@ except ImportError:
 
 DEFAULT_T_FIXED = 100
 DEFAULT_PROCESSED_SAMPLE_INDEX = 0
-DEFAULT_PROCESSED_OUTPUT = "/home/jeong/zeno/corl/main/scripts/generated/braidedhub_implicit_cue_act_ready_t100.npz"
+DEFAULT_PROCESSED_OUTPUT = "/home/jeong/zeno/corl/main/scripts/braidedhub_fourstart_implicit_cue_act_ready_t100.npz"
 DEFAULT_LAST_ACTION_MODE = "zero"
 DEFAULT_LEROBOT_V30_OUTPUT = (
-    "/home/jeong/zeno/corl/data/zeno-ai/braidedhub_implicit_cue_v30"
+    "/home/jeong/zeno/corl/data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
 )
+DEFAULT_INCLUDE_PATH_SIGNATURES = True
+DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_SIGNATURE_WINDOW_SIZE = 0
+DEFAULT_SIGNATURE_DEPTH = 3
+DEFAULT_SIGNATURE_BACKEND = "auto"
 DEFAULT_VIDEO_FPS = 20
 DEFAULT_VIDEO_IMAGE_SIZE = 128
 DEFAULT_LEROBOT_EPISODES_PER_CHUNK = 1000
@@ -71,10 +77,10 @@ ROBOT_INNER_COLOR = (240, 70, 70)
 TASK_ID_VALUES = tuple(sorted(TASK_ID_TO_GOAL_NAME))
 TASK_INDEX_BY_ID = {task_id: index for index, task_id in enumerate(TASK_ID_VALUES)}
 TASK_DESCRIPTION_BY_ID = {
-    0: "Reach G00 by taking the upper branch at the first split and the upper branch at the second split.",
-    1: "Reach G01 by taking the upper branch at the first split and the lower branch at the second split.",
-    2: "Reach G10 by taking the lower branch at the first split and the upper branch at the second split.",
-    3: "Reach G11 by taking the lower branch at the first split and the lower branch at the second split.",
+    0: "Start from S00, merge into the shared trunk, then take the upper branch at H1 and the upper branch at H2 to reach G00.",
+    1: "Start from S01, merge into the shared trunk, then take the upper branch at H1 and the lower branch at H2 to reach G01.",
+    2: "Start from S10, merge into the shared trunk, then take the lower branch at H1 and the upper branch at H2 to reach G10.",
+    3: "Start from S11, merge into the shared trunk, then take the lower branch at H1 and the lower branch at H2 to reach G11.",
 }
 PHASE_LABEL_VOCAB = (
     "start_region",
@@ -108,6 +114,7 @@ class ProcessedDemonstrationDataset:
 
     observations: np.ndarray
     actions: np.ndarray
+    path_signatures: np.ndarray | None
     task_ids: np.ndarray
     task_code_bits: np.ndarray
     goal_onehot: np.ndarray
@@ -122,6 +129,10 @@ class ProcessedDemonstrationDataset:
     seed: int
     t_fixed: int
     action_padding_mode: str
+    path_signature_key: str | None
+    path_signature_window_size: int
+    path_signature_depth: int
+    path_signature_backend: str | None
     phase_label_vocab: tuple[str, ...]
     source_num_per_task_requested: int
     source_solve_time: float
@@ -218,6 +229,139 @@ def build_task_code_bits(task_id: int) -> np.ndarray:
     return np.asarray([int(task_code[0]), int(task_code[1])], dtype=np.int64)
 
 
+def compute_logsignature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:
+    """Compute a log-signature feature for one sliding window."""
+
+    if window.ndim != 2:
+        raise ValueError(f"Window must be 2D, got shape={window.shape}")
+
+    try:
+        import torch
+        import signatory
+    except ImportError as exc:
+        raise ImportError(
+            "`signatory` is required for the signatory backend. "
+            "Install it first or use signature_backend='simple'."
+        ) from exc
+
+    path = torch.from_numpy(window.astype(np.float32, copy=False)).unsqueeze(0)
+    with torch.no_grad():
+        logsig = signatory.logsignature(path, depth=sig_depth)
+    return logsig.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def compute_simple_signature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:
+    """Fallback signature-like feature using moments of state increments."""
+
+    if window.ndim != 2:
+        raise ValueError(f"Window must be 2D, got shape={window.shape}")
+    if sig_depth <= 0:
+        raise ValueError(f"sig_depth must be > 0, got {sig_depth}")
+
+    deltas = np.diff(window, axis=0, prepend=window[:1]).astype(np.float32)
+    moments = [
+        np.sum(np.power(deltas, order, dtype=np.float32), axis=0)
+        for order in range(1, sig_depth + 1)
+    ]
+    return np.concatenate(moments, axis=0).astype(np.float32)
+
+
+def check_signatory_usable() -> tuple[bool, str]:
+    """Run a tiny subprocess probe before enabling the signatory backend."""
+
+    probe = (
+        "import torch\n"
+        "import signatory\n"
+        "x = torch.randn(1, 8, 2)\n"
+        "y = signatory.logsignature(x, depth=2)\n"
+        "print(tuple(y.shape))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ok = proc.returncode == 0
+    detail = proc.stderr.strip() if proc.stderr.strip() else proc.stdout.strip()
+    if not detail:
+        detail = f"probe exited with returncode={proc.returncode}"
+    return ok, detail
+
+
+def resolve_signature_backend(requested_backend: str) -> str:
+    """Resolve 'auto' to either 'signatory' or 'simple'."""
+
+    if requested_backend == "simple":
+        return "simple"
+    if requested_backend not in {"auto", "signatory"}:
+        raise ValueError(
+            f"Unsupported signature_backend={requested_backend!r}. "
+            "Expected one of {'auto', 'signatory', 'simple'}."
+        )
+
+    ok, detail = check_signatory_usable()
+    if requested_backend == "signatory":
+        if not ok:
+            raise RuntimeError(
+                "signatory backend requested but precheck failed. "
+                f"Detail: {detail or 'unknown error'}"
+            )
+        return "signatory"
+
+    if ok:
+        return "signatory"
+
+    print(
+        "[WARN] signatory precheck failed; falling back to simple backend. "
+        f"Detail: {detail or 'unknown error'}"
+    )
+    return "simple"
+
+
+def compute_path_signature_sequence(
+    states_xy: np.ndarray,
+    window_size: int = DEFAULT_SIGNATURE_WINDOW_SIZE,
+    sig_depth: int = DEFAULT_SIGNATURE_DEPTH,
+    signature_backend: str = DEFAULT_SIGNATURE_BACKEND,
+) -> np.ndarray:
+    """Compute one signature vector per timestep over a fixed-length state path.
+
+    Boundary convention for signature history:
+    - `window_size <= 0` means full-prefix mode: frame `t` uses states `[0, ..., t]`.
+    - `window_size > 0` keeps the legacy sliding-window behavior.
+    """
+
+    if sig_depth <= 0:
+        raise ValueError("sig_depth must be positive.")
+
+    state_array = _as_path_array(states_xy).astype(np.float32, copy=False)
+    resolved_backend = (
+        signature_backend
+        if signature_backend in {"signatory", "simple"}
+        else resolve_signature_backend(signature_backend)
+    )
+    signatures: list[np.ndarray] = []
+
+    for t in range(state_array.shape[0]):
+        if window_size <= 0:
+            window = state_array[: t + 1]
+        else:
+            start = max(0, t - window_size + 1)
+            window = state_array[start : t + 1]
+            if window.shape[0] < window_size:
+                pad = np.repeat(state_array[:1], window_size - window.shape[0], axis=0)
+                window = np.concatenate([pad, window], axis=0)
+
+        if resolved_backend == "signatory":
+            signature = compute_logsignature_np(window, sig_depth)
+        else:
+            signature = compute_simple_signature_np(window, sig_depth)
+        signatures.append(signature)
+
+    return np.stack(signatures, axis=0).astype(np.float32)
+
+
 def encode_phase_labels(phase_names: tuple[str, ...] | list[str]) -> np.ndarray:
     """Map semantic phase names to integer ids."""
 
@@ -267,9 +411,17 @@ def load_processed_dataset(input_path: str | Path) -> ProcessedDemonstrationData
         raise ValueError(f"Processed dataset file is missing keys: {missing_str}")
 
     phase_labels = loaded["phase_labels"] if "phase_labels" in loaded.files else None
+    path_signatures = (
+        loaded["path_signatures"] if "path_signatures" in loaded.files else None
+    )
     return ProcessedDemonstrationDataset(
         observations=np.asarray(loaded["observations"], dtype=np.float32),
         actions=np.asarray(loaded["actions"], dtype=np.float32),
+        path_signatures=(
+            None
+            if path_signatures is None
+            else np.asarray(path_signatures, dtype=np.float32)
+        ),
         task_ids=np.asarray(loaded["task_ids"], dtype=np.int64),
         task_code_bits=np.asarray(loaded["task_code_bits"], dtype=np.int64),
         goal_onehot=np.asarray(loaded["goal_onehot"], dtype=np.float32),
@@ -286,6 +438,34 @@ def load_processed_dataset(input_path: str | Path) -> ProcessedDemonstrationData
         seed=int(np.asarray(loaded["seed"]).item()),
         t_fixed=int(np.asarray(loaded["t_fixed"]).item()),
         action_padding_mode=str(np.asarray(loaded["action_padding_mode"]).item()),
+        path_signature_key=(
+            None
+            if "path_signature_key" not in loaded.files
+            else (
+                lambda value: None if value == "" else value
+            )(str(np.asarray(loaded["path_signature_key"]).item()))
+        ),
+        path_signature_window_size=int(
+            np.asarray(
+                loaded["path_signature_window_size"]
+                if "path_signature_window_size" in loaded.files
+                else 0
+            ).item()
+        ),
+        path_signature_depth=int(
+            np.asarray(
+                loaded["path_signature_depth"]
+                if "path_signature_depth" in loaded.files
+                else 0
+            ).item()
+        ),
+        path_signature_backend=(
+            None
+            if "path_signature_backend" not in loaded.files
+            else (
+                lambda value: None if value == "" else value
+            )(str(np.asarray(loaded["path_signature_backend"]).item()))
+        ),
         phase_label_vocab=tuple(
             str(item) for item in np.asarray(loaded["phase_label_vocab"]).tolist()
         ),
@@ -344,6 +524,10 @@ def _fill_region(
     color: tuple[int, int, int],
     config: MapConfig,
 ) -> None:
+    if hasattr(region, "rectangles"):
+        for rectangle in region.rectangles:
+            _fill_region(image, rectangle, color, config=config)
+        return
     top_left = _workspace_to_pixel(
         (region.xmin, region.ymax),
         config=config,
@@ -384,7 +568,8 @@ def make_lerobot_base_image(
     for obstacle in config.obstacle_rectangles:
         _fill_region(base_image, obstacle, OBSTACLE_COLOR, config=config)
 
-    _fill_region(base_image, config.start_region, START_COLOR, config=config)
+    for start_region in config.task_start_regions:
+        _fill_region(base_image, start_region, START_COLOR, config=config)
     for goal_region in config.goal_regions:
         _fill_region(
             base_image,
@@ -513,9 +698,21 @@ def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> An
 
     state_array = np.asarray(frame_records["observation.state"], dtype=np.float32)
     action_array = np.asarray(frame_records["action"], dtype=np.float32)
-    return pa.Table.from_arrays(
+    arrays = [fixed_size_list_array(pa, state_array, 2)]
+    names = ["observation.state"]
+
+    if DEFAULT_PATH_SIGNATURE_KEY in frame_records:
+        signature_array = np.asarray(
+            frame_records[DEFAULT_PATH_SIGNATURE_KEY],
+            dtype=np.float32,
+        )
+        arrays.append(
+            fixed_size_list_array(pa, signature_array, int(signature_array.shape[1]))
+        )
+        names.append(DEFAULT_PATH_SIGNATURE_KEY)
+
+    arrays.extend(
         [
-            fixed_size_list_array(pa, state_array, 2),
             fixed_size_list_array(pa, action_array, 2),
             pa.array(frame_records["next.reward"], type=pa.float32()),
             pa.array(frame_records["next.done"], type=pa.bool_()),
@@ -525,9 +722,10 @@ def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> An
             pa.array(frame_records["episode_index"], type=pa.int64()),
             pa.array(frame_records["index"], type=pa.int64()),
             pa.array(frame_records["task_index"], type=pa.int64()),
-        ],
-        names=[
-            "observation.state",
+        ]
+    )
+    names.extend(
+        [
             "action",
             "next.reward",
             "next.done",
@@ -537,8 +735,9 @@ def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> An
             "episode_index",
             "index",
             "task_index",
-        ],
+        ]
     )
+    return pa.Table.from_arrays(arrays, names=names)
 
 
 def get_chunk_and_file_index(
@@ -747,6 +946,11 @@ def process_demonstration_dataset(
     raw_dataset: DemonstrationDataset,
     t_fixed: int = DEFAULT_T_FIXED,
     include_phase_labels: bool = True,
+    include_path_signatures: bool = DEFAULT_INCLUDE_PATH_SIGNATURES,
+    path_signature_key: str = DEFAULT_PATH_SIGNATURE_KEY,
+    path_signature_window_size: int = DEFAULT_SIGNATURE_WINDOW_SIZE,
+    path_signature_depth: int = DEFAULT_SIGNATURE_DEPTH,
+    path_signature_backend: str = DEFAULT_SIGNATURE_BACKEND,
     last_action_mode: str = DEFAULT_LAST_ACTION_MODE,
     config: MapConfig | None = None,
 ) -> ProcessedDemonstrationDataset:
@@ -760,6 +964,7 @@ def process_demonstration_dataset(
     num_episodes = len(raw_dataset.episodes)
     observations = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
     actions = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
+    path_signatures: np.ndarray | None = None
     task_ids = np.zeros(num_episodes, dtype=np.int64)
     task_code_bits = np.zeros((num_episodes, 2), dtype=np.int64)
     goal_onehot = np.zeros((num_episodes, len(TASK_ID_VALUES)), dtype=np.float32)
@@ -783,6 +988,17 @@ def process_demonstration_dataset(
     )
     task_counts = validate_task_coverage(raw_task_ids)
     episode_order = build_balanced_episode_order(raw_task_ids, raw_dataset.seed)
+    resolved_signature_backend: str | None = None
+    if include_path_signatures:
+        resolved_signature_backend = resolve_signature_backend(path_signature_backend)
+        window_label = (
+            "all_prefix" if path_signature_window_size <= 0 else str(path_signature_window_size)
+        )
+        print(
+            "Processing demonstrations with path signatures: "
+            f"key={path_signature_key}, window={window_label}, "
+            f"depth={path_signature_depth}, backend={resolved_signature_backend}"
+        )
     print(
         "Processing demonstrations with balanced shuffled order: "
         + ", ".join(
@@ -799,6 +1015,27 @@ def process_demonstration_dataset(
             resampled_path,
             last_action_mode=last_action_mode,
         )
+        if include_path_signatures:
+            signature_sequence = compute_path_signature_sequence(
+                resampled_path,
+                window_size=path_signature_window_size,
+                sig_depth=path_signature_depth,
+                signature_backend=(
+                    DEFAULT_SIGNATURE_BACKEND
+                    if resolved_signature_backend is None
+                    else resolved_signature_backend
+                ),
+            )
+            if path_signatures is None:
+                path_signatures = np.zeros(
+                    (
+                        num_episodes,
+                        t_fixed,
+                        int(signature_sequence.shape[1]),
+                    ),
+                    dtype=np.float32,
+                )
+            path_signatures[episode_index] = signature_sequence
         task_ids[episode_index] = episode.task_id
         task_code_bits[episode_index] = build_task_code_bits(episode.task_id)
         goal_onehot[episode_index] = build_goal_onehot(episode.task_id)
@@ -822,6 +1059,7 @@ def process_demonstration_dataset(
     return ProcessedDemonstrationDataset(
         observations=observations,
         actions=actions,
+        path_signatures=path_signatures,
         task_ids=task_ids,
         task_code_bits=task_code_bits,
         goal_onehot=goal_onehot,
@@ -836,6 +1074,18 @@ def process_demonstration_dataset(
         seed=raw_dataset.seed,
         t_fixed=t_fixed,
         action_padding_mode=last_action_mode,
+        path_signature_key=(
+            None if path_signatures is None else str(path_signature_key)
+        ),
+        path_signature_window_size=(
+            0 if path_signatures is None else int(path_signature_window_size)
+        ),
+        path_signature_depth=(
+            0 if path_signatures is None else int(path_signature_depth)
+        ),
+        path_signature_backend=(
+            None if path_signatures is None else resolved_signature_backend
+        ),
         phase_label_vocab=PHASE_LABEL_VOCAB,
         source_num_per_task_requested=raw_dataset.num_per_task_requested,
         source_solve_time=raw_dataset.solve_time,
@@ -855,7 +1105,7 @@ def save_processed_dataset(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     save_kwargs: dict[str, Any] = {
-        "format_version": np.asarray("braidedhub_act_ready_implicitcue_v2"),
+        "format_version": np.asarray("braidedhub_act_ready_fourstart_implicitcue_sig_v4"),
         "observations": dataset.observations,
         "actions": dataset.actions,
         "task_ids": dataset.task_ids,
@@ -871,6 +1121,20 @@ def save_processed_dataset(
         "seed": np.asarray(dataset.seed, dtype=np.int64),
         "t_fixed": np.asarray(dataset.t_fixed, dtype=np.int64),
         "action_padding_mode": np.asarray(dataset.action_padding_mode),
+        "path_signature_key": np.asarray(
+            "" if dataset.path_signature_key is None else dataset.path_signature_key
+        ),
+        "path_signature_window_size": np.asarray(
+            dataset.path_signature_window_size,
+            dtype=np.int64,
+        ),
+        "path_signature_depth": np.asarray(
+            dataset.path_signature_depth,
+            dtype=np.int64,
+        ),
+        "path_signature_backend": np.asarray(
+            "" if dataset.path_signature_backend is None else dataset.path_signature_backend
+        ),
         "phase_label_vocab": np.asarray(dataset.phase_label_vocab, dtype="<U32"),
         "source_num_per_task_requested": np.asarray(
             dataset.source_num_per_task_requested,
@@ -884,6 +1148,8 @@ def save_processed_dataset(
     }
     if dataset.phase_labels is not None:
         save_kwargs["phase_labels"] = dataset.phase_labels
+    if dataset.path_signatures is not None:
+        save_kwargs["path_signatures"] = dataset.path_signatures
 
     np.savez_compressed(output_path, **save_kwargs)
     print(f"Saved processed dataset with {len(dataset)} samples to {output_path}")
@@ -907,6 +1173,20 @@ def dataset_summary(dataset: ProcessedDemonstrationDataset) -> dict[str, Any]:
     print(f"  fixed_horizon={dataset.t_fixed}")
     print(f"  observation_shape={tuple(dataset.observations.shape)}")
     print(f"  action_shape={tuple(dataset.actions.shape)}")
+    if dataset.path_signatures is not None:
+        window_label = (
+            "all_prefix"
+            if dataset.path_signature_window_size <= 0
+            else str(dataset.path_signature_window_size)
+        )
+        print(f"  path_signature_shape={tuple(dataset.path_signatures.shape)}")
+        print(
+            "  path_signature="
+            f"{dataset.path_signature_key}, "
+            f"window={window_label}, "
+            f"depth={dataset.path_signature_depth}, "
+            f"backend={dataset.path_signature_backend}"
+        )
     print(f"  avg_raw_path_steps={avg_raw_steps:.2f}")
     print(f"  avg_raw_path_distance={avg_raw_distance:.2f}")
     for task_id in TASK_ID_VALUES:
@@ -1071,6 +1351,7 @@ def plot_processed_sample(
     summary_lines = [
         f"task_id={task_id}",
         f"implicit_code={task_code}",
+        f"start_room=S{task_code}",
         f"target_goal={target_goal_name}",
         f"raw_steps={int(dataset.raw_path_lengths[sample_index])}",
         f"phase_flow={' -> '.join(compressed_phases[:6])}",
@@ -1177,6 +1458,8 @@ def generate_lerobot_v30_dataset(
         "next.done": [],
         "next.success": [],
     }
+    if processed_dataset.path_signatures is not None:
+        records[DEFAULT_PATH_SIGNATURE_KEY] = []
     episodes_meta: list[dict[str, Any]] = []
     global_index = 0
     video_frame_counts: dict[int, int] = {}
@@ -1220,10 +1503,17 @@ def generate_lerobot_v30_dataset(
             "next.done": [],
             "next.success": [],
         }
+        if processed_dataset.path_signatures is not None:
+            episode_records[DEFAULT_PATH_SIGNATURE_KEY] = []
 
         for frame_idx in range(episode_length):
             state_xy = observations[frame_idx]
             action_xy = actions[frame_idx]
+            signature_xy = (
+                None
+                if processed_dataset.path_signatures is None
+                else processed_dataset.path_signatures[source_idx, frame_idx]
+            )
             timestamp = frame_idx / fps
             done = frame_idx == episode_length - 1
             success = bool(done and processed_dataset.success[source_idx])
@@ -1245,6 +1535,10 @@ def generate_lerobot_v30_dataset(
                 target_records["next.reward"].append(float(reward))
                 target_records["next.done"].append(bool(done))
                 target_records["next.success"].append(bool(success))
+                if signature_xy is not None:
+                    target_records[DEFAULT_PATH_SIGNATURE_KEY].append(
+                        signature_xy.astype(np.float32).tolist()
+                    )
 
             frame = render_lerobot_frame(
                 base_image,
@@ -1294,6 +1588,11 @@ def generate_lerobot_v30_dataset(
     total_frames = len(records["index"])
     state_array = np.asarray(records["observation.state"], dtype=np.float32)
     action_array = np.asarray(records["action"], dtype=np.float32)
+    signature_array = (
+        None
+        if processed_dataset.path_signatures is None
+        else np.asarray(records[DEFAULT_PATH_SIGNATURE_KEY], dtype=np.float32)
+    )
 
     episodes_table = pa.Table.from_arrays(
         [
@@ -1412,7 +1711,7 @@ def generate_lerobot_v30_dataset(
 
     info = {
         "codebase_version": "v3.0",
-        "robot_type": "point_mass_2d_braidedhub_implicit_cue",
+        "robot_type": "point_mass_2d_braidedhub_fourstart_implicit_cue",
         "total_episodes": int(total_episodes),
         "total_frames": int(total_frames),
         "total_tasks": int(len(TASK_ID_VALUES)),
@@ -1491,6 +1790,35 @@ def generate_lerobot_v30_dataset(
             },
         },
     }
+    if (
+        processed_dataset.path_signatures is not None
+        and processed_dataset.path_signature_key is not None
+        and signature_array is not None
+    ):
+        info["features"][processed_dataset.path_signature_key] = {
+            "dtype": "float32",
+            "shape": [int(signature_array.shape[1])],
+            "names": [
+                f"path_sig_{index}" for index in range(int(signature_array.shape[1]))
+            ],
+        }
+        info["path_signature"] = {
+            "key": processed_dataset.path_signature_key,
+            "window_size": int(processed_dataset.path_signature_window_size),
+            "window_mode": (
+                "full_prefix"
+                if int(processed_dataset.path_signature_window_size) <= 0
+                else "sliding_window"
+            ),
+            "sig_depth": int(processed_dataset.path_signature_depth),
+            "signature_dim": int(signature_array.shape[1]),
+            "kind": (
+                "logsignature"
+                if processed_dataset.path_signature_backend == "signatory"
+                else "simple_signature"
+            ),
+            "backend": processed_dataset.path_signature_backend,
+        }
 
     stats = {
         "observation.state": build_stats(state_array),
@@ -1500,6 +1828,12 @@ def generate_lerobot_v30_dataset(
         ),
         "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
     }
+    if (
+        processed_dataset.path_signatures is not None
+        and processed_dataset.path_signature_key is not None
+        and signature_array is not None
+    ):
+        stats[processed_dataset.path_signature_key] = build_stats(signature_array)
 
     with info_file.open("w", encoding="utf-8") as info_handle:
         json.dump(info, info_handle, indent=4, ensure_ascii=False)
@@ -1525,25 +1859,15 @@ def generate_lerobot_v30_dataset(
 
 
 def main() -> None:
-    raw_output_path = Path(DEFAULT_DATASET_OUTPUT)
-    if raw_output_path.exists():
-        raw_dataset = load_demonstrations(raw_output_path)
-        print(f"Loaded raw demonstrations from {raw_output_path}")
-    else:
-        raw_dataset = generate_demonstrations(
-            num_per_task=25,
-            seed=DEFAULT_RANDOM_SEED,
-        )
-        save_demonstrations(raw_dataset, raw_output_path)
+    raw_dataset = generate_demonstrations(
+        num_per_task=25,
+        seed=DEFAULT_RANDOM_SEED,
+    )
 
     processed_dataset = process_demonstration_dataset(
         raw_dataset,
         t_fixed=DEFAULT_T_FIXED,
         include_phase_labels=True,
-    )
-    processed_output_path = save_processed_dataset(
-        processed_dataset,
-        DEFAULT_PROCESSED_OUTPUT,
     )
     dataset_summary(processed_dataset)
     lerobot_output_path: Path | None = None
@@ -1566,9 +1890,10 @@ def main() -> None:
     except RuntimeError as exc:
         print(f"Visualization skipped: {exc}")
 
-    print(f"Processed dataset ready at {processed_output_path}")
     if lerobot_output_path is not None:
         print(f"LeRobot v3.0 dataset ready at {lerobot_output_path}")
+    else:
+        print("Processed dataset prepared in memory; no NPZ file was written.")
 
 
 if __name__ == "__main__":
