@@ -7,16 +7,8 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 
-try:
-    import pandas as pd
-except Exception as exc:  # pragma: no cover - dependency guard
-    raise RuntimeError(
-        "pandas is required to write meta/tasks.parquet. Run with: "
-        "uv run --with numpy --with pyarrow --with pandas main/scripts/rrt_connect_h_env.py"
-    ) from exc
+from env import get_env_choices, get_env_module
 
 
 VIDEO_KEY = "observation.images.front"
@@ -24,6 +16,19 @@ TASKS = [
     "Navigate through the upper bridge of the H-maze from left to right.",
     "Navigate through the lower bridge of the H-maze from left to right.",
 ]
+
+
+def _require_h_shape_export_dependencies():
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "h_shape dataset export requires `pyarrow` and `pandas`. "
+            "Install them first before exporting LeRobot files."
+        ) from exc
+    return pa, pq, pd
 
 
 def create_h_shape_grid(
@@ -409,6 +414,7 @@ def generate_lerobot_v30_dataset(
     fps=20,
     image_size=128,
 ):
+    pa, pq, pd = _require_h_shape_export_dependencies()
     rng = random.Random(seed)
     np.random.seed(seed)
 
@@ -733,21 +739,145 @@ def generate_lerobot_v30_dataset(
 
     print(f"Generated LeRobotDataset v3.0 at: {root.resolve()}")
     print(f"Episodes: {num_episodes}, Frames: {total_frames}, Video frames: {video_info['frames']}")
+    return root
+
+
+def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--env", choices=get_env_choices(), default="h_shape")
+    known_args, _ = bootstrap.parse_known_args(argv)
+    env_module = get_env_module(known_args.env)
+    defaults = env_module.get_dataset_defaults()
+
+    parser = argparse.ArgumentParser(
+        description="Collect imitation datasets for supported environments."
+    )
+    parser.add_argument("--env", choices=get_env_choices(), default=known_args.env)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=Path, default=defaults["output_dir"])
+    parser.add_argument("--fps", type=int, default=defaults["fps"])
+    parser.add_argument("--image-size", type=int, default=defaults["image_size"])
+
+    if known_args.env == "h_shape":
+        parser.add_argument(
+            "--num-episodes",
+            type=int,
+            default=defaults["num_episodes"],
+            help="Total number of synthetic H-shape episodes to export.",
+        )
+    else:
+        import planner_utils
+
+        parser.add_argument(
+            "--num-per-task",
+            type=int,
+            default=defaults["num_per_task"],
+            help="Number of successful demonstrations to keep for each braidedhub task.",
+        )
+        parser.add_argument(
+            "--solve-time",
+            type=float,
+            default=planner_utils.DEFAULT_SOLVE_TIME,
+            help="Planner budget per RRTConnect segment.",
+        )
+        parser.add_argument(
+            "--max-retries-per-demo",
+            type=int,
+            default=planner_utils.DEFAULT_RETRIES_PER_DEMO,
+            help="Maximum retries before skipping one braidedhub sample.",
+        )
+        parser.add_argument(
+            "--low-success-warning-threshold",
+            type=float,
+            default=planner_utils.DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD,
+        )
+        parser.add_argument(
+            "--enable-randomize",
+            action="store_true",
+            help=(
+                "Randomize the braidedhub reset start state within each task's "
+                "start region. Default behavior uses the region center."
+            ),
+        )
+        parser.add_argument(
+            "--t-fixed",
+            type=int,
+            default=defaults["t_fixed"],
+            help="Fixed resampled horizon used before LeRobot export.",
+        )
+        parser.add_argument(
+            "--episodes-per-chunk",
+            type=int,
+            default=defaults["episodes_per_chunk"],
+        )
+        parser.add_argument(
+            "--raw-output",
+            type=Path,
+            default=defaults["raw_output"],
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--processed-output",
+            type=Path,
+            default=defaults["processed_output"],
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--disable-phase-labels",
+            action="store_true",
+            help="Skip writing phase labels into the processed braidedhub dataset.",
+        )
+        parser.add_argument(
+            "--disable-path-signature",
+            action="store_true",
+            help="Skip braidedhub path-signature preprocessing.",
+        )
+        parser.add_argument(
+            "--path-signature-window-size",
+            type=int,
+            default=0,
+            help="0 means full-prefix signatures; positive values use sliding windows.",
+        )
+        parser.add_argument(
+            "--path-signature-depth",
+            type=int,
+            default=env_module.DEFAULT_SIGNATURE_DEPTH,
+        )
+        parser.add_argument(
+            "--signature-backend",
+            type=str,
+            default=env_module.DEFAULT_SIGNATURE_BACKEND,
+            choices=["auto", "signatory", "simple"],
+        )
+        parser.add_argument(
+            "--skip-lerobot-export",
+            action="store_true",
+            help="Process demonstrations in memory but skip LeRobot dataset export.",
+        )
+
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    if args.env == "h_shape":
+        output_path = generate_lerobot_v30_dataset(
+            num_episodes=args.num_episodes,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            fps=args.fps,
+            image_size=args.image_size,
+        )
+    else:
+        env_module = get_env_module(args.env)
+        output_path = env_module.collect_dataset(args)
+    print(f"Dataset collection complete: {output_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate an H-maze synthetic LeRobotDataset v3.0")
-    parser.add_argument("--num-episodes", type=int, default=100)
-    parser.add_argument("--output-dir", type=str, default="data/zeno-ai/rrt_connect_h_v30")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fps", type=int, default=20)
-    parser.add_argument("--image-size", type=int, default=128)
-    args = parser.parse_args()
-
-    generate_lerobot_v30_dataset(
-        num_episodes=args.num_episodes,
-        output_dir=args.output_dir,
-        seed=args.seed,
-        fps=args.fps,
-        image_size=args.image_size,
-    )
+    main()

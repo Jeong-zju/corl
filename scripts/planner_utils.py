@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 try:
-    from .shared_channel_double_loop_map import (
+    from .env.braidedhub_env import (
         DEFAULT_RANDOM_SEED,
         BraidedHub2DEnv,
         MapConfig,
@@ -25,7 +25,7 @@ try:
         sample_valid_state_in_region,
     )
 except ImportError:
-    from shared_channel_double_loop_map import (
+    from env.braidedhub_env import (
         DEFAULT_RANDOM_SEED,
         BraidedHub2DEnv,
         MapConfig,
@@ -111,6 +111,29 @@ def _distance(point_a: tuple[float, float], point_b: tuple[float, float]) -> flo
     dx = point_a[0] - point_b[0]
     dy = point_a[1] - point_b[1]
     return math.hypot(dx, dy)
+
+
+def _mix_seed(state: int, value: int) -> int:
+    return (
+        state
+        ^ (
+            value
+            + 0x9E3779B9
+            + ((state << 6) & 0xFFFFFFFF)
+            + (state >> 2)
+        )
+    ) & 0xFFFFFFFF
+
+
+def _derive_seed(*values: int | float) -> int:
+    state = 0xA5A5A5A5
+    for value in values:
+        if isinstance(value, float):
+            normalized = int(round(value * 10_000.0))
+        else:
+            normalized = int(value)
+        state = _mix_seed(state, normalized & 0xFFFFFFFF)
+    return state & 0xFFFFFFFF
 
 
 def _steer(
@@ -389,6 +412,7 @@ def plan_path_rrtconnect(
     solve_time: float = DEFAULT_SOLVE_TIME,
     config: MapConfig | None = None,
     interpolate_solution: bool = True,
+    rng_seed: int | None = None,
 ) -> list[tuple[float, float]] | None:
     """Plan a single 2D geometric path with a self-contained RRTConnect."""
 
@@ -415,15 +439,14 @@ def plan_path_rrtconnect(
         return straight_path
 
     seed = (
-        hash(
-            (
-                round(start_xy[0], 4),
-                round(start_xy[1], 4),
-                round(goal_xy[0], 4),
-                round(goal_xy[1], 4),
-            )
+        _derive_seed(
+            round(start_xy[0], 4),
+            round(start_xy[1], 4),
+            round(goal_xy[0], 4),
+            round(goal_xy[1], 4),
         )
-        & 0xFFFFFFFF
+        if rng_seed is None
+        else int(rng_seed) & 0xFFFFFFFF
     )
     rng = random.Random(seed)
 
@@ -503,6 +526,7 @@ def plan_path_rrtconnect_via_waypoints(
     solve_time: float = DEFAULT_SOLVE_TIME,
     config: MapConfig | None = None,
     interpolate_solution: bool = True,
+    rng_seed: int | None = None,
 ) -> list[tuple[float, float]] | None:
     """Plan a piecewise path that must pass through intermediate task waypoints."""
 
@@ -511,13 +535,28 @@ def plan_path_rrtconnect_via_waypoints(
 
     resolved_config = _resolve_config(config)
     concatenated_path: list[tuple[float, float]] = []
-    for start_point, goal_point in zip(waypoints_xy[:-1], waypoints_xy[1:], strict=False):
+    for segment_index, (start_point, goal_point) in enumerate(
+        zip(waypoints_xy[:-1], waypoints_xy[1:], strict=False)
+    ):
+        segment_seed = (
+            None
+            if rng_seed is None
+            else _derive_seed(
+                rng_seed,
+                segment_index,
+                round(start_point[0], 4),
+                round(start_point[1], 4),
+                round(goal_point[0], 4),
+                round(goal_point[1], 4),
+            )
+        )
         segment_path = plan_path_rrtconnect(
             start_xy=start_point,
             goal_xy=goal_point,
             solve_time=solve_time,
             config=resolved_config,
             interpolate_solution=interpolate_solution,
+            rng_seed=segment_seed,
         )
         if segment_path is None:
             return None
@@ -617,6 +656,7 @@ def generate_demonstrations(
     solve_time: float = DEFAULT_SOLVE_TIME,
     max_retries_per_demo: int = DEFAULT_RETRIES_PER_DEMO,
     low_success_warning_threshold: float = DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD,
+    enable_randomize: bool = False,
     config: MapConfig | None = None,
 ) -> DemonstrationDataset:
     """Generate task-conditioned RRTConnect demonstrations for all four tasks.
@@ -638,7 +678,11 @@ def generate_demonstrations(
         raise ValueError("max_retries_per_demo must be positive.")
 
     resolved_config = _resolve_config(config)
-    env = BraidedHub2DEnv(map_config=resolved_config, rng_seed=seed)
+    env = BraidedHub2DEnv(
+        map_config=resolved_config,
+        rng_seed=seed,
+        enable_randomize=enable_randomize,
+    )
 
     episodes: list[DemonstrationEpisode] = []
     success_counts_by_task = {task_id: 0 for task_id in TASK_ID_TO_GOAL_NAME}
@@ -673,10 +717,12 @@ def generate_demonstrations(
                     goal_xy=goal_xy,
                     config=resolved_config,
                 )
+                planning_seed = _derive_seed(seed, task_id, sample_index, retry_index)
                 success_path = plan_path_rrtconnect_via_waypoints(
                     waypoints_xy=route_waypoints,
                     solve_time=solve_time,
                     config=resolved_config,
+                    rng_seed=planning_seed,
                 )
                 if success_path is not None:
                     path_ok, reject_reason = _validate_task_conditioned_path(
@@ -922,6 +968,7 @@ def run_single_rrtconnect_demo(
         waypoints_xy=route_waypoints,
         solve_time=solve_time,
         config=resolved_config,
+        rng_seed=rng_seed,
     )
 
     if path is not None and show_plot:
