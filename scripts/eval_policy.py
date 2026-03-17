@@ -91,7 +91,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--enable-randomize",
         action="store_true",
         help=(
-            "For braidedhub evaluation, randomize the reset start state within "
+            "Randomize the reset start state within "
             "the task start region instead of using the region center."
         ),
     )

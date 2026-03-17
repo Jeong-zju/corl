@@ -768,34 +768,49 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     else:
         import planner_utils
 
+        solve_time_default = getattr(
+            env_module,
+            "DEFAULT_SOLVE_TIME",
+            planner_utils.DEFAULT_SOLVE_TIME,
+        )
+        retries_default = getattr(
+            env_module,
+            "DEFAULT_RETRIES_PER_DEMO",
+            planner_utils.DEFAULT_RETRIES_PER_DEMO,
+        )
+        low_success_warning_default = getattr(
+            env_module,
+            "DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD",
+            planner_utils.DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD,
+        )
         parser.add_argument(
             "--num-per-task",
             type=int,
             default=defaults["num_per_task"],
-            help="Number of successful demonstrations to keep for each braidedhub task.",
+            help="Number of successful demonstrations to keep for each task.",
         )
         parser.add_argument(
             "--solve-time",
             type=float,
-            default=planner_utils.DEFAULT_SOLVE_TIME,
+            default=solve_time_default,
             help="Planner budget per RRTConnect segment.",
         )
         parser.add_argument(
             "--max-retries-per-demo",
             type=int,
-            default=planner_utils.DEFAULT_RETRIES_PER_DEMO,
-            help="Maximum retries before skipping one braidedhub sample.",
+            default=retries_default,
+            help="Maximum retries before skipping one demonstration.",
         )
         parser.add_argument(
             "--low-success-warning-threshold",
             type=float,
-            default=planner_utils.DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD,
+            default=low_success_warning_default,
         )
         parser.add_argument(
             "--enable-randomize",
             action="store_true",
             help=(
-                "Randomize the braidedhub reset start state within each task's "
+                "Randomize the reset start state within each task's "
                 "start region. Default behavior uses the region center."
             ),
         )
@@ -825,12 +840,12 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         parser.add_argument(
             "--disable-phase-labels",
             action="store_true",
-            help="Skip writing phase labels into the processed braidedhub dataset.",
+            help="Skip writing phase labels into the processed dataset.",
         )
         parser.add_argument(
             "--disable-path-signature",
             action="store_true",
-            help="Skip braidedhub path-signature preprocessing.",
+            help="Skip path-signature preprocessing.",
         )
         parser.add_argument(
             "--path-signature-window-size",

@@ -6,6 +6,7 @@ from importlib import import_module
 _ENV_MODULES = {
     "h_shape": "env.h_shape_env",
     "braidedhub": "env.braidedhub_env",
+    "panda_route": "env.panda_route_env",
 }
 
 
