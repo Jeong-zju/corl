@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from xml.etree import ElementTree as ET
 
 import numpy as np
 
@@ -66,6 +68,25 @@ DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD = 0.80
 DEFAULT_STEP_PENALTY = -0.01
 DEFAULT_GOAL_REWARD = 1.0
 DEFAULT_START_RANDOMIZE = False
+DEFAULT_PANDA_DESCRIPTION_NAME = "panda_mj_description"
+DEFAULT_PANDA_DESCRIPTION_VARIANT = "panda_nohand"
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+LOCAL_MUJOCO_MENAGERIE_ROOT = WORKSPACE_ROOT / "mujoco_menagerie"
+LOCAL_FRANKA_PANDA_ROOT = LOCAL_MUJOCO_MENAGERIE_ROOT / "franka_emika_panda"
+ROBOT_DESCRIPTIONS_CACHE_ROOT = WORKSPACE_ROOT / ".robot_descriptions_cache"
+FRANKA_ARM_JOINT_NAMES = tuple(f"joint{index}" for index in range(1, 8))
+LEGACY_ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
+FRANKA_FINGER_JOINT_NAMES = ("finger_joint1", "finger_joint2")
+FRANKA_HOME_QPOS = np.asarray(
+    [0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853],
+    dtype=np.float64,
+)
+LEGACY_HOME_QPOS = np.asarray(
+    [0.0, 0.4, 0.0, -1.8, 0.0, 1.6, 0.0],
+    dtype=np.float64,
+)
+FRANKA_OPEN_GRIPPER_QPOS = 0.04
 
 TASK_ID_TO_START_NAME = {
     0: "S1",
@@ -980,10 +1001,249 @@ def _rectangle_to_mjcf_geom(
     )
 
 
-def build_panda_route_mjcf(config: MapConfig) -> str:
+def _normalize_panda_description_variant(variant: str | None) -> str:
+    normalized = (
+        DEFAULT_PANDA_DESCRIPTION_VARIANT
+        if variant is None
+        else str(variant).strip()
+    )
+    if normalized.endswith(".xml"):
+        normalized = normalized[:-4]
+    if not normalized:
+        normalized = DEFAULT_PANDA_DESCRIPTION_VARIANT
+    return normalized
+
+
+def _ensure_local_robot_descriptions_cache() -> None:
+    if "ROBOT_DESCRIPTIONS_CACHE" in os.environ:
+        return
+    if not LOCAL_MUJOCO_MENAGERIE_ROOT.is_dir():
+        return
+    cache_repo_path = ROBOT_DESCRIPTIONS_CACHE_ROOT / "mujoco_menagerie"
+    ROBOT_DESCRIPTIONS_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    if not cache_repo_path.exists():
+        try:
+            cache_repo_path.symlink_to(
+                LOCAL_MUJOCO_MENAGERIE_ROOT,
+                target_is_directory=True,
+            )
+        except OSError:
+            shutil.copytree(
+                LOCAL_MUJOCO_MENAGERIE_ROOT,
+                cache_repo_path,
+                dirs_exist_ok=True,
+            )
+    os.environ["ROBOT_DESCRIPTIONS_CACHE"] = str(ROBOT_DESCRIPTIONS_CACHE_ROOT)
+
+
+def get_franka_panda_mjcf_path(
+    variant: str | None = DEFAULT_PANDA_DESCRIPTION_VARIANT,
+) -> Path:
+    normalized_variant = _normalize_panda_description_variant(variant)
+    filename = "panda.xml" if normalized_variant == "panda" else f"{normalized_variant}.xml"
+    _ensure_local_robot_descriptions_cache()
+    try:
+        from robot_descriptions import panda_mj_description
+    except Exception:
+        panda_package_path = None
+    else:
+        panda_package_path = Path(panda_mj_description.PACKAGE_PATH)
+        candidate_path = panda_package_path / filename
+        if candidate_path.is_file():
+            return candidate_path.resolve()
+    fallback_path = LOCAL_FRANKA_PANDA_ROOT / filename
+    if fallback_path.is_file():
+        return fallback_path.resolve()
+    raise FileNotFoundError(
+        "Could not locate the Franka Emika Panda MJCF description. "
+        f"Tried variant={normalized_variant!r} via robot_descriptions and {fallback_path}."
+    )
+
+
+def load_franka_panda_model(
+    variant: str | None = DEFAULT_PANDA_DESCRIPTION_VARIANT,
+) -> "mujoco.MjModel":
+    if mujoco is None:  # pragma: no cover
+        raise RuntimeError(
+            "mujoco is required to load the Franka Emika Panda model."
+        ) from _MUJOCO_IMPORT_ERROR
+    return mujoco.MjModel.from_xml_path(str(get_franka_panda_mjcf_path(variant)))
+
+
+def _find_named_mjcf_element(
+    root: ET.Element,
+    tag: str,
+    name: str,
+) -> ET.Element | None:
+    for element in root.iter(tag):
+        if element.get("name") == name:
+            return element
+    return None
+
+
+def _append_route_scene_assets(root: ET.Element) -> None:
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(root, "asset")
+    if _find_named_mjcf_element(asset, "texture", "ground_tex") is None:
+        ET.SubElement(
+            asset,
+            "texture",
+            {
+                "name": "ground_tex",
+                "type": "2d",
+                "builtin": "checker",
+                "rgb1": "0.92 0.92 0.90",
+                "rgb2": "0.84 0.84 0.82",
+                "width": "512",
+                "height": "512",
+            },
+        )
+    if _find_named_mjcf_element(asset, "material", "ground_mat") is None:
+        ET.SubElement(
+            asset,
+            "material",
+            {
+                "name": "ground_mat",
+                "texture": "ground_tex",
+                "texrepeat": "8 8",
+                "specular": "0.0",
+                "shininess": "0.0",
+                "reflectance": "0.0",
+            },
+        )
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.SubElement(root, "visual")
+    if visual.find("headlight") is None:
+        ET.SubElement(
+            visual,
+            "headlight",
+            {
+                "ambient": "0.35 0.35 0.35",
+                "diffuse": "0.85 0.85 0.85",
+                "specular": "0.15 0.15 0.15",
+            },
+        )
+    if visual.find("map") is None:
+        ET.SubElement(visual, "map", {"znear": "0.001"})
+
+
+def _append_route_probe_site(root: ET.Element) -> None:
+    if _find_named_mjcf_element(root, "site", "probe_tip") is not None:
+        return
+    attachment_body = _find_named_mjcf_element(root, "body", "attachment")
+    if attachment_body is not None:
+        ET.SubElement(
+            attachment_body,
+            "site",
+            {
+                "name": "probe_tip",
+                "type": "sphere",
+                "pos": "0 0 0",
+                "size": "0.010",
+                "rgba": "0.90 0.15 0.15 1.0",
+            },
+        )
+        return
+    hand_body = _find_named_mjcf_element(root, "body", "hand")
+    if hand_body is not None:
+        ET.SubElement(
+            hand_body,
+            "site",
+            {
+                "name": "probe_tip",
+                "type": "sphere",
+                "pos": "0 0 0.103",
+                "size": "0.010",
+                "rgba": "0.90 0.15 0.15 1.0",
+            },
+        )
+        return
+    raise RuntimeError("Could not attach a probe_tip site to the Franka Panda MJCF.")
+
+
+def _append_route_world_geoms(root: ET.Element, config: MapConfig) -> None:
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise RuntimeError("Franka Panda MJCF does not define a worldbody.")
+    if _find_named_mjcf_element(worldbody, "geom", "ground") is None:
+        worldbody.insert(
+            0,
+            ET.Element(
+                "geom",
+                {
+                    "name": "ground",
+                    "type": "plane",
+                    "size": "2 2 0.05",
+                    "material": "ground_mat",
+                    "contype": "1",
+                    "conaffinity": "1",
+                },
+            ),
+        )
+
     wall_height = 0.035
     marker_height = 0.002
-    obstacle_geoms = "\n      ".join(
+    geoms = [
+        _rectangle_to_mjcf_geom(
+            config.task_start_regions[0],
+            height=marker_height,
+            rgba=(0.30, 0.47, 0.66, 0.55),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.task_start_regions[1],
+            height=marker_height,
+            rgba=(0.30, 0.47, 0.66, 0.55),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.merge_region_m1.rectangles[0],
+            height=marker_height,
+            rgba=(0.55, 0.55, 0.55, 0.45),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.upper_hole_region.rectangles[0],
+            height=marker_height,
+            rgba=(0.17, 0.62, 0.17, 0.55),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.lower_hole_region.rectangles[0],
+            height=marker_height,
+            rgba=(0.58, 0.40, 0.74, 0.55),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.merge_region_m2.rectangles[0],
+            height=marker_height,
+            rgba=(0.55, 0.55, 0.55, 0.45),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.goal_regions[0],
+            height=marker_height,
+            rgba=(0.10, 0.62, 0.47, 0.60),
+            contype=0,
+            conaffinity=0,
+        ),
+        _rectangle_to_mjcf_geom(
+            config.goal_regions[1],
+            height=marker_height,
+            rgba=(0.85, 0.37, 0.08, 0.60),
+            contype=0,
+            conaffinity=0,
+        ),
+    ]
+    geoms.extend(
         _rectangle_to_mjcf_geom(
             obstacle,
             height=wall_height,
@@ -991,138 +1251,77 @@ def build_panda_route_mjcf(config: MapConfig) -> str:
         )
         for obstacle in config.obstacle_rectangles
     )
-    floor_markers = "\n      ".join(
-        [
-            _rectangle_to_mjcf_geom(
-                config.task_start_regions[0],
-                height=marker_height,
-                rgba=(0.30, 0.47, 0.66, 0.55),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.task_start_regions[1],
-                height=marker_height,
-                rgba=(0.30, 0.47, 0.66, 0.55),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.merge_region_m1.rectangles[0],
-                height=marker_height,
-                rgba=(0.55, 0.55, 0.55, 0.45),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.upper_hole_region.rectangles[0],
-                height=marker_height,
-                rgba=(0.17, 0.62, 0.17, 0.55),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.lower_hole_region.rectangles[0],
-                height=marker_height,
-                rgba=(0.58, 0.40, 0.74, 0.55),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.merge_region_m2.rectangles[0],
-                height=marker_height,
-                rgba=(0.55, 0.55, 0.55, 0.45),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.goal_regions[0],
-                height=marker_height,
-                rgba=(0.10, 0.62, 0.47, 0.60),
-                contype=0,
-                conaffinity=0,
-            ),
-            _rectangle_to_mjcf_geom(
-                config.goal_regions[1],
-                height=marker_height,
-                rgba=(0.85, 0.37, 0.08, 0.60),
-                contype=0,
-                conaffinity=0,
-            ),
+    for geom_xml in geoms:
+        geom = ET.fromstring(geom_xml)
+        if _find_named_mjcf_element(worldbody, "geom", geom.get("name", "")) is None:
+            worldbody.append(geom)
+
+
+def build_panda_route_mjcf(
+    config: MapConfig,
+    robot_variant: str | None = DEFAULT_PANDA_DESCRIPTION_VARIANT,
+) -> str:
+    base_xml_path = get_franka_panda_mjcf_path(robot_variant)
+    root = ET.fromstring(base_xml_path.read_text())
+    root.set("model", "panda_route")
+    compiler = root.find("compiler")
+    if compiler is not None:
+        compiler.set("meshdir", str((base_xml_path.parent / "assets").resolve()))
+    _append_route_scene_assets(root)
+    _append_route_probe_site(root)
+    _append_route_world_geoms(root, config)
+    return ET.tostring(root, encoding="unicode")
+
+
+def _resolve_arm_joint_names(model: "mujoco.MjModel") -> tuple[str, ...]:
+    for joint_names in (FRANKA_ARM_JOINT_NAMES, LEGACY_ARM_JOINT_NAMES):
+        joint_ids = [
+            int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name))
+            for joint_name in joint_names
         ]
-    )
-    return f"""
-<mujoco model="panda_route">
-  <compiler angle="radian" coordinate="local" autolimits="true"/>
-  <option timestep="0.002" gravity="0 0 -9.81" iterations="50" integrator="RK4"/>
-  <visual>
-    <headlight ambient="0.35 0.35 0.35" diffuse="0.85 0.85 0.85" specular="0.15 0.15 0.15"/>
-    <map znear="0.001"/>
-  </visual>
-  <asset>
-    <texture name="ground_tex" type="2d" builtin="checker" rgb1="0.92 0.92 0.90" rgb2="0.84 0.84 0.82" width="512" height="512"/>
-    <material name="ground_mat" texture="ground_tex" texrepeat="8 8" specular="0.0" shininess="0.0" reflectance="0.0"/>
-    <material name="panda_grey" rgba="0.80 0.82 0.84 1.0"/>
-    <material name="panda_dark" rgba="0.24 0.24 0.26 1.0"/>
-    <material name="probe_red" rgba="0.86 0.21 0.18 1.0"/>
-  </asset>
-  <worldbody>
-    <light name="key" pos="0.55 -0.65 1.35" dir="-0.1 0.2 -1.0" diffuse="1 1 1"/>
-    <geom name="ground" type="plane" size="2 2 0.05" material="ground_mat" contype="1" conaffinity="1"/>
-    {floor_markers}
-    {obstacle_geoms}
-    <body name="panda_base" pos="0 0 0.0">
-      <geom name="base_pedestal" type="cylinder" size="0.085 0.05" pos="0 0 0.05" material="panda_dark"/>
-      <body name="panda_link1" pos="0 0 0.30">
-        <joint name="panda_joint1" type="hinge" axis="0 0 1" range="-2.9 2.9" damping="1.0"/>
-        <geom name="link1_geom" type="capsule" fromto="0 0 -0.20 0 0 0.00" size="0.05" material="panda_grey"/>
-        <body name="panda_link2" pos="0 0 0.0">
-          <joint name="panda_joint2" type="hinge" axis="0 1 0" range="-2.5 2.5" damping="1.0"/>
-          <geom name="link2_geom" type="capsule" fromto="0 0 0 0.28 0 0" size="0.04" material="panda_grey"/>
-          <body name="panda_link3" pos="0.28 0 0">
-            <joint name="panda_joint3" type="hinge" axis="1 0 0" range="-2.9 2.9" damping="0.8"/>
-            <geom name="link3_geom" type="capsule" fromto="0 0 0 0.02 0 0.06" size="0.035" material="panda_grey"/>
-            <body name="panda_link4" pos="0.02 0 0.06">
-              <joint name="panda_joint4" type="hinge" axis="0 1 0" range="-2.9 0.2" damping="0.8"/>
-              <geom name="link4_geom" type="capsule" fromto="0 0 0 0.24 0 0" size="0.035" material="panda_grey"/>
-              <body name="panda_link5" pos="0.24 0 0">
-                <joint name="panda_joint5" type="hinge" axis="1 0 0" range="-2.9 2.9" damping="0.5"/>
-                <geom name="link5_geom" type="capsule" fromto="0 0 0 0.02 0 0.05" size="0.03" material="panda_grey"/>
-                <body name="panda_link6" pos="0.02 0 0.05">
-                  <joint name="panda_joint6" type="hinge" axis="0 1 0" range="-2.9 2.9" damping="0.5"/>
-                  <geom name="link6_geom" type="capsule" fromto="0 0 0 0.18 0 0" size="0.028" material="panda_grey"/>
-                  <body name="panda_link7" pos="0.18 0 0">
-                    <joint name="panda_joint7" type="hinge" axis="1 0 0" range="-2.9 2.9" damping="0.3"/>
-                    <geom name="link7_geom" type="capsule" fromto="0 0 0 0.10 0 0" size="0.024" material="panda_grey"/>
-                    <body name="panda_hand" pos="0.10 0 0">
-                      <geom name="hand_geom" type="box" pos="0.025 0 0" size="0.04 0.03 0.025" material="panda_dark"/>
-                      <geom name="finger_left" type="box" pos="0.055 0.018 -0.005" size="0.018 0.005 0.030" material="panda_grey"/>
-                      <geom name="finger_right" type="box" pos="0.055 -0.018 -0.005" size="0.018 0.005 0.030" material="panda_grey"/>
-                      <site name="probe_tip" type="sphere" pos="0.070 0 -0.060" size="0.012" rgba="0.90 0.15 0.15 1.0"/>
-                    </body>
-                  </body>
-                </body>
-              </body>
-            </body>
-          </body>
-        </body>
-      </body>
-    </body>
-  </worldbody>
-</mujoco>
-""".strip()
+        if all(joint_id >= 0 for joint_id in joint_ids):
+            return joint_names
+    raise RuntimeError("Could not resolve the Panda arm joints in the MuJoCo model.")
+
+
+def _resolve_optional_qpos_indices(
+    model: "mujoco.MjModel",
+    joint_names: tuple[str, ...],
+) -> np.ndarray:
+    indices: list[int] = []
+    for joint_name in joint_names:
+        joint_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name))
+        if joint_id < 0:
+            continue
+        indices.append(int(model.jnt_qposadr[joint_id]))
+    return np.asarray(indices, dtype=np.int64)
+
+
+def _default_home_qpos_for_joint_names(joint_names: tuple[str, ...]) -> np.ndarray:
+    if joint_names == FRANKA_ARM_JOINT_NAMES:
+        return FRANKA_HOME_QPOS.copy()
+    return LEGACY_HOME_QPOS.copy()
+
+
+def _resolve_probe_site_name(model: "mujoco.MjModel") -> str:
+    for site_name in ("probe_tip", "attachment_site"):
+        site_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name))
+        if site_id >= 0:
+            return site_name
+    raise RuntimeError("Could not resolve a probe site in the MuJoCo model.")
 
 
 class PandaRouteMjEnv(PandaRouteSemanticEnv):
-    PROBE_TARGET_Z = 0.060
+    PROBE_TARGET_Z = 0.100
     IK_TOLERANCE = 5e-4
-    IK_MAX_ITERS = 120
+    IK_ACCEPT_RESIDUAL = 1e-2
+    IK_MAX_ITERS = 240
     IK_DAMPING = 2e-2
     IK_REGULARIZATION = 1e-2
-    RENDER_LOOKAT = np.asarray([0.46, 0.0, 0.10], dtype=np.float64)
-    RENDER_DISTANCE = 1.08
-    RENDER_AZIMUTH = 90.0
-    RENDER_ELEVATION = -72.0
+    RENDER_LOOKAT = np.asarray([0.45, 0.0, 0.24], dtype=np.float64)
+    RENDER_DISTANCE = 1.35
+    RENDER_AZIMUTH = 135.0
+    RENDER_ELEVATION = -28.0
 
     def __init__(
         self,
@@ -1132,6 +1331,7 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
         step_penalty: float = DEFAULT_STEP_PENALTY,
         goal_reward: float = DEFAULT_GOAL_REWARD,
         image_size: int = DEFAULT_IMAGE_SIZE,
+        robot_variant: str = DEFAULT_PANDA_DESCRIPTION_VARIANT,
     ) -> None:
         if mujoco is None:  # pragma: no cover
             raise RuntimeError(
@@ -1145,21 +1345,21 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
             goal_reward=goal_reward,
             image_size=image_size,
         )
+        self.robot_variant = _normalize_panda_description_variant(robot_variant)
         self.model = mujoco.MjModel.from_xml_string(
-            build_panda_route_mjcf(self.map_config)
+            build_panda_route_mjcf(
+                self.map_config,
+                robot_variant=self.robot_variant,
+            )
         )
         self.data = mujoco.MjData(self.model)
-        self.renderer = mujoco.Renderer(
-            self.model,
-            height=self.image_size,
-            width=self.image_size,
-        )
+        self.renderer = None
         self.camera = mujoco.MjvCamera()
         self.camera.lookat[:] = self.RENDER_LOOKAT
         self.camera.distance = float(self.RENDER_DISTANCE)
         self.camera.azimuth = float(self.RENDER_AZIMUTH)
         self.camera.elevation = float(self.RENDER_ELEVATION)
-        self.joint_names = tuple(f"panda_joint{index}" for index in range(1, 8))
+        self.joint_names = _resolve_arm_joint_names(self.model)
         self.joint_ids = tuple(
             int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name))
             for joint_name in self.joint_names
@@ -1177,21 +1377,37 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
         self.joint_range = self.model.jnt_range[
             np.asarray(self.joint_ids, dtype=np.intp)
         ].astype(np.float64)
+        self.gripper_qpos_indices = _resolve_optional_qpos_indices(
+            self.model,
+            FRANKA_FINGER_JOINT_NAMES,
+        )
+        self.home_keyframe_id = int(
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        )
+        self.site_name = _resolve_probe_site_name(self.model)
         self.site_id = int(
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "probe_tip")
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, self.site_name)
         )
         if self.site_id < 0:
-            raise RuntimeError("Could not resolve probe_tip site in MuJoCo model.")
-        self.home_qpos = np.asarray(
-            [0.0, 0.4, 0.0, -1.8, 0.0, 1.6, 0.0],
-            dtype=np.float64,
-        )
+            raise RuntimeError("Could not resolve a probe site in the MuJoCo model.")
+        self.home_qpos = _default_home_qpos_for_joint_names(self.joint_names)
         self._reset_robot_pose()
+        self.home_qpos = self.data.qpos[self.qpos_indices].astype(np.float64, copy=True)
 
     def _reset_robot_pose(self) -> None:
-        self.data.qpos[:] = 0.0
+        if self.home_keyframe_id >= 0:
+            mujoco.mj_resetDataKeyframe(
+                self.model,
+                self.data,
+                self.home_keyframe_id,
+            )
+        else:
+            self.data.qpos[:] = 0.0
+            self.data.qvel[:] = 0.0
+            self.data.qpos[self.qpos_indices] = self.home_qpos
+            if self.gripper_qpos_indices.size > 0:
+                self.data.qpos[self.gripper_qpos_indices] = FRANKA_OPEN_GRIPPER_QPOS
         self.data.qvel[:] = 0.0
-        self.data.qpos[self.qpos_indices] = self.home_qpos
         mujoco.mj_forward(self.model, self.data)
 
     def get_joint_positions(self) -> np.ndarray:
@@ -1245,7 +1461,7 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
         residual = float(np.linalg.norm(self.data.site_xpos[self.site_id] - target_xyz))
-        if residual > 5e-3:
+        if residual > self.IK_ACCEPT_RESIDUAL:
             raise RuntimeError(
                 f"IK did not converge for target_xyz={target_xyz.tolist()}, residual={residual:.6f}"
             )
@@ -1308,6 +1524,12 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
     def render_frame(self) -> np.ndarray:
         if self.state is None:
             raise RuntimeError("Call reset() before render_frame().")
+        if self.renderer is None:
+            self.renderer = mujoco.Renderer(
+                self.model,
+                height=self.image_size,
+                width=self.image_size,
+            )
         self.renderer.update_scene(self.data, camera=self.camera)
         return self.renderer.render().copy()
 
