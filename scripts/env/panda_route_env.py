@@ -6,6 +6,7 @@ import math
 import random
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,6 +272,35 @@ class ProcessedDemonstrationDataset:
 
     def __len__(self) -> int:
         return int(self.observations.shape[0])
+
+
+@dataclass(slots=True)
+class ReplayEpisode:
+    replay_index: int
+    source_episode_id: int
+    task_id: int
+    target_goal_name: str
+    states_xy: np.ndarray
+    start_xy: tuple[float, float]
+    goal_xy: tuple[float, float]
+    success: bool
+    source_format: str
+    phase_labels: tuple[str, ...] | None = None
+    raw_path_length: int | None = None
+
+    def __len__(self) -> int:
+        return int(self.states_xy.shape[0])
+
+
+@dataclass(slots=True)
+class ReplayDataset:
+    dataset_path: Path
+    format_version: str
+    source_kind: str
+    episodes: list[ReplayEpisode]
+
+    def __len__(self) -> int:
+        return len(self.episodes)
 
 
 class SupportsUniform(Protocol):
@@ -2216,6 +2246,455 @@ def save_processed_dataset(
     np.savez_compressed(output_path, **save_kwargs)
     print(f"Saved processed dataset with {len(dataset)} samples to {output_path}")
     return output_path
+
+
+def _np_scalar_to_str(value: Any) -> str:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        return str(array.item())
+    if array.size == 1:
+        return str(array.reshape(()).item())
+    return str(value)
+
+
+def _decode_phase_labels_from_ids(
+    phase_ids: np.ndarray,
+    phase_vocab: tuple[str, ...],
+) -> tuple[str, ...]:
+    fallback_name = "free_space_other"
+    decoded: list[str] = []
+    for phase_id in np.asarray(phase_ids, dtype=np.int64):
+        index = int(phase_id)
+        if 0 <= index < len(phase_vocab):
+            decoded.append(phase_vocab[index])
+        else:
+            decoded.append(fallback_name)
+    return tuple(decoded)
+
+
+def _load_replay_dataset_from_raw_npz(
+    dataset_path: Path,
+    payload: np.lib.npyio.NpzFile,
+    format_version: str,
+) -> ReplayDataset:
+    padded_paths = np.asarray(payload["path_xy"], dtype=np.float32)
+    path_lengths = np.asarray(payload["path_length"], dtype=np.int64)
+    task_ids = np.asarray(payload["task_id"], dtype=np.int64)
+    source_episode_ids = np.asarray(payload["episode_id"], dtype=np.int64)
+    target_goal_names = np.asarray(payload["target_goal_name"])
+    start_xy = np.asarray(payload["start_xy"], dtype=np.float32)
+    goal_xy = np.asarray(payload["goal_xy"], dtype=np.float32)
+    success = np.asarray(payload["success"], dtype=bool)
+
+    if padded_paths.ndim != 3 or padded_paths.shape[-1] != 2:
+        raise ValueError(
+            f"Raw replay dataset {dataset_path} has invalid path_xy shape {tuple(padded_paths.shape)}."
+        )
+
+    episodes: list[ReplayEpisode] = []
+    for replay_index in range(int(padded_paths.shape[0])):
+        path_length = int(path_lengths[replay_index])
+        if path_length <= 0:
+            raise ValueError(
+                f"Episode {replay_index} in {dataset_path} has non-positive path_length={path_length}."
+            )
+        states_xy = np.asarray(
+            padded_paths[replay_index, :path_length],
+            dtype=np.float32,
+        ).copy()
+        episodes.append(
+            ReplayEpisode(
+                replay_index=replay_index,
+                source_episode_id=int(source_episode_ids[replay_index]),
+                task_id=int(task_ids[replay_index]),
+                target_goal_name=str(target_goal_names[replay_index]),
+                states_xy=states_xy,
+                start_xy=(float(start_xy[replay_index, 0]), float(start_xy[replay_index, 1])),
+                goal_xy=(float(goal_xy[replay_index, 0]), float(goal_xy[replay_index, 1])),
+                success=bool(success[replay_index]),
+                source_format="raw_npz",
+                raw_path_length=path_length,
+            )
+        )
+    return ReplayDataset(
+        dataset_path=dataset_path,
+        format_version=format_version,
+        source_kind="raw_npz",
+        episodes=episodes,
+    )
+
+
+def _load_replay_dataset_from_processed_npz(
+    dataset_path: Path,
+    payload: np.lib.npyio.NpzFile,
+    format_version: str,
+) -> ReplayDataset:
+    observations = np.asarray(payload["observations"], dtype=np.float32)
+    task_ids = np.asarray(payload["task_ids"], dtype=np.int64)
+    source_episode_ids = np.asarray(payload["episode_ids"], dtype=np.int64)
+    target_goal_names = np.asarray(payload["target_goal_names"])
+    start_xy = np.asarray(payload["start_xy"], dtype=np.float32)
+    goal_xy = np.asarray(payload["goal_xy"], dtype=np.float32)
+    success = np.asarray(payload["success"], dtype=bool)
+    raw_path_lengths = np.asarray(payload["raw_path_lengths"], dtype=np.int64)
+    phase_ids = (
+        None if "phase_labels" not in payload.files else np.asarray(payload["phase_labels"], dtype=np.int64)
+    )
+    phase_vocab = (
+        PHASE_LABEL_VOCAB
+        if "phase_label_vocab" not in payload.files
+        else tuple(str(name) for name in np.asarray(payload["phase_label_vocab"]).tolist())
+    )
+
+    if observations.ndim != 3 or observations.shape[-1] != 2:
+        raise ValueError(
+            f"Processed replay dataset {dataset_path} has invalid observations shape {tuple(observations.shape)}."
+        )
+
+    episodes: list[ReplayEpisode] = []
+    for replay_index in range(int(observations.shape[0])):
+        states_xy = np.asarray(observations[replay_index], dtype=np.float32).copy()
+        phase_labels = (
+            None
+            if phase_ids is None
+            else _decode_phase_labels_from_ids(phase_ids[replay_index], phase_vocab)
+        )
+        episodes.append(
+            ReplayEpisode(
+                replay_index=replay_index,
+                source_episode_id=int(source_episode_ids[replay_index]),
+                task_id=int(task_ids[replay_index]),
+                target_goal_name=str(target_goal_names[replay_index]),
+                states_xy=states_xy,
+                start_xy=(float(start_xy[replay_index, 0]), float(start_xy[replay_index, 1])),
+                goal_xy=(float(goal_xy[replay_index, 0]), float(goal_xy[replay_index, 1])),
+                success=bool(success[replay_index]),
+                source_format="processed_npz",
+                phase_labels=phase_labels,
+                raw_path_length=int(raw_path_lengths[replay_index]),
+            )
+        )
+    return ReplayDataset(
+        dataset_path=dataset_path,
+        format_version=format_version,
+        source_kind="processed_npz",
+        episodes=episodes,
+    )
+
+
+def load_replay_dataset(dataset_path: str | Path) -> ReplayDataset:
+    dataset_path = Path(dataset_path).expanduser().resolve()
+    if not dataset_path.is_file():
+        raise FileNotFoundError(f"Replay dataset path does not exist: {dataset_path}")
+    if dataset_path.suffix != ".npz":
+        raise ValueError(
+            f"Unsupported replay dataset format for {dataset_path}. Expected a .npz file."
+        )
+
+    with np.load(dataset_path, allow_pickle=False) as payload:
+        format_version = (
+            "unknown"
+            if "format_version" not in payload.files
+            else _np_scalar_to_str(payload["format_version"])
+        )
+        if "path_xy" in payload.files and "path_length" in payload.files:
+            return _load_replay_dataset_from_raw_npz(dataset_path, payload, format_version)
+        if "observations" in payload.files:
+            return _load_replay_dataset_from_processed_npz(dataset_path, payload, format_version)
+
+    raise ValueError(
+        f"Replay dataset {dataset_path} does not look like a supported panda_route .npz export."
+    )
+
+
+def filter_replay_episodes(
+    dataset: ReplayDataset,
+    *,
+    task_id: int | None = None,
+    success_only: bool = False,
+) -> list[ReplayEpisode]:
+    episodes = list(dataset.episodes)
+    if task_id is not None:
+        episodes = [episode for episode in episodes if episode.task_id == int(task_id)]
+    if success_only:
+        episodes = [episode for episode in episodes if episode.success]
+    return episodes
+
+
+def print_replay_dataset_summary(
+    dataset: ReplayDataset,
+    *,
+    episodes: list[ReplayEpisode] | None = None,
+    max_episodes: int = 20,
+) -> None:
+    listed_episodes = dataset.episodes if episodes is None else episodes
+    print(
+        f"Replay dataset: {dataset.dataset_path} "
+        f"(format={dataset.format_version}, kind={dataset.source_kind}, "
+        f"episodes={len(listed_episodes)}/{len(dataset)})"
+    )
+    if not listed_episodes:
+        print("  No episodes matched the requested filter.")
+        return
+    for listed_index, episode in enumerate(listed_episodes[: max(0, int(max_episodes))]):
+        print(
+            f"  [{listed_index:03d}] replay_index={episode.replay_index:03d} "
+            f"episode_id={episode.source_episode_id:03d} "
+            f"task={episode.task_id}->{episode.target_goal_name} "
+            f"len={len(episode):03d} success={episode.success}"
+        )
+    if len(listed_episodes) > max_episodes:
+        print(f"  ... {len(listed_episodes) - max_episodes} more episodes omitted")
+
+
+def _select_replay_episode_index_interactively(
+    episodes: list[ReplayEpisode],
+) -> int:
+    if not episodes:
+        raise ValueError("Cannot select an episode from an empty replay set.")
+    upper_bound = len(episodes) - 1
+    while True:
+        try:
+            raw_value = input(
+                f"Select replay episode index [0-{upper_bound}] "
+                "(press Enter for 0): "
+            ).strip()
+        except EOFError:
+            return 0
+        if raw_value == "":
+            return 0
+        try:
+            selected_index = int(raw_value)
+        except ValueError:
+            print(f"Invalid selection {raw_value!r}; expected an integer.")
+            continue
+        if 0 <= selected_index <= upper_bound:
+            return selected_index
+        print(f"Selection {selected_index} is out of range [0, {upper_bound}].")
+
+
+def _print_replay_controls() -> None:
+    print("MuJoCo replay controls:")
+    print("  mouse / trackpad: move camera")
+    print("  space: pause or resume")
+    print("  n / p: next or previous episode")
+    print("  r: restart current episode")
+    print("  l: toggle loop mode")
+    print("  s: print current episode metadata")
+    print("  q: quit replay")
+
+
+def _print_replay_episode_header(
+    episode: ReplayEpisode,
+    *,
+    list_index: int,
+    total_episodes: int,
+    paused: bool,
+    loop: bool,
+) -> None:
+    print(
+        f"[viewer] episode {list_index + 1}/{total_episodes} "
+        f"(replay_index={episode.replay_index}, episode_id={episode.source_episode_id}, "
+        f"task={episode.task_id}->{episode.target_goal_name}, len={len(episode)}, "
+        f"success={episode.success}, paused={paused}, loop={loop})"
+    )
+
+
+def launch_replay_viewer(
+    episodes: list[ReplayEpisode],
+    *,
+    initial_episode_index: int = 0,
+    fps: int = DEFAULT_FPS,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    loop: bool = False,
+    start_paused: bool = False,
+) -> None:
+    if mujoco is None:  # pragma: no cover
+        raise RuntimeError(
+            "mujoco is required for interactive replay. Install it first."
+        ) from _MUJOCO_IMPORT_ERROR
+    try:
+        import mujoco.viewer as mujoco_viewer
+    except Exception as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "mujoco.viewer is required for the interactive 3D replay window."
+        ) from exc
+
+    if not episodes:
+        raise ValueError("No replay episodes were provided.")
+    if fps <= 0:
+        raise ValueError("fps must be positive.")
+
+    env = PandaRouteMjEnv(
+        map_config=build_default_map_config(),
+        rng_seed=DEFAULT_RANDOM_SEED,
+        enable_randomize=False,
+        image_size=image_size,
+    )
+    controller = {
+        "paused": bool(start_paused),
+        "loop": bool(loop),
+        "episode_delta": 0,
+        "restart": False,
+        "quit": False,
+        "print_info": False,
+    }
+
+    current_episode_index = int(np.clip(initial_episode_index, 0, len(episodes) - 1))
+    current_frame_index = 0
+    frame_dt = 1.0 / float(fps)
+
+    def _load_episode(episode_index: int, viewer_handle: Any | None) -> None:
+        nonlocal current_episode_index, current_frame_index
+        current_episode_index = int(np.clip(episode_index, 0, len(episodes) - 1))
+        current_frame_index = 0
+        episode = episodes[current_episode_index]
+        env.reset(
+            task_id=episode.task_id,
+            start_state=(float(episode.states_xy[0, 0]), float(episode.states_xy[0, 1])),
+        )
+        env.sync_to_state(
+            (float(episode.states_xy[0, 0]), float(episode.states_xy[0, 1])),
+            step_count=0,
+        )
+        if viewer_handle is not None:
+            viewer_handle.cam.lookat[:] = env.RENDER_LOOKAT
+            viewer_handle.cam.distance = float(env.RENDER_DISTANCE)
+            viewer_handle.cam.azimuth = float(env.RENDER_AZIMUTH)
+            viewer_handle.cam.elevation = float(env.RENDER_ELEVATION)
+        _print_replay_episode_header(
+            episode,
+            list_index=current_episode_index,
+            total_episodes=len(episodes),
+            paused=bool(controller["paused"]),
+            loop=bool(controller["loop"]),
+        )
+
+    def _key_callback(keycode: int) -> None:
+        if keycode in (ord(" "),):
+            controller["paused"] = not bool(controller["paused"])
+        elif keycode in (ord("n"), ord("N")):
+            controller["episode_delta"] = 1
+        elif keycode in (ord("p"), ord("P")):
+            controller["episode_delta"] = -1
+        elif keycode in (ord("r"), ord("R")):
+            controller["restart"] = True
+        elif keycode in (ord("l"), ord("L")):
+            controller["loop"] = not bool(controller["loop"])
+        elif keycode in (ord("s"), ord("S")):
+            controller["print_info"] = True
+        elif keycode in (ord("q"), ord("Q")):
+            controller["quit"] = True
+
+    _print_replay_controls()
+    try:
+        with mujoco_viewer.launch_passive(
+            env.model,
+            env.data,
+            key_callback=_key_callback,
+        ) as viewer_handle:
+            _load_episode(current_episode_index, viewer_handle)
+            while viewer_handle.is_running() and not bool(controller["quit"]):
+                loop_start = time.monotonic()
+                if int(controller["episode_delta"]) != 0:
+                    next_episode_index = (
+                        current_episode_index + int(controller["episode_delta"])
+                    ) % len(episodes)
+                    controller["episode_delta"] = 0
+                    _load_episode(next_episode_index, viewer_handle)
+                if bool(controller["restart"]):
+                    controller["restart"] = False
+                    _load_episode(current_episode_index, viewer_handle)
+                if bool(controller["print_info"]):
+                    controller["print_info"] = False
+                    _print_replay_episode_header(
+                        episodes[current_episode_index],
+                        list_index=current_episode_index,
+                        total_episodes=len(episodes),
+                        paused=bool(controller["paused"]),
+                        loop=bool(controller["loop"]),
+                    )
+
+                episode = episodes[current_episode_index]
+                if not bool(controller["paused"]):
+                    env.sync_to_state(
+                        (
+                            float(episode.states_xy[current_frame_index, 0]),
+                            float(episode.states_xy[current_frame_index, 1]),
+                        ),
+                        step_count=current_frame_index,
+                    )
+                    current_frame_index += 1
+                    if current_frame_index >= len(episode):
+                        if bool(controller["loop"]):
+                            _load_episode(current_episode_index, viewer_handle)
+                        else:
+                            controller["paused"] = True
+                            current_frame_index = len(episode) - 1
+                viewer_handle.sync()
+                elapsed = time.monotonic() - loop_start
+                time.sleep(max(0.0, frame_dt - elapsed) if not bool(controller["paused"]) else 0.01)
+    finally:
+        env.close()
+
+
+def get_replay_defaults() -> dict[str, Any]:
+    return {
+        "fps": DEFAULT_FPS,
+        "image_size": DEFAULT_IMAGE_SIZE,
+        "max_list_episodes": 30,
+    }
+
+
+def replay_dataset_with_viewer(args) -> None:
+    dataset = load_replay_dataset(args.dataset_path)
+    episodes = filter_replay_episodes(
+        dataset,
+        task_id=getattr(args, "task_id", None),
+        success_only=bool(getattr(args, "success_only", False)),
+    )
+    if not episodes:
+        raise RuntimeError("No replay episodes matched the requested filters.")
+
+    max_list_episodes = int(getattr(args, "max_list_episodes", 30))
+    print_replay_dataset_summary(
+        dataset,
+        episodes=episodes,
+        max_episodes=max_list_episodes,
+    )
+    if bool(getattr(args, "list_episodes", False)):
+        return
+
+    selected_episode_index = 0
+    requested_episode_id = getattr(args, "episode_id", None)
+    if requested_episode_id is not None:
+        matching_indices = [
+            index
+            for index, episode in enumerate(episodes)
+            if episode.source_episode_id == int(requested_episode_id)
+        ]
+        if not matching_indices:
+            raise ValueError(
+                f"No replay episode with episode_id={requested_episode_id} matched the current filters."
+            )
+        selected_episode_index = matching_indices[0]
+    elif getattr(args, "episode_index", None) is not None:
+        selected_episode_index = int(args.episode_index)
+        if not (0 <= selected_episode_index < len(episodes)):
+            raise ValueError(
+                f"episode_index={selected_episode_index} is out of range for {len(episodes)} filtered episodes."
+            )
+    elif not bool(getattr(args, "no_prompt", False)) and len(episodes) > 1 and sys.stdin.isatty():
+        selected_episode_index = _select_replay_episode_index_interactively(episodes)
+
+    launch_replay_viewer(
+        episodes,
+        initial_episode_index=selected_episode_index,
+        fps=int(args.fps),
+        image_size=int(args.image_size),
+        loop=bool(getattr(args, "loop", False)),
+        start_paused=bool(getattr(args, "start_paused", False)),
+    )
 
 
 def dataset_summary(dataset: ProcessedDemonstrationDataset) -> dict[str, Any]:
