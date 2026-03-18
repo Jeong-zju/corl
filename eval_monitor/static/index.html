@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CORL Eval Monitor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero__copy">
+          <p class="eyebrow">CORL Eval Monitor</p>
+          <h1>Live Eval Observatory</h1>
+          <p class="hero__summary">
+            自动监控 <code>main/outputs/eval</code>，实时对比不同环境与算法，查看
+            rollout 视频，并在浏览器里直接删除 run 或整组实验结果。
+          </p>
+        </div>
+        <div class="hero__status panel">
+          <div class="hero__status-row">
+            <span class="muted-label">Eval Root</span>
+            <code id="eval-root">-</code>
+          </div>
+          <div class="hero__status-row">
+            <span class="muted-label">Snapshot</span>
+            <strong id="snapshot-version">v0</strong>
+          </div>
+          <div class="hero__status-row">
+            <span class="muted-label">Last Refresh</span>
+            <strong id="last-refresh">-</strong>
+          </div>
+          <div class="hero__status-row">
+            <span class="muted-label">Live Stream</span>
+            <span class="stream-status">
+              <span id="stream-dot" class="stream-dot"></span>
+              <span id="stream-status">connecting</span>
+            </span>
+          </div>
+          <div class="hero__actions">
+            <button id="refresh-btn" class="button button--primary">立即刷新</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel filters">
+        <div class="filters__grid">
+          <label class="control">
+            <span>环境</span>
+            <select id="environment-filter"></select>
+          </label>
+          <label class="control">
+            <span>算法</span>
+            <select id="algorithm-filter"></select>
+          </label>
+          <label class="control">
+            <span>状态</span>
+            <select id="status-filter">
+              <option value="all">全部</option>
+            </select>
+          </label>
+          <label class="control">
+            <span>比较指标</span>
+            <select id="metric-filter">
+              <option value="weighted_success_rate">加权成功率</option>
+              <option value="latest_success_rate">最新成功率</option>
+              <option value="best_success_rate">最佳成功率</option>
+              <option value="average_success_rate">平均成功率</option>
+            </select>
+          </label>
+          <label class="control control--search">
+            <span>检索</span>
+            <input id="search-input" type="search" placeholder="env / algorithm / run / task" />
+          </label>
+        </div>
+      </section>
+
+      <section id="stats-grid" class="stats-grid"></section>
+
+      <section class="content-grid">
+        <div class="panel panel--wide">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Compare</p>
+              <h2>环境 × 算法矩阵</h2>
+            </div>
+            <p class="section-note">
+              同一环境 + 算法多轮 run 默认按选中的比较指标展示，自动兼容 rollout 数不一致。
+            </p>
+          </div>
+          <div id="matrix" class="matrix-wrap"></div>
+        </div>
+        <div class="panel panel--side">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Series</p>
+              <h2>实验序列</h2>
+            </div>
+          </div>
+          <div id="series-list" class="stack"></div>
+        </div>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel panel--wide">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Trend</p>
+              <h2 id="timeline-title">Run 时间线</h2>
+            </div>
+            <div class="section-actions">
+              <button id="select-latest-run-btn" class="button">选中最新完整 run</button>
+            </div>
+          </div>
+          <div id="timeline" class="timeline"></div>
+        </div>
+        <div class="panel panel--side">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Tasks</p>
+              <h2>环境任务对比</h2>
+            </div>
+          </div>
+          <div id="task-compare" class="task-compare"></div>
+        </div>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel panel--wide">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Runs</p>
+              <h2>过滤后的运行列表</h2>
+            </div>
+          </div>
+          <div id="run-table" class="run-table-wrap"></div>
+        </div>
+        <div class="panel panel--side detail-panel">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Inspect</p>
+              <h2>Run 详情</h2>
+            </div>
+            <div class="section-actions">
+              <button id="delete-run-btn" class="button button--danger" disabled>
+                删除当前 run
+              </button>
+            </div>
+          </div>
+          <div id="run-detail" class="stack"></div>
+        </div>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
