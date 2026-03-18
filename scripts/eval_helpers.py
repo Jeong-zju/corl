@@ -64,12 +64,18 @@ def build_eval_observation(
     state_key: str,
     image_key: str,
     state_dim: int,
+    state_vector: np.ndarray | list[float] | tuple[float, ...] | None = None,
 ) -> dict[str, object]:
     import torch
 
     state_vec = np.zeros((state_dim,), dtype=np.float32)
-    copy_n = min(2, state_dim)
-    state_vec[:copy_n] = np.asarray(state_xy[:copy_n], dtype=np.float32)
+    if state_vector is None:
+        copy_n = min(2, state_dim)
+        state_vec[:copy_n] = np.asarray(state_xy[:copy_n], dtype=np.float32)
+    else:
+        provided = np.asarray(state_vector, dtype=np.float32).reshape(-1)
+        copy_n = min(int(provided.shape[0]), state_dim)
+        state_vec[:copy_n] = provided[:copy_n]
     return {
         state_key: torch.from_numpy(state_vec),
         image_key: torch.from_numpy(rgb_frame).permute(2, 0, 1).contiguous().float()

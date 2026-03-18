@@ -68,6 +68,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=defaults["fps"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for policy n_action_steps during rollout. "
+            "Set to 1 for per-step replanning. Defaults to the checkpoint config."
+        ),
+    )
+    parser.add_argument(
         "--success-threshold",
         type=float,
         default=defaults["success_threshold"],
@@ -139,8 +148,21 @@ def main(argv: list[str] | None = None) -> None:
     policy = policy_cls.from_pretrained(policy_dir)
     cfg = policy.config
     cfg.device = args.device
+    if args.n_action_steps is not None:
+        cfg.n_action_steps = int(args.n_action_steps)
+        if cfg.n_action_steps <= 0:
+            raise ValueError(
+                f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
+            )
+        if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
+            raise ValueError(
+                "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
+                f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
+            )
     policy.eval()
     policy.to(args.device)
+    if args.n_action_steps is not None and hasattr(policy, "reset"):
+        policy.reset()
 
     preprocessor_overrides = {
         "device_processor": {"device": args.device},

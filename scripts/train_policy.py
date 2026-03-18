@@ -230,6 +230,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--chunk-size", type=int, default=5, help="ACT action chunk size."
     )
     parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of predicted actions executed before querying the policy again. "
+            "Set to 1 for per-step replanning."
+        ),
+    )
+    parser.add_argument(
         "--disable-imagenet-stats",
         action="store_true",
         help="Disable replacing visual stats with ImageNet stats.",
@@ -293,6 +302,9 @@ def main(argv: list[str] | None = None) -> None:
 
     dataset_root = args.dataset_root.resolve()
     validate_dataset_root(dataset_root)
+    env_module = get_env_module(args.env)
+    if hasattr(env_module, "validate_training_dataset_root"):
+        env_module.validate_training_dataset_root(dataset_root)
     use_imagenet_stats = resolve_use_imagenet_stats(
         dataset_root=dataset_root,
         disable_imagenet_stats=args.disable_imagenet_stats,
@@ -361,7 +373,7 @@ def main(argv: list[str] | None = None) -> None:
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
-            n_action_steps=args.chunk_size,
+            n_action_steps=args.n_action_steps,
             use_path_signature=use_path_signature,
             history_length=resolved_history_length,
             signature_dim=signature_dim,
@@ -377,7 +389,7 @@ def main(argv: list[str] | None = None) -> None:
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
-            n_action_steps=args.chunk_size,
+            n_action_steps=args.n_action_steps,
         )
 
     wandb_cfg = WandBConfig(
@@ -412,6 +424,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"- job_name: {resolved_job_name}")
     print(f"- steps: {args.steps}")
     print(f"- batch_size: {args.batch_size}")
+    print(
+        f"- action_execution: chunk_size={args.chunk_size}, "
+        f"n_action_steps={args.n_action_steps}"
+    )
     print(f"- use_imagenet_stats: {use_imagenet_stats}")
     if args.policy == "streaming_act":
         print(f"- use_path_signature: {use_path_signature}")

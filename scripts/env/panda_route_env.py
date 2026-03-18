@@ -46,7 +46,7 @@ DEFAULT_IMAGE_SIZE = 128
 DEFAULT_MAX_ACTION_STEP = 0.035
 DEFAULT_RANDOM_SEED = 17
 DEFAULT_T_FIXED = 100
-DEFAULT_LAST_ACTION_MODE = "zero"
+DEFAULT_LAST_ACTION_MODE = "repeat_last"
 DEFAULT_INCLUDE_PATH_SIGNATURES = True
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_SIGNATURE_WINDOW_SIZE = 0
@@ -78,6 +78,7 @@ ROBOT_DESCRIPTIONS_CACHE_ROOT = WORKSPACE_ROOT / ".robot_descriptions_cache"
 FRANKA_ARM_JOINT_NAMES = tuple(f"joint{index}" for index in range(1, 8))
 LEGACY_ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 FRANKA_FINGER_JOINT_NAMES = ("finger_joint1", "finger_joint2")
+DEFAULT_ARM_JOINT_FEATURE_NAMES = FRANKA_ARM_JOINT_NAMES
 FRANKA_HOME_QPOS = np.asarray(
     [0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853],
     dtype=np.float64,
@@ -267,6 +268,7 @@ class DemonstrationDataset:
 class ProcessedDemonstrationDataset:
     observations: np.ndarray
     actions: np.ndarray
+    probe_states: np.ndarray
     path_signatures: np.ndarray | None
     task_ids: np.ndarray
     task_code_bits: np.ndarray
@@ -290,6 +292,7 @@ class ProcessedDemonstrationDataset:
     source_num_per_task_requested: int
     source_solve_time: float
     source_retries_per_demo: int
+    joint_names: tuple[str, ...]
 
     def __len__(self) -> int:
         return int(self.observations.shape[0])
@@ -306,6 +309,7 @@ class ReplayEpisode:
     goal_xy: tuple[float, float]
     success: bool
     source_format: str
+    joint_positions: np.ndarray | None = None
     phase_labels: tuple[str, ...] | None = None
     raw_path_length: int | None = None
 
@@ -1393,6 +1397,7 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
         self.home_qpos = _default_home_qpos_for_joint_names(self.joint_names)
         self._reset_robot_pose()
         self.home_qpos = self.data.qpos[self.qpos_indices].astype(np.float64, copy=True)
+        self.action_dim = int(self.qpos_indices.size)
 
     def _reset_robot_pose(self) -> None:
         if self.home_keyframe_id >= 0:
@@ -1413,6 +1418,10 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
     def get_joint_positions(self) -> np.ndarray:
         return self.data.qpos[self.qpos_indices].astype(np.float32, copy=True)
 
+    def get_probe_state(self) -> tuple[float, float]:
+        probe_position = self.get_probe_position_3d()
+        return (float(probe_position[0]), float(probe_position[1]))
+
     def get_probe_position_3d(self) -> np.ndarray:
         return self.data.site_xpos[self.site_id].astype(np.float32, copy=True)
 
@@ -1425,6 +1434,36 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
             }
         )
         return base
+
+    def _augment_info_with_robot(self, info: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **info,
+            "joint_positions": self.get_joint_positions().tolist(),
+            "probe_position_3d": self.get_probe_position_3d().tolist(),
+            "partial_observation": self.get_partial_observation(),
+            "full_observation": self.get_full_observation(),
+        }
+
+    def _clip_joint_positions(
+        self,
+        joint_positions: np.ndarray | list[float] | tuple[float, ...],
+    ) -> np.ndarray:
+        joint_array = np.asarray(joint_positions, dtype=np.float64).reshape(-1)
+        if int(joint_array.shape[0]) != self.action_dim:
+            raise ValueError(
+                f"Expected {self.action_dim} joint positions, got shape={tuple(joint_array.shape)}."
+            )
+        return np.clip(joint_array, self.joint_range[:, 0], self.joint_range[:, 1])
+
+    def _set_joint_positions(
+        self,
+        joint_positions: np.ndarray | list[float] | tuple[float, ...],
+    ) -> np.ndarray:
+        clipped = self._clip_joint_positions(joint_positions)
+        self.data.qpos[self.qpos_indices] = clipped
+        self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        return clipped.astype(np.float32, copy=False)
 
     def _solve_inverse_kinematics(
         self,
@@ -1491,34 +1530,91 @@ class PandaRouteMjEnv(PandaRouteSemanticEnv):
         )
         self._reset_robot_pose()
         self._sync_robot_to_probe_state(state)
+        self.last_info = self._augment_info_with_robot(self.last_info)
         return state
 
     def step(
         self,
-        action: tuple[float, float],
+        action: np.ndarray | list[float] | tuple[float, ...],
     ) -> tuple[tuple[float, float], float, bool, dict[str, Any]]:
-        next_state, reward, done, info = super().step(action)
-        self._sync_robot_to_probe_state(next_state)
+        if self.state is None:
+            raise RuntimeError("Call reset() before step().")
+        if self.done:
+            raise RuntimeError("Episode already finished. Call reset() to start a new one.")
+        if self.task_spec is None or self.target_goal_name is None:
+            raise RuntimeError("Call reset() before step().")
+
+        previous_state = (float(self.state[0]), float(self.state[1]))
+        previous_joint_positions = self.get_joint_positions()
+        target_joint_positions = self._set_joint_positions(action)
+        proposed_state = self.get_probe_state()
+        proposed_valid = is_state_valid(*proposed_state, config=self.map_config)
+        collision_rejected = not proposed_valid
+        if collision_rejected:
+            self._set_joint_positions(previous_joint_positions)
+            next_state = previous_state
+        else:
+            next_state = proposed_state
+        reached_goal = get_goal_region_for_state(*next_state, config=self.map_config)
+        success = reached_goal is not None and reached_goal.name == self.target_goal_name
+
+        self.state = next_state
+        self.trajectory.append(next_state)
+        self.step_count += 1
+        self.done = reached_goal is not None
+
+        reward = self.step_penalty
+        if success:
+            reward += self.goal_reward
+
         info = {
-            **info,
-            "joint_positions": self.get_joint_positions().tolist(),
-            "probe_position_3d": self.get_probe_position_3d().tolist(),
+            "task_id": self.task_spec.task_id,
+            "task_code": self.task_spec.task_code,
+            "start_region_name": self.start_region_name,
+            "branch_region_name": self.task_spec.branch_region_name,
+            "target_goal_name": self.target_goal_name,
+            "step_count": self.step_count,
+            "action": target_joint_positions.astype(np.float32).tolist(),
+            "proposed_state": proposed_state,
+            "applied_state": next_state,
+            "proposed_state_valid": proposed_valid,
+            "collision_rejected": collision_rejected,
+            "reached_goal": None if reached_goal is None else reached_goal.name,
+            "success": success,
         }
+        info = self._augment_info_with_robot(info)
         self.last_info = info
-        return next_state, reward, done, info
+        return next_state, reward, self.done, info
 
     def sync_to_state(
         self,
         state: tuple[float, float],
         step_count: int | None = None,
     ) -> tuple[float, float]:
+        self._sync_robot_to_probe_state(
+            (float(state[0]), float(state[1])),
+        )
         synced_state = super().sync_to_state(state=state, step_count=step_count)
-        self._sync_robot_to_probe_state(synced_state)
-        self.last_info = {
-            **self.last_info,
-            "joint_positions": self.get_joint_positions().tolist(),
-            "probe_position_3d": self.get_probe_position_3d().tolist(),
-        }
+        self.last_info = self._augment_info_with_robot(self.last_info)
+        return synced_state
+
+    def sync_to_joint_positions(
+        self,
+        joint_positions: np.ndarray | list[float] | tuple[float, ...],
+        *,
+        probe_state: tuple[float, float] | None = None,
+        step_count: int | None = None,
+    ) -> tuple[float, float]:
+        self._set_joint_positions(joint_positions)
+        resolved_probe_state = self.get_probe_state() if probe_state is None else (
+            float(probe_state[0]),
+            float(probe_state[1]),
+        )
+        synced_state = super().sync_to_state(
+            state=resolved_probe_state,
+            step_count=step_count,
+        )
+        self.last_info = self._augment_info_with_robot(self.last_info)
         return synced_state
 
     def render_frame(self) -> np.ndarray:
@@ -2154,6 +2250,19 @@ def _as_path_array(path_xy: np.ndarray | list[tuple[float, float]]) -> np.ndarra
     return path_array
 
 
+def _as_sequence_array(
+    values: np.ndarray | list[list[float]] | list[tuple[float, ...]],
+    *,
+    name: str,
+) -> np.ndarray:
+    value_array = np.asarray(values, dtype=np.float64)
+    if value_array.ndim != 2:
+        raise ValueError(f"{name} must have shape [T, D].")
+    if value_array.shape[0] == 0:
+        raise ValueError(f"{name} must contain at least one step.")
+    return value_array
+
+
 def compute_path_distance(path_xy: np.ndarray | list[tuple[float, float]]) -> float:
     path_array = _as_path_array(path_xy)
     if path_array.shape[0] <= 1:
@@ -2186,19 +2295,51 @@ def resample_path_fixed_length(
     return np.stack([resampled_x, resampled_y], axis=1).astype(np.float32)
 
 
-def build_actions_from_states(
-    states_xy: np.ndarray,
+def build_actions_from_observations(
+    observations: np.ndarray,
     last_action_mode: str = DEFAULT_LAST_ACTION_MODE,
 ) -> np.ndarray:
-    state_array = _as_path_array(states_xy).astype(np.float32, copy=False)
-    if last_action_mode != "zero":
+    observation_array = _as_sequence_array(
+        observations,
+        name="observations",
+    ).astype(np.float32, copy=False)
+    actions = np.zeros_like(observation_array, dtype=np.float32)
+    if observation_array.shape[0] >= 2:
+        actions[:-1] = observation_array[1:]
+    if last_action_mode == "repeat_last":
+        actions[-1] = observation_array[-1]
+    elif last_action_mode != "zero":
         raise ValueError(
-            f"Unsupported last_action_mode={last_action_mode!r}. Expected 'zero'."
+            "Unsupported last_action_mode="
+            f"{last_action_mode!r}. Expected 'repeat_last' or 'zero'."
         )
-    actions = np.zeros_like(state_array, dtype=np.float32)
-    if state_array.shape[0] >= 2:
-        actions[:-1] = state_array[1:] - state_array[:-1]
     return actions
+
+
+def build_joint_trajectory_from_probe_states(
+    env: PandaRouteMjEnv,
+    *,
+    task_id: int,
+    probe_states_xy: np.ndarray | list[tuple[float, float]],
+) -> np.ndarray:
+    probe_array = _as_path_array(probe_states_xy).astype(np.float32, copy=False)
+    joint_trajectory = np.zeros(
+        (int(probe_array.shape[0]), env.action_dim),
+        dtype=np.float32,
+    )
+    env.reset(
+        task_id=task_id,
+        enable_randomize=False,
+        start_state=(float(probe_array[0, 0]), float(probe_array[0, 1])),
+    )
+    joint_trajectory[0] = env.get_joint_positions()
+    for step_index in range(1, int(probe_array.shape[0])):
+        env.sync_to_state(
+            (float(probe_array[step_index, 0]), float(probe_array[step_index, 1])),
+            step_count=step_index,
+        )
+        joint_trajectory[step_index] = env.get_joint_positions()
+    return joint_trajectory
 
 
 def build_goal_onehot(task_id: int) -> np.ndarray:
@@ -2216,14 +2357,17 @@ def build_task_code_bits(task_id: int) -> np.ndarray:
 
 
 def compute_path_signature_sequence(
-    states_xy: np.ndarray,
+    state_sequence: np.ndarray,
     window_size: int = DEFAULT_SIGNATURE_WINDOW_SIZE,
     sig_depth: int = DEFAULT_SIGNATURE_DEPTH,
     signature_backend: str = DEFAULT_SIGNATURE_BACKEND,
 ) -> np.ndarray:
     if sig_depth <= 0:
         raise ValueError("sig_depth must be positive.")
-    state_array = _as_path_array(states_xy).astype(np.float32, copy=False)
+    state_array = _as_sequence_array(
+        state_sequence,
+        name="state_sequence",
+    ).astype(np.float32, copy=False)
     resolved_backend = (
         signature_backend
         if signature_backend in {"signatory", "simple"}
@@ -2312,11 +2456,23 @@ def process_demonstration_dataset(
         raise ValueError("raw_dataset is empty.")
     if t_fixed <= 0:
         raise ValueError("t_fixed must be positive.")
+    if mujoco is None:
+        raise RuntimeError(
+            "mujoco is required to convert panda_route probe trajectories into joint-space datasets."
+        ) from _MUJOCO_IMPORT_ERROR
 
     map_config = build_default_map_config() if config is None else config
     num_episodes = len(raw_dataset.episodes)
-    observations = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
-    actions = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
+    joint_env = PandaRouteMjEnv(
+        map_config=map_config,
+        rng_seed=raw_dataset.seed,
+        enable_randomize=False,
+        image_size=DEFAULT_IMAGE_SIZE,
+    )
+    joint_names = tuple(str(name) for name in joint_env.joint_names)
+    observations = np.zeros((num_episodes, t_fixed, joint_env.action_dim), dtype=np.float32)
+    actions = np.zeros((num_episodes, t_fixed, joint_env.action_dim), dtype=np.float32)
+    probe_states = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
     path_signatures: np.ndarray | None = None
     task_ids = np.zeros(num_episodes, dtype=np.int64)
     task_code_bits = np.zeros((num_episodes, 1), dtype=np.int64)
@@ -2356,51 +2512,60 @@ def process_demonstration_dataset(
         )
     )
 
-    for episode_index, source_index in enumerate(episode_order.tolist()):
-        episode = raw_dataset.episodes[source_index]
-        resampled_path = resample_path_fixed_length(episode.path_xy, t_fixed=t_fixed)
-        observations[episode_index] = resampled_path
-        actions[episode_index] = build_actions_from_states(
-            resampled_path,
-            last_action_mode=last_action_mode,
-        )
-        if include_path_signatures:
-            signature_sequence = compute_path_signature_sequence(
-                resampled_path,
-                window_size=path_signature_window_size,
-                sig_depth=path_signature_depth,
-                signature_backend=(
-                    DEFAULT_SIGNATURE_BACKEND
-                    if resolved_signature_backend is None
-                    else resolved_signature_backend
-                ),
+    try:
+        for episode_index, source_index in enumerate(episode_order.tolist()):
+            episode = raw_dataset.episodes[source_index]
+            resampled_path = resample_path_fixed_length(episode.path_xy, t_fixed=t_fixed)
+            probe_states[episode_index] = resampled_path
+            observations[episode_index] = build_joint_trajectory_from_probe_states(
+                joint_env,
+                task_id=episode.task_id,
+                probe_states_xy=resampled_path,
             )
-            if path_signatures is None:
-                path_signatures = np.zeros(
-                    (num_episodes, t_fixed, int(signature_sequence.shape[1])),
-                    dtype=np.float32,
+            actions[episode_index] = build_actions_from_observations(
+                observations[episode_index],
+                last_action_mode=last_action_mode,
+            )
+            if include_path_signatures:
+                signature_sequence = compute_path_signature_sequence(
+                    observations[episode_index],
+                    window_size=path_signature_window_size,
+                    sig_depth=path_signature_depth,
+                    signature_backend=(
+                        DEFAULT_SIGNATURE_BACKEND
+                        if resolved_signature_backend is None
+                        else resolved_signature_backend
+                    ),
                 )
-            path_signatures[episode_index] = signature_sequence
-        task_ids[episode_index] = episode.task_id
-        task_code_bits[episode_index] = build_task_code_bits(episode.task_id)
-        goal_onehot[episode_index] = build_goal_onehot(episode.task_id)
-        if phase_labels is not None:
-            phase_annotation = annotate_trajectory_phases(
-                [tuple(map(float, point_xy)) for point_xy in resampled_path.tolist()],
-                config=map_config,
-            )
-            phase_labels[episode_index] = encode_phase_labels(phase_annotation.phase_labels)
-        episode_ids[episode_index] = episode.episode_id
-        target_goal_names[episode_index] = episode.target_goal_name
-        start_xy[episode_index] = np.asarray(episode.start_xy, dtype=np.float32)
-        goal_xy[episode_index] = np.asarray(episode.goal_xy, dtype=np.float32)
-        raw_path_lengths[episode_index] = int(episode.path_length)
-        raw_path_distances[episode_index] = compute_path_distance(episode.path_xy)
-        success[episode_index] = bool(episode.success)
+                if path_signatures is None:
+                    path_signatures = np.zeros(
+                        (num_episodes, t_fixed, int(signature_sequence.shape[1])),
+                        dtype=np.float32,
+                    )
+                path_signatures[episode_index] = signature_sequence
+            task_ids[episode_index] = episode.task_id
+            task_code_bits[episode_index] = build_task_code_bits(episode.task_id)
+            goal_onehot[episode_index] = build_goal_onehot(episode.task_id)
+            if phase_labels is not None:
+                phase_annotation = annotate_trajectory_phases(
+                    [tuple(map(float, point_xy)) for point_xy in resampled_path.tolist()],
+                    config=map_config,
+                )
+                phase_labels[episode_index] = encode_phase_labels(phase_annotation.phase_labels)
+            episode_ids[episode_index] = episode.episode_id
+            target_goal_names[episode_index] = episode.target_goal_name
+            start_xy[episode_index] = np.asarray(episode.start_xy, dtype=np.float32)
+            goal_xy[episode_index] = np.asarray(episode.goal_xy, dtype=np.float32)
+            raw_path_lengths[episode_index] = int(episode.path_length)
+            raw_path_distances[episode_index] = compute_path_distance(episode.path_xy)
+            success[episode_index] = bool(episode.success)
+    finally:
+        joint_env.close()
 
     return ProcessedDemonstrationDataset(
         observations=observations,
         actions=actions,
+        probe_states=probe_states,
         path_signatures=path_signatures,
         task_ids=task_ids,
         task_code_bits=task_code_bits,
@@ -2424,6 +2589,7 @@ def process_demonstration_dataset(
         source_num_per_task_requested=raw_dataset.num_per_task_requested,
         source_solve_time=raw_dataset.solve_time,
         source_retries_per_demo=raw_dataset.retries_per_demo,
+        joint_names=joint_names,
     )
 
 
@@ -2436,9 +2602,10 @@ def save_processed_dataset(
         output_path = output_path.with_suffix(".npz")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs: dict[str, Any] = {
-        "format_version": np.asarray("panda_route_act_ready_sig_v1"),
+        "format_version": np.asarray("panda_route_joint_act_ready_sig_v2"),
         "observations": dataset.observations,
         "actions": dataset.actions,
+        "probe_states": dataset.probe_states,
         "task_ids": dataset.task_ids,
         "task_code_bits": dataset.task_code_bits,
         "goal_onehot": dataset.goal_onehot,
@@ -2457,6 +2624,9 @@ def save_processed_dataset(
         "path_signature_depth": np.asarray(dataset.path_signature_depth, dtype=np.int64),
         "path_signature_backend": np.asarray("" if dataset.path_signature_backend is None else dataset.path_signature_backend),
         "phase_label_vocab": np.asarray(dataset.phase_label_vocab, dtype="<U32"),
+        "joint_names": np.asarray(dataset.joint_names, dtype="<U32"),
+        "observation_representation": np.asarray("joint_positions"),
+        "action_representation": np.asarray("next_joint_positions"),
         "source_num_per_task_requested": np.asarray(dataset.source_num_per_task_requested, dtype=np.int64),
         "source_solve_time": np.asarray(dataset.source_solve_time, dtype=np.float32),
         "source_retries_per_demo": np.asarray(dataset.source_retries_per_demo, dtype=np.int64),
@@ -2552,6 +2722,11 @@ def _load_replay_dataset_from_processed_npz(
     format_version: str,
 ) -> ReplayDataset:
     observations = np.asarray(payload["observations"], dtype=np.float32)
+    probe_states = (
+        None
+        if "probe_states" not in payload.files
+        else np.asarray(payload["probe_states"], dtype=np.float32)
+    )
     task_ids = np.asarray(payload["task_ids"], dtype=np.int64)
     source_episode_ids = np.asarray(payload["episode_ids"], dtype=np.int64)
     target_goal_names = np.asarray(payload["target_goal_names"])
@@ -2568,14 +2743,27 @@ def _load_replay_dataset_from_processed_npz(
         else tuple(str(name) for name in np.asarray(payload["phase_label_vocab"]).tolist())
     )
 
-    if observations.ndim != 3 or observations.shape[-1] != 2:
+    if observations.ndim != 3:
         raise ValueError(
             f"Processed replay dataset {dataset_path} has invalid observations shape {tuple(observations.shape)}."
         )
+    if probe_states is None:
+        if observations.shape[-1] == 2:
+            probe_states = observations
+        else:
+            raise ValueError(
+                "Processed replay dataset is missing `probe_states` required for route replay. "
+                f"dataset={dataset_path}"
+            )
+    if probe_states.ndim != 3 or probe_states.shape[-1] != 2:
+        raise ValueError(
+            f"Processed replay dataset {dataset_path} has invalid probe_states shape {tuple(probe_states.shape)}."
+        )
+    joint_positions = observations if observations.shape[-1] != 2 else None
 
     episodes: list[ReplayEpisode] = []
-    for replay_index in range(int(observations.shape[0])):
-        states_xy = np.asarray(observations[replay_index], dtype=np.float32).copy()
+    for replay_index in range(int(probe_states.shape[0])):
+        states_xy = np.asarray(probe_states[replay_index], dtype=np.float32).copy()
         phase_labels = (
             None
             if phase_ids is None
@@ -2592,6 +2780,11 @@ def _load_replay_dataset_from_processed_npz(
                 goal_xy=(float(goal_xy[replay_index, 0]), float(goal_xy[replay_index, 1])),
                 success=bool(success[replay_index]),
                 source_format="processed_npz",
+                joint_positions=(
+                    None
+                    if joint_positions is None
+                    else np.asarray(joint_positions[replay_index], dtype=np.float32).copy()
+                ),
                 phase_labels=phase_labels,
                 raw_path_length=int(raw_path_lengths[replay_index]),
             )
@@ -2775,10 +2968,20 @@ def launch_replay_viewer(
             task_id=episode.task_id,
             start_state=(float(episode.states_xy[0, 0]), float(episode.states_xy[0, 1])),
         )
-        env.sync_to_state(
-            (float(episode.states_xy[0, 0]), float(episode.states_xy[0, 1])),
-            step_count=0,
-        )
+        if episode.joint_positions is not None:
+            env.sync_to_joint_positions(
+                episode.joint_positions[0],
+                probe_state=(
+                    float(episode.states_xy[0, 0]),
+                    float(episode.states_xy[0, 1]),
+                ),
+                step_count=0,
+            )
+        else:
+            env.sync_to_state(
+                (float(episode.states_xy[0, 0]), float(episode.states_xy[0, 1])),
+                step_count=0,
+            )
         if viewer_handle is not None:
             viewer_handle.cam.lookat[:] = env.RENDER_LOOKAT
             viewer_handle.cam.distance = float(env.RENDER_DISTANCE)
@@ -2839,13 +3042,23 @@ def launch_replay_viewer(
 
                 episode = episodes[current_episode_index]
                 if not bool(controller["paused"]):
-                    env.sync_to_state(
-                        (
-                            float(episode.states_xy[current_frame_index, 0]),
-                            float(episode.states_xy[current_frame_index, 1]),
-                        ),
-                        step_count=current_frame_index,
-                    )
+                    if episode.joint_positions is not None:
+                        env.sync_to_joint_positions(
+                            episode.joint_positions[current_frame_index],
+                            probe_state=(
+                                float(episode.states_xy[current_frame_index, 0]),
+                                float(episode.states_xy[current_frame_index, 1]),
+                            ),
+                            step_count=current_frame_index,
+                        )
+                    else:
+                        env.sync_to_state(
+                            (
+                                float(episode.states_xy[current_frame_index, 0]),
+                                float(episode.states_xy[current_frame_index, 1]),
+                            ),
+                            step_count=current_frame_index,
+                        )
                     current_frame_index += 1
                     if current_frame_index >= len(episode):
                         if bool(controller["loop"]):
@@ -2929,6 +3142,7 @@ def dataset_summary(dataset: ProcessedDemonstrationDataset) -> dict[str, Any]:
     print(f"  fixed_horizon={dataset.t_fixed}")
     print(f"  observation_shape={tuple(dataset.observations.shape)}")
     print(f"  action_shape={tuple(dataset.actions.shape)}")
+    print(f"  probe_state_shape={tuple(dataset.probe_states.shape)}")
     if dataset.path_signatures is not None:
         window_label = (
             "all_prefix" if dataset.path_signature_window_size <= 0 else str(dataset.path_signature_window_size)
@@ -3064,10 +3278,14 @@ def fixed_size_list_array(pa: Any, values: np.ndarray, width: int):
     return pa.FixedSizeListArray.from_arrays(flat, width)
 
 
+def build_joint_action_feature_names(joint_names: tuple[str, ...]) -> list[str]:
+    return [f"target_{joint_name}" for joint_name in joint_names]
+
+
 def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> Any:
     state_array = np.asarray(frame_records["observation.state"], dtype=np.float32)
     action_array = np.asarray(frame_records["action"], dtype=np.float32)
-    arrays = [fixed_size_list_array(pa, state_array, 2)]
+    arrays = [fixed_size_list_array(pa, state_array, int(state_array.shape[1]))]
     names = ["observation.state"]
     if DEFAULT_PATH_SIGNATURE_KEY in frame_records:
         signature_array = np.asarray(frame_records[DEFAULT_PATH_SIGNATURE_KEY], dtype=np.float32)
@@ -3077,7 +3295,7 @@ def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> An
         names.append(DEFAULT_PATH_SIGNATURE_KEY)
     arrays.extend(
         [
-            fixed_size_list_array(pa, action_array, 2),
+            fixed_size_list_array(pa, action_array, int(action_array.shape[1])),
             pa.array(frame_records["next.reward"], type=pa.float32()),
             pa.array(frame_records["next.done"], type=pa.bool_()),
             pa.array(frame_records["next.success"], type=pa.bool_()),
@@ -3249,12 +3467,13 @@ def generate_lerobot_v30_dataset(
 
     try:
         for episode_idx, source_idx in enumerate(episode_order.tolist()):
-            observations = processed_dataset.observations[source_idx]
-            actions = processed_dataset.actions[source_idx]
+            joint_observations = processed_dataset.observations[source_idx]
+            joint_actions = processed_dataset.actions[source_idx]
+            probe_states = processed_dataset.probe_states[source_idx]
             goal_xy = processed_dataset.goal_xy[source_idx]
             task_id = int(processed_dataset.task_ids[source_idx])
             task_text = TASK_DESCRIPTION_BY_ID[task_id]
-            episode_length = int(observations.shape[0])
+            episode_length = int(joint_observations.shape[0])
             episode_from_index = global_index
             chunk_index, file_index = get_chunk_and_file_index(
                 episode_idx,
@@ -3285,10 +3504,14 @@ def generate_lerobot_v30_dataset(
             if processed_dataset.path_signatures is not None:
                 episode_records[DEFAULT_PATH_SIGNATURE_KEY] = []
 
-            env.reset(task_id=task_id, start_state=(float(observations[0, 0]), float(observations[0, 1])))
+            env.reset(
+                task_id=task_id,
+                start_state=(float(probe_states[0, 0]), float(probe_states[0, 1])),
+            )
             for frame_idx in range(episode_length):
-                state_xy = observations[frame_idx]
-                action_xy = actions[frame_idx]
+                state_joint = joint_observations[frame_idx]
+                action_joint = joint_actions[frame_idx]
+                probe_state_xy = probe_states[frame_idx]
                 signature_xy = (
                     None
                     if processed_dataset.path_signatures is None
@@ -3296,19 +3519,25 @@ def generate_lerobot_v30_dataset(
                 )
                 # Render directly from the processed trajectory so export stays aligned
                 # with the saved observations even if replay dynamics diverge slightly.
-                env.sync_to_state(
-                    (float(state_xy[0]), float(state_xy[1])),
+                env.sync_to_joint_positions(
+                    state_joint,
+                    probe_state=(
+                        float(probe_state_xy[0]),
+                        float(probe_state_xy[1]),
+                    ),
                     step_count=frame_idx,
                 )
                 timestamp = frame_idx / fps
                 done = frame_idx == episode_length - 1
                 success = bool(done and processed_dataset.success[source_idx])
                 distance_to_goal = float(
-                    np.linalg.norm(state_xy.astype(np.float64) - goal_xy.astype(np.float64))
+                    np.linalg.norm(
+                        probe_state_xy.astype(np.float64) - goal_xy.astype(np.float64)
+                    )
                 )
                 reward = 1.0 if success else -distance_to_goal
-                frame_state = [float(state_xy[0]), float(state_xy[1])]
-                frame_action = [float(action_xy[0]), float(action_xy[1])]
+                frame_state = state_joint.astype(np.float32).tolist()
+                frame_action = action_joint.astype(np.float32).tolist()
                 for target_records in (records, episode_records):
                     target_records["timestamp"].append(float(timestamp))
                     target_records["frame_index"].append(int(frame_idx))
@@ -3439,9 +3668,13 @@ def generate_lerobot_v30_dataset(
         "train": f"0:{val_start}",
         "val": f"{val_start}:{total_episodes}",
     }
+    state_feature_names = list(processed_dataset.joint_names)
+    action_feature_names = build_joint_action_feature_names(processed_dataset.joint_names)
     info = {
         "codebase_version": "v3.0",
         "robot_type": "mujoco_panda_route_onebit",
+        "observation_representation": "joint_positions",
+        "action_representation": "next_joint_positions",
         "total_episodes": int(total_episodes),
         "total_frames": int(total_frames),
         "total_tasks": int(len(TASK_ID_VALUES)),
@@ -3455,13 +3688,13 @@ def generate_lerobot_v30_dataset(
         "features": {
             "observation.state": {
                 "dtype": "float32",
-                "shape": [2],
-                "names": ["probe_x", "probe_y"],
+                "shape": [int(state_array.shape[1])],
+                "names": state_feature_names,
             },
             "action": {
                 "dtype": "float32",
-                "shape": [2],
-                "names": ["delta_probe_x", "delta_probe_y"],
+                "shape": [int(action_array.shape[1])],
+                "names": action_feature_names,
             },
             "next.reward": {
                 "dtype": "float32",
@@ -3587,6 +3820,67 @@ def get_train_defaults(policy_type: str) -> dict[str, Any]:
         }
     )
     return defaults
+
+
+def expected_signature_dim(
+    *,
+    state_dim: int,
+    sig_depth: int,
+    backend: str,
+) -> int:
+    if state_dim <= 0:
+        raise ValueError(f"state_dim must be positive, got {state_dim}.")
+    if sig_depth <= 0:
+        raise ValueError(f"sig_depth must be positive, got {sig_depth}.")
+    if backend == "signatory":
+        return int(sum(state_dim**order for order in range(1, sig_depth + 1)))
+    if backend == "simple":
+        return int(state_dim * sig_depth)
+    raise ValueError(f"Unsupported signature backend {backend!r}.")
+
+
+def validate_training_dataset_root(dataset_root: Path) -> None:
+    info_path = dataset_root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    features = info.get("features", {})
+    state_feature = features.get("observation.state", {})
+    action_feature = features.get("action", {})
+    expected_state_dim = len(DEFAULT_ARM_JOINT_FEATURE_NAMES)
+
+    state_shape = state_feature.get("shape")
+    action_shape = action_feature.get("shape")
+    observation_representation = info.get("observation_representation")
+    action_representation = info.get("action_representation")
+    if (
+        observation_representation != "joint_positions"
+        or action_representation != "next_joint_positions"
+        or state_shape != [expected_state_dim]
+        or action_shape != [expected_state_dim]
+    ):
+        raise ValueError(
+            "panda_route training now expects a regenerated joint-space dataset. "
+            f"Dataset at {dataset_root} still looks like the legacy 2D export. "
+            "Please rerun `scripts/collect_imitation_dataset.py --env panda_route` "
+            "after installing MuJoCo."
+        )
+    path_signature = info.get("path_signature")
+    if isinstance(path_signature, dict):
+        signature_dim = int(path_signature.get("signature_dim", 0))
+        sig_depth = int(path_signature.get("sig_depth", 0))
+        backend = str(path_signature.get("backend", ""))
+        if signature_dim > 0 and sig_depth > 0 and backend in {"signatory", "simple"}:
+            expected_sig_dim = expected_signature_dim(
+                state_dim=expected_state_dim,
+                sig_depth=sig_depth,
+                backend=backend,
+            )
+            if signature_dim != expected_sig_dim:
+                raise ValueError(
+                    "panda_route dataset path_signature metadata is inconsistent with "
+                    "joint-space observation.state. "
+                    f"Expected signature_dim={expected_sig_dim}, got {signature_dim}. "
+                    "Please regenerate the dataset."
+                )
 
 
 def get_eval_defaults(policy_type: str) -> dict[str, Any]:
@@ -3748,6 +4042,26 @@ def evaluate_policy(
         enable_randomize=enable_randomize,
         image_size=image_hw[0],
     )
+    if state_dim != env.action_dim:
+        raise RuntimeError(
+            "Loaded panda_route policy uses an incompatible observation.state dim. "
+            f"Policy expects {state_dim}, but joint-space panda_route requires {env.action_dim}. "
+            "Please retrain on the regenerated joint-space dataset."
+        )
+    action_feature = getattr(cfg, "action_feature", None)
+    if action_feature is not None and hasattr(action_feature, "shape"):
+        action_dim = int(action_feature.shape[0])
+        if action_dim != env.action_dim:
+            raise RuntimeError(
+                "Loaded panda_route policy uses an incompatible action dim. "
+                f"Policy expects {action_dim}, but joint-space panda_route requires {env.action_dim}. "
+                "Please retrain on the regenerated joint-space dataset."
+            )
+    print(
+        "[info] panda_route eval action semantics: "
+        "observation.state=joint_positions, action=joint_position_target, "
+        f"per_joint_delta_clip={args.max_action_step:.4f}"
+    )
 
     results = []
     success_count = 0
@@ -3762,6 +4076,7 @@ def evaluate_policy(
             task_spec = build_task_spec(task_id)
             task_rollout_counts[task_id] += 1
             state_xy = tuple(float(v) for v in env.reset(task_id=task_id))
+            joint_state = env.get_joint_positions()
             if env.start_region_name != task_spec.start_region_name:
                 raise RuntimeError(
                     "Environment reset returned a start region that does not match the task. "
@@ -3778,7 +4093,7 @@ def evaluate_policy(
                 raise RuntimeError("Failed to open ffmpeg stdin for rollout video writing.")
 
             trajectory = [state_xy]
-            state_history = deque() if use_path_signature else None
+            joint_history = deque() if use_path_signature else None
             last_info = {
                 **env.last_info,
                 "phase_name": env.get_phase_name(state_xy),
@@ -3798,16 +4113,14 @@ def evaluate_policy(
                     state_key=state_key,
                     image_key=image_key,
                     state_dim=state_dim,
+                    state_vector=joint_state,
                 )
 
                 if use_path_signature:
-                    assert state_history is not None
-                    state_now = (
-                        obs[state_key].detach().cpu().numpy().astype(np.float32, copy=False)
-                    )
-                    state_history.append(state_now.copy())
+                    assert joint_history is not None
+                    joint_history.append(joint_state.astype(np.float32, copy=True))
                     signature_vec = _compute_online_signature_prefix(
-                        state_history=state_history,
+                        state_history=joint_history,
                         sig_depth=int(cfg.signature_depth),
                         signature_backend=str(signature_backend),
                     )
@@ -3844,17 +4157,25 @@ def evaluate_policy(
                 with torch.no_grad():
                     action = policy.select_action(obs)
                 action = postprocessor(action)
-                action_np = action.squeeze(0).detach().cpu().numpy()
-                dx = float(action_np[0]) if action_np.shape[0] >= 1 else 0.0
-                dy = float(action_np[1]) if action_np.shape[0] >= 2 else 0.0
-                norm = math.sqrt(dx * dx + dy * dy)
-                if norm > args.max_action_step and norm > 1e-8:
-                    scale = args.max_action_step / norm
-                    dx *= scale
-                    dy *= scale
+                action_np = action.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+                if action_np.ndim != 1 or int(action_np.shape[0]) < env.action_dim:
+                    raise RuntimeError(
+                        "panda_route evaluation expects a 1D joint-position action with "
+                        f"at least {env.action_dim} values, got shape={tuple(action_np.shape)}."
+                    )
+                target_joint = action_np[: env.action_dim].copy()
+                if args.max_action_step > 0.0:
+                    joint_delta = target_joint - joint_state
+                    joint_delta = np.clip(
+                        joint_delta,
+                        -float(args.max_action_step),
+                        float(args.max_action_step),
+                    )
+                    target_joint = joint_state + joint_delta
 
-                next_state, reward, done, info = env.step((dx, dy))
+                next_state, reward, done, info = env.step(target_joint)
                 state_xy = (float(next_state[0]), float(next_state[1]))
+                joint_state = env.get_joint_positions()
                 trajectory.append(state_xy)
                 episode_reward += float(reward)
                 phase_name = env.get_phase_name(state_xy)
@@ -3907,6 +4228,7 @@ def evaluate_policy(
                 "target_goal_name": str(last_info.get("target_goal_name")),
                 "video_path": str(video_path),
                 "final_position": [float(state_xy[0]), float(state_xy[1])],
+                "final_joint_positions": joint_state.astype(np.float32).tolist(),
                 "final_phase_name": str(last_info.get("phase_name")),
                 "reached_goal": last_info.get("reached_goal"),
                 "route_mismatch": bool(last_info.get("route_mismatch", False)),

@@ -21,6 +21,7 @@ LOG_FREQ="${LOG_FREQ:-50}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 EVAL_FREQ="${EVAL_FREQ:--1}"
 CHUNK_SIZE="${CHUNK_SIZE:-5}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
 WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
 WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-10}"
 
@@ -43,6 +44,7 @@ export WANDB__SERVICE_WAIT
   --eval-freq "${EVAL_FREQ}" \
   --device "${DEVICE}" \
   --chunk-size "${CHUNK_SIZE}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
   --disable-imagenet-stats \
   --wandb-project "${WANDB_PROJECT}" \
   --wandb-mode "${WANDB_MODE}" \

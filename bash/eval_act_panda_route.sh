@@ -11,12 +11,13 @@ TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-outputs/train/panda_route_act}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/eval/panda_route_act/${RUN_TAG}}"
 NUM_ROLLOUTS="${NUM_ROLLOUTS:-50}"
-MAX_STEPS="${MAX_STEPS:-180}"
+MAX_STEPS="${MAX_STEPS:-500}"
 FPS="${FPS:-20}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"
-MAX_ACTION_STEP="${MAX_ACTION_STEP:-0.035}"
-ENABLE_RANDOMIZE="${ENABLE_RANDOMIZE:-1}"
+MAX_ACTION_STEP="${MAX_ACTION_STEP:-0.02}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
+ENABLE_RANDOMIZE="${ENABLE_RANDOMIZE:-0}"
 
 POLICY_PATH="${POLICY_PATH:-}"
 LATEST_RUN_DIR="${LATEST_RUN_DIR:-}"
@@ -49,6 +50,7 @@ fi
   --fps "${FPS}" \
   --seed "${SEED}" \
   --device "${DEVICE}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
   --max-action-step "${MAX_ACTION_STEP}" \
   "${RANDOMIZE_ARG[@]}" \
   "$@"

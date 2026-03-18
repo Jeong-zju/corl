@@ -21,6 +21,7 @@ LOG_FREQ="${LOG_FREQ:-50}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 EVAL_FREQ="${EVAL_FREQ:--1}"
 CHUNK_SIZE="${CHUNK_SIZE:-5}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-0}"
 SIGNATURE_DIM="${SIGNATURE_DIM:-0}"
 SIGNATURE_DEPTH="${SIGNATURE_DEPTH:-3}"
@@ -48,6 +49,7 @@ export WANDB__SERVICE_WAIT
   --eval-freq "${EVAL_FREQ}" \
   --device "${DEVICE}" \
   --chunk-size "${CHUNK_SIZE}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
   --history-length "${HISTORY_LENGTH}" \
   --signature-dim "${SIGNATURE_DIM}" \
   --signature-depth "${SIGNATURE_DEPTH}" \
