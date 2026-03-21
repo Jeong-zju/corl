@@ -16,7 +16,9 @@ FPS="${FPS:-20}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"
 MAX_ACTION_STEP="${MAX_ACTION_STEP:-2.5}"
-ENABLE_RANDOMIZE="${ENABLE_RANDOMIZE:-1}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
+COLLISION_MODE="${COLLISION_MODE:-detect}"
+ENABLE_RANDOMIZE="${ENABLE_RANDOMIZE:-0}"
 
 POLICY_PATH="${POLICY_PATH:-}"
 LATEST_RUN_DIR="${LATEST_RUN_DIR:-}"
@@ -50,5 +52,7 @@ fi
   --seed "${SEED}" \
   --device "${DEVICE}" \
   --max-action-step "${MAX_ACTION_STEP}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
+  --collision-mode "${COLLISION_MODE}" \
   "${RANDOMIZE_ARG[@]}" \
   "$@"

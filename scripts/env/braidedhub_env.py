@@ -93,6 +93,7 @@ DEFAULT_MAX_STEPS = 240
 DEFAULT_FPS = 20
 DEFAULT_IMAGE_SIZE = 128
 DEFAULT_MAX_ACTION_STEP = 2.5
+DEFAULT_COLLISION_MODE = "reject"
 DEFAULT_RAW_OUTPUT = None
 DEFAULT_PROCESSED_OUTPUT = None
 BRANCH1_PHASE_BY_BIT = {0: "branch1_upper_region", 1: "branch1_lower_region"}
@@ -123,6 +124,7 @@ DEFAULT_SIGNATURE_BACKEND = "auto"
 DEFAULT_VIDEO_FPS = 20
 DEFAULT_VIDEO_IMAGE_SIZE = 128
 DEFAULT_LEROBOT_EPISODES_PER_CHUNK = 1000
+DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION = 0.1
 VIDEO_KEY = "observation.images.front"
 MAP_BACKGROUND_COLOR = (248, 244, 227)
 OBSTACLE_COLOR = (74, 74, 74)
@@ -133,6 +135,10 @@ GOAL_COLOR_BY_NAME = {
     "G10": (217, 95, 2),
     "G11": (230, 171, 2),
 }
+TARGET_GOAL_OUTLINE_COLOR = (255, 255, 255)
+TARGET_GOAL_MARKER_OUTER_COLOR = (24, 24, 24)
+TARGET_GOAL_MARKER_INNER_COLOR = (255, 255, 255)
+TRAJECTORY_TRAIL_COLOR = (20, 20, 20)
 ROBOT_OUTER_COLOR = (255, 255, 255)
 ROBOT_INNER_COLOR = (240, 70, 70)
 TASK_ID_VALUES = tuple(sorted(TASK_ID_TO_GOAL_NAME))
@@ -167,6 +173,7 @@ PHASE_LABEL_VOCAB = (
 PHASE_NAME_TO_ID = {
     phase_name: phase_index for phase_index, phase_name in enumerate(PHASE_LABEL_VOCAB)
 }
+VALID_COLLISION_MODES = ("reject", "detect")
 
 
 @dataclass(frozen=True)
@@ -248,11 +255,15 @@ class MapConfig:
     decision_region_h1: "SemanticRegion"
     branch1_upper_region: "SemanticRegion"
     branch1_lower_region: "SemanticRegion"
+    branch1_upper_detection_region: RectangleRegion
+    branch1_lower_detection_region: RectangleRegion
     merge_region_1: "SemanticRegion"
     middle_corridor_region: "SemanticRegion"
     decision_region_h2: "SemanticRegion"
     branch2_upper_region: "SemanticRegion"
     branch2_lower_region: "SemanticRegion"
+    branch2_upper_detection_region: RectangleRegion
+    branch2_lower_detection_region: RectangleRegion
     merge_region_2: "SemanticRegion"
     final_corridor_region: "SemanticRegion"
     free_space_rectangles: tuple[RectangleRegion, ...]
@@ -381,6 +392,32 @@ def build_obstacles_from_free_rectangles(
     return tuple(obstacles)
 
 
+def inset_rectangle_region(
+    region: RectangleRegion,
+    *,
+    name: str,
+    x_margin: float,
+    y_margin: float,
+) -> RectangleRegion:
+    """Create a smaller inner rectangle used for event-style region checks."""
+
+    if x_margin < 0.0 or y_margin < 0.0:
+        raise ValueError("x_margin and y_margin must be non-negative.")
+    if x_margin * 2.0 >= region.width or y_margin * 2.0 >= region.height:
+        raise ValueError(
+            f"Inset margins are too large for region {region.name}: "
+            f"width={region.width}, height={region.height}, "
+            f"x_margin={x_margin}, y_margin={y_margin}."
+        )
+    return RectangleRegion(
+        name=name,
+        xmin=region.xmin + x_margin,
+        xmax=region.xmax - x_margin,
+        ymin=region.ymin + y_margin,
+        ymax=region.ymax - y_margin,
+    )
+
+
 def build_default_map_config() -> MapConfig:
     """Centralized geometry for the four-start implicit-cue braided map.
 
@@ -400,101 +437,101 @@ def build_default_map_config() -> MapConfig:
     task_start_regions = (start_s00, start_s01, start_s10, start_s11)
 
     start_00_prefix = RectangleRegion(
-        "start_00_prefix", xmin=8.0, xmax=12.0, ymin=46.0, ymax=48.0
+        "start_00_prefix", xmin=8.0, xmax=12.0, ymin=45.0, ymax=49.0
     )
     start_01_prefix = RectangleRegion(
-        "start_01_prefix", xmin=8.0, xmax=12.0, ymin=36.0, ymax=38.0
+        "start_01_prefix", xmin=8.0, xmax=12.0, ymin=35.0, ymax=39.0
     )
     start_10_prefix = RectangleRegion(
-        "start_10_prefix", xmin=8.0, xmax=12.0, ymin=22.0, ymax=24.0
+        "start_10_prefix", xmin=8.0, xmax=12.0, ymin=21.0, ymax=25.0
     )
     start_11_prefix = RectangleRegion(
-        "start_11_prefix", xmin=8.0, xmax=12.0, ymin=12.0, ymax=14.0
+        "start_11_prefix", xmin=8.0, xmax=12.0, ymin=11.0, ymax=15.0
     )
     start_collector = RectangleRegion(
-        "start_collector", xmin=12.0, xmax=14.0, ymin=12.0, ymax=48.0
+        "start_collector", xmin=11.0, xmax=15.0, ymin=11.0, ymax=49.0
     )
     shared_entry = RectangleRegion(
-        "shared_entry", xmin=14.0, xmax=18.0, ymin=28.0, ymax=32.0
+        "shared_entry", xmin=14.0, xmax=18.0, ymin=27.0, ymax=33.0
     )
 
     shared_snake_1 = RectangleRegion(
-        "shared_snake_1", xmin=18.0, xmax=24.0, ymin=28.0, ymax=32.0
+        "shared_snake_1", xmin=18.0, xmax=24.0, ymin=27.0, ymax=33.0
     )
     shared_snake_2 = RectangleRegion(
-        "shared_snake_2", xmin=22.0, xmax=24.0, ymin=28.0, ymax=42.0
+        "shared_snake_2", xmin=21.0, xmax=25.0, ymin=27.0, ymax=43.0
     )
     shared_snake_3 = RectangleRegion(
-        "shared_snake_3", xmin=24.0, xmax=30.0, ymin=38.0, ymax=42.0
+        "shared_snake_3", xmin=24.0, xmax=30.0, ymin=37.0, ymax=43.0
     )
     shared_snake_4 = RectangleRegion(
-        "shared_snake_4", xmin=30.0, xmax=32.0, ymin=24.0, ymax=42.0
+        "shared_snake_4", xmin=29.0, xmax=33.0, ymin=23.0, ymax=43.0
     )
     shared_snake_5 = RectangleRegion(
-        "shared_snake_5", xmin=32.0, xmax=34.0, ymin=24.0, ymax=28.0
+        "shared_snake_5", xmin=31.0, xmax=35.0, ymin=23.0, ymax=29.0
     )
 
-    h1_hub = RectangleRegion("H1_hub", xmin=34.0, xmax=38.0, ymin=20.0, ymax=36.0)
+    h1_hub = RectangleRegion("H1_hub", xmin=33.0, xmax=39.0, ymin=19.0, ymax=37.0)
     branch1_upper_top = RectangleRegion(
-        "branch1_upper_top", xmin=40.0, xmax=48.0, ymin=42.0, ymax=46.0
+        "branch1_upper_top", xmin=40.0, xmax=48.0, ymin=41.0, ymax=47.0
     )
     branch1_upper_rise = RectangleRegion(
-        "branch1_upper_rise", xmin=38.0, xmax=40.0, ymin=34.0, ymax=46.0
+        "branch1_upper_rise", xmin=37.0, xmax=41.0, ymin=33.0, ymax=47.0
     )
     branch1_upper_drop = RectangleRegion(
-        "branch1_upper_drop", xmin=48.0, xmax=50.0, ymin=32.0, ymax=46.0
+        "branch1_upper_drop", xmin=47.0, xmax=51.0, ymin=31.0, ymax=47.0
     )
     branch1_lower_bottom = RectangleRegion(
-        "branch1_lower_bottom", xmin=40.0, xmax=48.0, ymin=10.0, ymax=14.0
+        "branch1_lower_bottom", xmin=40.0, xmax=48.0, ymin=9.0, ymax=15.0
     )
     branch1_lower_drop = RectangleRegion(
-        "branch1_lower_drop", xmin=38.0, xmax=40.0, ymin=10.0, ymax=22.0
+        "branch1_lower_drop", xmin=37.0, xmax=41.0, ymin=9.0, ymax=23.0
     )
     branch1_lower_rise = RectangleRegion(
-        "branch1_lower_rise", xmin=48.0, xmax=50.0, ymin=10.0, ymax=28.0
+        "branch1_lower_rise", xmin=47.0, xmax=51.0, ymin=9.0, ymax=29.0
     )
-    merge1_hub = RectangleRegion("merge1_hub", xmin=50.0, xmax=54.0, ymin=24.0, ymax=36.0)
+    merge1_hub = RectangleRegion("merge1_hub", xmin=49.0, xmax=55.0, ymin=23.0, ymax=37.0)
 
     middle_snake_1 = RectangleRegion(
-        "middle_snake_1", xmin=54.0, xmax=60.0, ymin=28.0, ymax=32.0
+        "middle_snake_1", xmin=54.0, xmax=60.0, ymin=27.0, ymax=33.0
     )
     middle_snake_2 = RectangleRegion(
-        "middle_snake_2", xmin=60.0, xmax=62.0, ymin=28.0, ymax=40.0
+        "middle_snake_2", xmin=59.0, xmax=63.0, ymin=27.0, ymax=41.0
     )
     middle_snake_3 = RectangleRegion(
-        "middle_snake_3", xmin=62.0, xmax=68.0, ymin=36.0, ymax=40.0
+        "middle_snake_3", xmin=62.0, xmax=68.0, ymin=35.0, ymax=41.0
     )
     middle_snake_4 = RectangleRegion(
-        "middle_snake_4", xmin=68.0, xmax=70.0, ymin=18.0, ymax=40.0
+        "middle_snake_4", xmin=67.0, xmax=71.0, ymin=17.0, ymax=41.0
     )
     middle_snake_5 = RectangleRegion(
-        "middle_snake_5", xmin=70.0, xmax=72.0, ymin=18.0, ymax=22.0
+        "middle_snake_5", xmin=69.0, xmax=73.0, ymin=17.0, ymax=23.0
     )
 
-    h2_hub = RectangleRegion("H2_hub", xmin=72.0, xmax=76.0, ymin=14.0, ymax=36.0)
+    h2_hub = RectangleRegion("H2_hub", xmin=71.0, xmax=77.0, ymin=13.0, ymax=37.0)
     branch2_upper_top = RectangleRegion(
-        "branch2_upper_top", xmin=78.0, xmax=86.0, ymin=40.0, ymax=44.0
+        "branch2_upper_top", xmin=78.0, xmax=86.0, ymin=39.0, ymax=45.0
     )
     branch2_upper_rise = RectangleRegion(
-        "branch2_upper_rise", xmin=76.0, xmax=78.0, ymin=32.0, ymax=44.0
+        "branch2_upper_rise", xmin=75.0, xmax=79.0, ymin=31.0, ymax=45.0
     )
     branch2_upper_drop = RectangleRegion(
-        "branch2_upper_drop", xmin=86.0, xmax=88.0, ymin=30.0, ymax=44.0
+        "branch2_upper_drop", xmin=85.0, xmax=89.0, ymin=30.0, ymax=45.0
     )
     branch2_lower_bottom = RectangleRegion(
-        "branch2_lower_bottom", xmin=78.0, xmax=86.0, ymin=8.0, ymax=12.0
+        "branch2_lower_bottom", xmin=78.0, xmax=86.0, ymin=7.0, ymax=13.0
     )
     branch2_lower_drop = RectangleRegion(
-        "branch2_lower_drop", xmin=76.0, xmax=78.0, ymin=8.0, ymax=16.0
+        "branch2_lower_drop", xmin=75.0, xmax=79.0, ymin=7.0, ymax=17.0
     )
     branch2_lower_rise = RectangleRegion(
-        "branch2_lower_rise", xmin=86.0, xmax=88.0, ymin=8.0, ymax=28.0
+        "branch2_lower_rise", xmin=85.0, xmax=89.0, ymin=7.0, ymax=29.0
     )
-    merge2_hub = RectangleRegion("merge2_hub", xmin=88.0, xmax=92.0, ymin=24.0, ymax=36.0)
+    merge2_hub = RectangleRegion("merge2_hub", xmin=87.0, xmax=93.0, ymin=23.0, ymax=37.0)
     final_corridor = RectangleRegion(
-        "final_corridor", xmin=92.0, xmax=96.0, ymin=28.0, ymax=32.0
+        "final_corridor", xmin=91.0, xmax=97.0, ymin=27.0, ymax=33.0
     )
-    terminal_hub = RectangleRegion("terminal_hub", xmin=96.0, xmax=98.0, ymin=10.0, ymax=50.0)
+    terminal_hub = RectangleRegion("terminal_hub", xmin=95.0, xmax=99.0, ymin=9.0, ymax=51.0)
 
     goal_regions = (
         GoalRegion("G00", xmin=98.0, xmax=100.0, ymin=42.0, ymax=50.0),
@@ -539,6 +576,18 @@ def build_default_map_config() -> MapConfig:
         "branch1_lower_region",
         rectangles=(branch1_lower_bottom, branch1_lower_drop, branch1_lower_rise),
     )
+    branch1_upper_detection_region = inset_rectangle_region(
+        branch1_upper_top,
+        name="branch1_upper_detection_region",
+        x_margin=2.0,
+        y_margin=1.0,
+    )
+    branch1_lower_detection_region = inset_rectangle_region(
+        branch1_lower_bottom,
+        name="branch1_lower_detection_region",
+        x_margin=2.0,
+        y_margin=1.0,
+    )
     merge_region_1 = SemanticRegion("merge_region_1", rectangles=(merge1_hub,))
     middle_corridor_region = SemanticRegion(
         "middle_corridor_region",
@@ -558,6 +607,18 @@ def build_default_map_config() -> MapConfig:
     branch2_lower_region = SemanticRegion(
         "branch2_lower_region",
         rectangles=(branch2_lower_bottom, branch2_lower_drop, branch2_lower_rise),
+    )
+    branch2_upper_detection_region = inset_rectangle_region(
+        branch2_upper_top,
+        name="branch2_upper_detection_region",
+        x_margin=2.0,
+        y_margin=1.0,
+    )
+    branch2_lower_detection_region = inset_rectangle_region(
+        branch2_lower_bottom,
+        name="branch2_lower_detection_region",
+        x_margin=2.0,
+        y_margin=1.0,
     )
     merge_region_2 = SemanticRegion("merge_region_2", rectangles=(merge2_hub,))
     final_corridor_region = SemanticRegion(
@@ -624,11 +685,15 @@ def build_default_map_config() -> MapConfig:
         decision_region_h1=decision_region_h1,
         branch1_upper_region=branch1_upper_region,
         branch1_lower_region=branch1_lower_region,
+        branch1_upper_detection_region=branch1_upper_detection_region,
+        branch1_lower_detection_region=branch1_lower_detection_region,
         merge_region_1=merge_region_1,
         middle_corridor_region=middle_corridor_region,
         decision_region_h2=decision_region_h2,
         branch2_upper_region=branch2_upper_region,
         branch2_lower_region=branch2_lower_region,
+        branch2_upper_detection_region=branch2_upper_detection_region,
+        branch2_lower_detection_region=branch2_lower_detection_region,
         merge_region_2=merge_region_2,
         final_corridor_region=final_corridor_region,
         free_space_rectangles=free_space_rectangles,
@@ -736,6 +801,31 @@ def is_state_valid(x: float, y: float, config: MapConfig | None = None) -> bool:
     """Check whether a point-robot state is valid in the current map."""
 
     return is_in_bounds(x, y, config=config) and not is_in_obstacle(x, y, config=config)
+
+
+def is_line_segment_valid(
+    from_point: tuple[float, float],
+    to_point: tuple[float, float],
+    config: MapConfig | None = None,
+    resolution: float = DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+) -> bool:
+    """Check whether a straight-line sweep between two states stays in free space."""
+
+    if resolution <= 0.0:
+        raise ValueError("resolution must be positive.")
+
+    resolved_config = _resolve_config(config)
+    distance = math.dist(from_point, to_point)
+    num_checks = max(1, int(math.ceil(distance / resolution)))
+    for check_index in range(num_checks + 1):
+        t = check_index / num_checks
+        point = (
+            float(from_point[0] * (1.0 - t) + to_point[0] * t),
+            float(from_point[1] * (1.0 - t) + to_point[1] * t),
+        )
+        if not is_state_valid(*point, config=resolved_config):
+            return False
+    return True
 
 
 def sample_workspace_state(
@@ -849,6 +939,26 @@ def get_phase_name(x: float, y: float, config: MapConfig | None = None) -> str:
     if resolved_config.shared_corridor_region.contains_point(x, y):
         return resolved_config.shared_corridor_region.name
     return "free_space_other"
+
+
+def get_branch_detection_event(
+    x: float,
+    y: float,
+    config: MapConfig | None = None,
+) -> tuple[str, str] | None:
+    """Return a stage/phase tuple only inside the narrowed branch detection windows."""
+
+    resolved_config = _resolve_config(config)
+    detection_regions = (
+        ("H1", "branch1_upper_region", resolved_config.branch1_upper_detection_region),
+        ("H1", "branch1_lower_region", resolved_config.branch1_lower_detection_region),
+        ("H2", "branch2_upper_region", resolved_config.branch2_upper_detection_region),
+        ("H2", "branch2_lower_region", resolved_config.branch2_lower_detection_region),
+    )
+    for stage_name, phase_name, detection_region in detection_regions:
+        if detection_region.contains_point(x, y):
+            return stage_name, phase_name
+    return None
 
 
 def _first_index_of_phase(
@@ -1397,6 +1507,7 @@ class BraidedHub2DEnv:
         step_penalty: float = DEFAULT_STEP_PENALTY,
         goal_reward: float = DEFAULT_GOAL_REWARD,
         enable_randomize: bool = False,
+        collision_mode: str = DEFAULT_COLLISION_MODE,
     ) -> None:
         self.map_config = _resolve_config(map_config)
         self.start_region = self.map_config.start_region
@@ -1408,6 +1519,12 @@ class BraidedHub2DEnv:
         self.step_penalty = float(step_penalty)
         self.goal_reward = float(goal_reward)
         self.enable_randomize = bool(enable_randomize)
+        self.collision_mode = str(collision_mode).lower()
+        if self.collision_mode not in VALID_COLLISION_MODES:
+            raise ValueError(
+                f"Unsupported collision_mode={collision_mode!r}. "
+                f"Expected one of {VALID_COLLISION_MODES}."
+            )
         self.rng = random.Random(rng_seed)
 
         self.state: tuple[float, float] | None = None
@@ -1489,6 +1606,8 @@ class BraidedHub2DEnv:
             "target_goal_name": self.target_goal_name,
             "reached_goal": None,
             "success": False,
+            "collision_mode": self.collision_mode,
+            "collision_detected": False,
             "collision_rejected": False,
             "start_randomized": use_randomized_start,
         }
@@ -1588,10 +1707,11 @@ class BraidedHub2DEnv:
     ) -> tuple[tuple[float, float], float, bool, dict[str, Any]]:
         """Advance the point robot with simple Euler integration.
 
-        Invalid next states are handled by rejection:
-        - If the proposed state is outside bounds or inside an obstacle,
-          the robot stays at the previous valid state.
-        - No clipping or wall sliding is applied.
+        Invalid next states are handled according to collision_mode:
+        - `reject`: if the proposed state is outside bounds or inside an
+          obstacle, the robot stays at the previous valid state.
+        - `detect`: the invalid transition is recorded but still applied,
+          which allows penetration through walls for debugging/eval ablations.
         Terminal handling:
         - Entering any goal region ends the episode.
         - Only entering the task-selected target goal counts as success and
@@ -1618,8 +1738,16 @@ class BraidedHub2DEnv:
         )
 
         proposed_valid = is_state_valid(*proposed_state, config=self.map_config)
-        collision_rejected = not proposed_valid
-        next_state = self.state if collision_rejected else proposed_state
+        collision_detected = not proposed_valid
+        if proposed_valid:
+            collision_rejected = False
+            next_state = proposed_state
+        elif self.collision_mode == "reject":
+            collision_rejected = True
+            next_state = self.state
+        else:
+            collision_rejected = False
+            next_state = proposed_state
         reached_goal = get_goal_region_for_state(*next_state, config=self.map_config)
         success = (
             reached_goal is not None and reached_goal.name == self.target_goal_name
@@ -1642,9 +1770,11 @@ class BraidedHub2DEnv:
             "target_goal_name": self.target_goal_name,
             "step_count": self.step_count,
             "action": (float(dx), float(dy)),
+            "collision_mode": self.collision_mode,
             "proposed_state": proposed_state,
             "applied_state": next_state,
             "proposed_state_valid": proposed_valid,
+            "collision_detected": collision_detected,
             "collision_rejected": collision_rejected,
             "reached_goal": None if reached_goal is None else reached_goal.name,
             "success": success,
@@ -1985,21 +2115,28 @@ def build_balanced_task_schedule(num_rollouts: int, seed: int) -> list[int]:
     return [int(task_id) for task_id in repeated]
 
 
-def detect_branch_mismatch(task_spec, phase_name: str) -> dict[str, str] | None:
+def detect_branch_mismatch(
+    task_spec,
+    state_xy: tuple[float, float],
+    config: MapConfig | None = None,
+) -> dict[str, str] | None:
     expected_branch1 = BRANCH1_PHASE_BY_BIT[int(task_spec.task_bits[0])]
     expected_branch2 = BRANCH2_PHASE_BY_BIT[int(task_spec.task_bits[1])]
+    detection_event = get_branch_detection_event(
+        float(state_xy[0]),
+        float(state_xy[1]),
+        config=config,
+    )
+    if detection_event is None:
+        return None
 
-    if phase_name in BRANCH1_PHASES and phase_name != expected_branch1:
+    stage_name, observed_phase = detection_event
+    expected_phase = expected_branch1 if stage_name == "H1" else expected_branch2
+    if observed_phase != expected_phase:
         return {
-            "stage": "H1",
-            "expected_phase": expected_branch1,
-            "observed_phase": phase_name,
-        }
-    if phase_name in BRANCH2_PHASES and phase_name != expected_branch2:
-        return {
-            "stage": "H2",
-            "expected_phase": expected_branch2,
-            "observed_phase": phase_name,
+            "stage": stage_name,
+            "expected_phase": expected_phase,
+            "observed_phase": observed_phase,
         }
     return None
 
@@ -2056,10 +2193,20 @@ def evaluate_policy(
         "[info] braidedhub eval reset mode: "
         + ("randomized starts" if enable_randomize else "deterministic center starts")
     )
+    print(
+        "[info] braidedhub collision mode: "
+        f"{args.collision_mode} "
+        + (
+            "(invalid moves are rejected)"
+            if args.collision_mode == "reject"
+            else "(invalid moves are detected but still applied)"
+        )
+    )
     env = BraidedHub2DEnv(
         map_config=map_config,
         rng_seed=args.seed,
         enable_randomize=enable_randomize,
+        collision_mode=args.collision_mode,
     )
     base_img = make_lerobot_base_image(
         map_config,
@@ -2095,6 +2242,8 @@ def evaluate_policy(
             policy.reset()
 
         episode_reward = 0.0
+        episode_collision_detection_count = 0
+        episode_collision_rejection_count = 0
         video_path = output_dir / f"rollout_{ep_idx:03d}_task_{task_spec.task_code}.mp4"
         writer = start_ffmpeg_raw_writer(
             video_path,
@@ -2191,8 +2340,16 @@ def evaluate_policy(
             state_xy = (float(next_state[0]), float(next_state[1]))
             trajectory.append(state_xy)
             episode_reward += float(reward)
+            if info.get("collision_detected", False):
+                episode_collision_detection_count += 1
+            if info.get("collision_rejected", False):
+                episode_collision_rejection_count += 1
             phase_name = env.get_phase_name(state_xy)
-            mismatch = detect_branch_mismatch(task_spec=task_spec, phase_name=phase_name)
+            mismatch = detect_branch_mismatch(
+                task_spec=task_spec,
+                state_xy=state_xy,
+                config=map_config,
+            )
             last_info = {
                 **info,
                 "phase_name": phase_name,
@@ -2262,13 +2419,9 @@ def evaluate_policy(
             "success": success,
             "steps": int(len(trajectory) - 1),
             "sum_reward": float(episode_reward),
-            "collision_rejections": int(
-                sum(
-                    1
-                    for index in range(1, len(env.trajectory))
-                    if env.trajectory[index] == env.trajectory[index - 1]
-                )
-            ),
+            "collision_mode": args.collision_mode,
+            "collision_detections": int(episode_collision_detection_count),
+            "collision_rejections": int(episode_collision_rejection_count),
         }
         results.append(result)
         print(
@@ -2303,6 +2456,13 @@ def evaluate_policy(
         "fps": args.fps,
         "max_steps": args.max_steps,
         "max_action_step": args.max_action_step,
+        "collision_mode": args.collision_mode,
+        "collision_detections": int(
+            sum(result["collision_detections"] for result in results)
+        ),
+        "collision_rejections": int(
+            sum(result["collision_rejections"] for result in results)
+        ),
         "start_randomized": enable_randomize,
         "policy_dir": str(policy_dir),
         "per_task": per_task,
@@ -2314,6 +2474,12 @@ def evaluate_policy(
     print(f"Summary: {summary_path}")
     print(
         f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})"
+    )
+    print(
+        "Collision mode: "
+        f"{summary['collision_mode']}, "
+        f"detections={summary['collision_detections']}, "
+        f"rejections={summary['collision_rejections']}"
     )
     print(f"Wrong-branch failures: {branch_failure_count}/{args.num_rollouts}")
     for task_id in sorted(TASK_ID_TO_GOAL_NAME):
@@ -2375,29 +2541,341 @@ def compute_path_distance(path_xy: np.ndarray | list[tuple[float, float]]) -> fl
     return float(np.linalg.norm(deltas, axis=1).sum())
 
 
-def resample_path_fixed_length(
+def compress_dense_path_to_collision_free_indices(
     path_xy: np.ndarray | list[tuple[float, float]],
+    config: MapConfig | None = None,
+    resolution: float = DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+) -> list[int]:
+    """Greedily compress a dense safe path into a collision-free polyline index set.
+
+    The output keeps path order, uses only points from the original dense path, and ensures
+    every consecutive straight segment is collision-free under the configured checker.
+    """
+
+    # Match the dtype used by the exported dataset so compression remains valid
+    # for the exact straight segments we will later serialize and re-check.
+    path_array = _as_path_array(path_xy).astype(np.float32, copy=False)
+    if path_array.shape[0] <= 1:
+        return [0]
+
+    resolved_config = _resolve_config(config)
+    selected_indices = [0]
+    current_index = 0
+    last_index = int(path_array.shape[0] - 1)
+
+    while current_index < last_index:
+        next_index = last_index
+        current_point = (
+            float(path_array[current_index, 0]),
+            float(path_array[current_index, 1]),
+        )
+        while next_index > current_index + 1:
+            next_point = (
+                float(path_array[next_index, 0]),
+                float(path_array[next_index, 1]),
+            )
+            if is_line_segment_valid(
+                current_point,
+                next_point,
+                config=resolved_config,
+                resolution=resolution,
+            ):
+                break
+            next_index -= 1
+
+        if next_index == current_index:
+            raise RuntimeError(
+                "Failed to advance collision-free path compression. "
+                f"current_index={current_index}, path_length={path_array.shape[0]}"
+            )
+
+        if next_index == current_index + 1:
+            next_point = (
+                float(path_array[next_index, 0]),
+                float(path_array[next_index, 1]),
+            )
+            if not is_line_segment_valid(
+                current_point,
+                next_point,
+                config=resolved_config,
+                resolution=resolution,
+            ):
+                raise ValueError(
+                    "Dense raw path contains an invalid consecutive segment. "
+                    f"segment=({current_index}, {next_index})"
+                )
+
+        selected_indices.append(next_index)
+        current_index = next_index
+
+    return selected_indices
+
+
+def compress_dense_path_to_collision_free_polyline(
+    path_xy: np.ndarray | list[tuple[float, float]],
+    config: MapConfig | None = None,
+    resolution: float = DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+) -> np.ndarray:
+    path_array = _as_path_array(path_xy)
+    indices = compress_dense_path_to_collision_free_indices(
+        path_array,
+        config=config,
+        resolution=resolution,
+    )
+    return path_array[np.asarray(indices, dtype=np.int64)].astype(np.float32)
+
+
+def count_invalid_resampled_segments(
+    path_xy: np.ndarray | list[tuple[float, float]],
+    config: MapConfig | None = None,
+    resolution: float = DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+) -> tuple[int, int | None]:
+    path_array = _as_path_array(path_xy)
+    invalid_segment_count = 0
+    first_invalid_segment_index: int | None = None
+
+    for segment_index in range(path_array.shape[0] - 1):
+        from_point = (
+            float(path_array[segment_index, 0]),
+            float(path_array[segment_index, 1]),
+        )
+        to_point = (
+            float(path_array[segment_index + 1, 0]),
+            float(path_array[segment_index + 1, 1]),
+        )
+        if is_line_segment_valid(
+            from_point,
+            to_point,
+            config=config,
+            resolution=resolution,
+        ):
+            continue
+        invalid_segment_count += 1
+        if first_invalid_segment_index is None:
+            first_invalid_segment_index = segment_index
+
+    return invalid_segment_count, first_invalid_segment_index
+
+
+def resolve_resampled_horizon(
+    compressed_index_paths: list[list[int]],
+    requested_t_fixed: int,
+) -> int:
+    if not compressed_index_paths:
+        raise ValueError("raw_dataset is empty.")
+
+    compressed_lengths = np.asarray(
+        [len(index_path) for index_path in compressed_index_paths],
+        dtype=np.int64,
+    )
+    required_t_fixed = int(compressed_lengths.max())
+    avg_compressed_steps = float(compressed_lengths.mean())
+
+    if requested_t_fixed > 0:
+        if requested_t_fixed < required_t_fixed:
+            raise ValueError(
+                "Requested t_fixed is too small to preserve collision-free polylines "
+                f"for every episode. requested={requested_t_fixed}, "
+                f"required_minimum={required_t_fixed}."
+            )
+        return int(requested_t_fixed)
+
+    print(
+        "[info] auto-resolving t_fixed from collision-free compressed paths: "
+        f"avg_compressed_steps={avg_compressed_steps:.2f}, "
+        f"required_minimum={required_t_fixed}"
+    )
+    return required_t_fixed
+
+
+def expand_collision_free_polyline_fixed_length(
+    path_xy: np.ndarray | list[tuple[float, float]],
+    compressed_indices: list[int],
     t_fixed: int,
+    config: MapConfig | None = None,
+    resolution: float = DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
 ) -> np.ndarray:
     if t_fixed <= 0:
         raise ValueError("t_fixed must be positive.")
 
-    path_array = _as_path_array(path_xy)
-    if path_array.shape[0] == 1:
-        return np.repeat(path_array.astype(np.float32), t_fixed, axis=0)
+    path_array = _as_path_array(path_xy).astype(np.float32, copy=False)
+    if not compressed_indices:
+        raise ValueError("compressed_indices must not be empty.")
 
-    segment_lengths = np.linalg.norm(np.diff(path_array, axis=0), axis=1)
-    cumulative_lengths = np.concatenate(
-        [np.zeros(1, dtype=np.float64), np.cumsum(segment_lengths, dtype=np.float64)]
-    )
-    total_length = float(cumulative_lengths[-1])
-    if total_length <= 1e-8:
-        return np.repeat(path_array[:1].astype(np.float32), t_fixed, axis=0)
+    current_indices = [int(index) for index in compressed_indices]
+    current_length = len(current_indices)
+    if current_length > t_fixed:
+        raise ValueError(
+            f"Cannot expand path of length {current_length} into smaller t_fixed={t_fixed}."
+        )
+    if current_length == 1:
+        repeated = path_array[np.asarray(current_indices[:1], dtype=np.int64)]
+        return np.repeat(repeated, t_fixed, axis=0).astype(np.float32, copy=False)
 
-    target_lengths = np.linspace(0.0, total_length, num=t_fixed, dtype=np.float64)
-    resampled_x = np.interp(target_lengths, cumulative_lengths, path_array[:, 0])
-    resampled_y = np.interp(target_lengths, cumulative_lengths, path_array[:, 1])
-    return np.stack([resampled_x, resampled_y], axis=1).astype(np.float32)
+    resolved_config = _resolve_config(config)
+    total_intervals = int(t_fixed - 1)
+
+    def try_find_split_index(left_index: int, right_index: int) -> int | None:
+        if right_index - left_index <= 1:
+            return None
+
+        midpoint = (left_index + right_index) // 2
+        max_offset = max(midpoint - left_index, right_index - midpoint)
+        candidate_indices: list[int] = []
+        for offset in range(max_offset + 1):
+            left_candidate = midpoint - offset
+            right_candidate = midpoint + offset
+            if left_index < left_candidate < right_index:
+                candidate_indices.append(left_candidate)
+            if (
+                right_candidate != left_candidate
+                and left_index < right_candidate < right_index
+            ):
+                candidate_indices.append(right_candidate)
+
+        left_point = (
+            float(path_array[left_index, 0]),
+            float(path_array[left_index, 1]),
+        )
+        right_point = (
+            float(path_array[right_index, 0]),
+            float(path_array[right_index, 1]),
+        )
+        for candidate_index in candidate_indices:
+            middle_point = (
+                float(path_array[candidate_index, 0]),
+                float(path_array[candidate_index, 1]),
+            )
+            if not is_line_segment_valid(
+                left_point,
+                middle_point,
+                config=resolved_config,
+                resolution=resolution,
+            ):
+                continue
+            if not is_line_segment_valid(
+                middle_point,
+                right_point,
+                config=resolved_config,
+                resolution=resolution,
+            ):
+                continue
+            return candidate_index
+        return None
+
+    def allocate_interval_counts(polyline_xy: np.ndarray) -> np.ndarray:
+        num_segments = int(polyline_xy.shape[0] - 1)
+        if total_intervals < num_segments:
+            raise ValueError(
+                "t_fixed is too small to preserve every collision-free polyline vertex. "
+                f"t_fixed={t_fixed}, required_minimum={num_segments + 1}."
+            )
+
+        segment_vectors = np.diff(polyline_xy.astype(np.float64), axis=0)
+        segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+        interval_counts = np.ones(num_segments, dtype=np.int64)
+        remaining_intervals = int(total_intervals - num_segments)
+        for _ in range(remaining_intervals):
+            best_segment_index = max(
+                range(num_segments),
+                key=lambda idx: (
+                    float(segment_lengths[idx] / max(1, int(interval_counts[idx]))),
+                    float(segment_lengths[idx]),
+                ),
+            )
+            interval_counts[best_segment_index] += 1
+        return interval_counts
+
+    def build_uniform_dense_path(
+        polyline_xy: np.ndarray,
+        interval_counts: np.ndarray,
+    ) -> tuple[np.ndarray | None, int | None]:
+        expanded = np.empty((t_fixed, 2), dtype=np.float32)
+        expanded[0] = polyline_xy[0]
+        write_index = 1
+
+        for segment_index in range(polyline_xy.shape[0] - 1):
+            start_point = polyline_xy[segment_index].astype(np.float64)
+            end_point = polyline_xy[segment_index + 1].astype(np.float64)
+            previous_point = polyline_xy[segment_index]
+            interval_count = int(interval_counts[segment_index])
+            for step_index in range(1, interval_count + 1):
+                alpha = float(step_index / interval_count)
+                next_point = (
+                    start_point * (1.0 - alpha) + end_point * alpha
+                ).astype(np.float32)
+                if not is_line_segment_valid(
+                    (
+                        float(previous_point[0]),
+                        float(previous_point[1]),
+                    ),
+                    (
+                        float(next_point[0]),
+                        float(next_point[1]),
+                    ),
+                    config=resolved_config,
+                    resolution=resolution,
+                ):
+                    return None, int(segment_index)
+                expanded[write_index] = next_point
+                write_index += 1
+                previous_point = next_point
+
+        if write_index != t_fixed:
+            raise RuntimeError(
+                "Uniform collision-free densification produced an unexpected number "
+                f"of states. expected={t_fixed}, got={write_index}"
+            )
+        return expanded, None
+
+    while True:
+        polyline = path_array[np.asarray(current_indices, dtype=np.int64)].astype(
+            np.float32,
+            copy=False,
+        )
+        if polyline.shape[0] == t_fixed:
+            expanded = polyline.astype(np.float32, copy=True)
+        else:
+            interval_counts = allocate_interval_counts(polyline)
+            expanded, failing_segment_index = build_uniform_dense_path(
+                polyline,
+                interval_counts,
+            )
+            if expanded is None:
+                if failing_segment_index is None:
+                    raise RuntimeError(
+                        "Uniform collision-free densification failed without reporting "
+                        "the offending segment."
+                    )
+
+                left_index = current_indices[failing_segment_index]
+                right_index = current_indices[failing_segment_index + 1]
+                split_index = try_find_split_index(left_index, right_index)
+                if split_index is None:
+                    if right_index - left_index <= 1:
+                        raise ValueError(
+                            "Unable to refine a collision-free segment for uniform dense "
+                            f"resampling. left_index={left_index}, right_index={right_index}, "
+                            f"t_fixed={t_fixed}"
+                        )
+                    split_index = (left_index + right_index) // 2
+                current_indices.insert(failing_segment_index + 1, int(split_index))
+                continue
+
+        invalid_segment_count, first_invalid_segment_index = (
+            count_invalid_resampled_segments(
+                expanded,
+                config=resolved_config,
+                resolution=resolution,
+            )
+        )
+        if invalid_segment_count > 0:
+            raise ValueError(
+                "Uniform collision-free densification produced an invalid straight-line "
+                f"segment. invalid_segments={invalid_segment_count}, "
+                f"first_invalid_segment={first_invalid_segment_index}"
+            )
+        return expanded
 
 
 def build_actions_from_states(
@@ -2553,6 +3031,80 @@ def _draw_disk(
     image[mask] = np.asarray(color, dtype=np.uint8)
 
 
+def _draw_region_outline(
+    image: np.ndarray,
+    region: RectangleRegion | SemanticRegion,
+    color: tuple[int, int, int],
+    thickness: int,
+    config: MapConfig,
+) -> None:
+    if hasattr(region, "rectangles"):
+        for rectangle in region.rectangles:
+            _draw_region_outline(
+                image,
+                rectangle,
+                color,
+                thickness,
+                config=config,
+            )
+        return
+
+    top_left = _workspace_to_pixel(
+        (region.xmin, region.ymax),
+        config=config,
+        image_size=image.shape[:2],
+    )
+    bottom_right = _workspace_to_pixel(
+        (region.xmax, region.ymin),
+        config=config,
+        image_size=image.shape[:2],
+    )
+    x0, x1 = sorted((top_left[0], bottom_right[0]))
+    y0, y1 = sorted((top_left[1], bottom_right[1]))
+    height, width = image.shape[:2]
+    x0 = max(0, min(width - 1, x0))
+    x1 = max(0, min(width - 1, x1))
+    y0 = max(0, min(height - 1, y0))
+    y1 = max(0, min(height - 1, y1))
+    t = max(1, int(thickness))
+    outline_color = np.asarray(color, dtype=np.uint8)
+
+    image[y0 : min(height, y0 + t), x0 : x1 + 1] = outline_color
+    image[max(0, y1 - t + 1) : y1 + 1, x0 : x1 + 1] = outline_color
+    image[y0 : y1 + 1, x0 : min(width, x0 + t)] = outline_color
+    image[y0 : y1 + 1, max(0, x1 - t + 1) : x1 + 1] = outline_color
+
+
+def _draw_workspace_segment(
+    image: np.ndarray,
+    from_xy: tuple[float, float],
+    to_xy: tuple[float, float],
+    color: tuple[int, int, int],
+    radius: int,
+    config: MapConfig,
+) -> None:
+    start_px = _workspace_to_pixel(
+        from_xy,
+        config=config,
+        image_size=image.shape[:2],
+    )
+    end_px = _workspace_to_pixel(
+        to_xy,
+        config=config,
+        image_size=image.shape[:2],
+    )
+    dx = end_px[0] - start_px[0]
+    dy = end_px[1] - start_px[1]
+    num_steps = max(1, int(max(abs(dx), abs(dy))))
+    for step_index in range(num_steps + 1):
+        alpha = step_index / num_steps
+        point_px = (
+            int(round(start_px[0] * (1.0 - alpha) + end_px[0] * alpha)),
+            int(round(start_px[1] * (1.0 - alpha) + end_px[1] * alpha)),
+        )
+        _draw_disk(image, point_px, radius, color)
+
+
 def make_lerobot_base_image(
     config: MapConfig,
     image_size: int = DEFAULT_VIDEO_IMAGE_SIZE,
@@ -2572,6 +3124,33 @@ def make_lerobot_base_image(
             config=config,
         )
     return base_image
+
+
+def make_lerobot_episode_base_image(
+    base_image: np.ndarray,
+    config: MapConfig,
+    target_goal_name: str | None = None,
+    goal_xy: tuple[float, float] | None = None,
+) -> np.ndarray:
+    del config, target_goal_name, goal_xy
+    return base_image.copy()
+
+
+def draw_lerobot_trail_segment(
+    image: np.ndarray,
+    config: MapConfig,
+    from_xy: tuple[float, float],
+    to_xy: tuple[float, float],
+) -> None:
+    trail_radius = max(1, int(min(image.shape[:2]) * 0.01))
+    _draw_workspace_segment(
+        image,
+        from_xy=from_xy,
+        to_xy=to_xy,
+        color=TRAJECTORY_TRAIL_COLOR,
+        radius=trail_radius,
+        config=config,
+    )
 
 
 def render_lerobot_frame(
@@ -2859,18 +3438,43 @@ def process_demonstration_dataset(
 ) -> ProcessedDemonstrationDataset:
     if len(raw_dataset) == 0:
         raise ValueError("raw_dataset is empty.")
-    if t_fixed <= 0:
-        raise ValueError("t_fixed must be positive.")
 
+    map_config = build_default_map_config() if config is None else config
+    raw_paths = [
+        _as_path_array(episode.path_xy).astype(np.float32, copy=False)
+        for episode in raw_dataset.episodes
+    ]
+    compressed_index_paths = [
+        compress_dense_path_to_collision_free_indices(
+            episode.path_xy,
+            config=map_config,
+            resolution=DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+        )
+        for episode in raw_dataset.episodes
+    ]
+    compressed_lengths = np.asarray(
+        [len(index_path) for index_path in compressed_index_paths],
+        dtype=np.int64,
+    )
+    print(
+        "[info] collision-free compression stats: "
+        f"min={int(compressed_lengths.min())}, "
+        f"avg={float(compressed_lengths.mean()):.2f}, "
+        f"max={int(compressed_lengths.max())}"
+    )
+    resolved_t_fixed = resolve_resampled_horizon(
+        compressed_index_paths=compressed_index_paths,
+        requested_t_fixed=int(t_fixed),
+    )
     num_episodes = len(raw_dataset.episodes)
-    observations = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
-    actions = np.zeros((num_episodes, t_fixed, 2), dtype=np.float32)
+    observations = np.zeros((num_episodes, resolved_t_fixed, 2), dtype=np.float32)
+    actions = np.zeros((num_episodes, resolved_t_fixed, 2), dtype=np.float32)
     path_signatures: np.ndarray | None = None
     task_ids = np.zeros(num_episodes, dtype=np.int64)
     task_code_bits = np.zeros((num_episodes, 2), dtype=np.int64)
     goal_onehot = np.zeros((num_episodes, len(TASK_ID_VALUES)), dtype=np.float32)
     phase_labels = (
-        np.zeros((num_episodes, t_fixed), dtype=np.int64)
+        np.zeros((num_episodes, resolved_t_fixed), dtype=np.int64)
         if include_phase_labels
         else None
     )
@@ -2882,7 +3486,6 @@ def process_demonstration_dataset(
     raw_path_distances = np.zeros(num_episodes, dtype=np.float32)
     success = np.zeros(num_episodes, dtype=bool)
 
-    map_config = build_default_map_config() if config is None else config
     raw_task_ids = np.asarray(
         [episode.task_id for episode in raw_dataset.episodes],
         dtype=np.int64,
@@ -2909,10 +3512,33 @@ def process_demonstration_dataset(
             for task_id in TASK_ID_VALUES
         )
     )
+    progress_interval = max(1, min(25, num_episodes))
 
     for episode_index, source_index in enumerate(episode_order.tolist()):
         episode = raw_dataset.episodes[source_index]
-        resampled_path = resample_path_fixed_length(episode.path_xy, t_fixed=t_fixed)
+        resampled_path = expand_collision_free_polyline_fixed_length(
+            raw_paths[source_index],
+            compressed_indices=compressed_index_paths[source_index],
+            t_fixed=resolved_t_fixed,
+            config=map_config,
+            resolution=DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+        )
+        invalid_segment_count, first_invalid_segment_index = (
+            count_invalid_resampled_segments(
+                resampled_path,
+                config=map_config,
+                resolution=DEFAULT_RESAMPLED_SEGMENT_CHECK_RESOLUTION,
+            )
+        )
+        if invalid_segment_count > 0:
+            raise ValueError(
+                "Resampled path contains invalid straight-line segments. "
+                f"episode_id={episode.episode_id}, task_id={episode.task_id}, "
+                f"t_fixed={resolved_t_fixed}, invalid_segments={invalid_segment_count}, "
+                f"first_invalid_segment={first_invalid_segment_index}. "
+                "This should not happen after collision-free compression and "
+                "uniform dense segment resampling."
+            )
         observations[episode_index] = resampled_path
         actions[episode_index] = build_actions_from_states(
             resampled_path,
@@ -2931,10 +3557,19 @@ def process_demonstration_dataset(
             )
             if path_signatures is None:
                 path_signatures = np.zeros(
-                    (num_episodes, t_fixed, int(signature_sequence.shape[1])),
+                    (num_episodes, resolved_t_fixed, int(signature_sequence.shape[1])),
                     dtype=np.float32,
                 )
             path_signatures[episode_index] = signature_sequence
+        if (
+            episode_index == 0
+            or episode_index + 1 == num_episodes
+            or (episode_index + 1) % progress_interval == 0
+        ):
+            print(
+                "[info] processed demonstrations: "
+                f"{episode_index + 1}/{num_episodes}"
+            )
         task_ids[episode_index] = episode.task_id
         task_code_bits[episode_index] = build_task_code_bits(episode.task_id)
         goal_onehot[episode_index] = build_goal_onehot(episode.task_id)
@@ -2971,7 +3606,7 @@ def process_demonstration_dataset(
         raw_path_distances=raw_path_distances,
         success=success,
         seed=raw_dataset.seed,
-        t_fixed=t_fixed,
+        t_fixed=resolved_t_fixed,
         action_padding_mode=last_action_mode,
         path_signature_key=None if path_signatures is None else str(path_signature_key),
         path_signature_window_size=(
@@ -3173,6 +3808,7 @@ def generate_lerobot_v30_dataset(
         observations = processed_dataset.observations[source_idx]
         actions = processed_dataset.actions[source_idx]
         goal_xy = processed_dataset.goal_xy[source_idx]
+        target_goal_name = str(processed_dataset.target_goal_names[source_idx])
         task_id = int(processed_dataset.task_ids[source_idx])
         task_text = TASK_DESCRIPTION_BY_ID[task_id]
         episode_length = int(observations.shape[0])
@@ -3192,6 +3828,12 @@ def generate_lerobot_v30_dataset(
         ffmpeg_proc = start_ffmpeg_raw_writer(video_file, image_size, image_size, fps)
         if ffmpeg_proc.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for raw video writing.")
+        episode_base_image = make_lerobot_episode_base_image(
+            base_image,
+            config=map_config,
+            target_goal_name=target_goal_name,
+            goal_xy=(float(goal_xy[0]), float(goal_xy[1])),
+        )
 
         episode_records: dict[str, list[Any]] = {
             "timestamp": [],
@@ -3243,7 +3885,7 @@ def generate_lerobot_v30_dataset(
                     )
 
             frame = render_lerobot_frame(
-                base_image,
+                episode_base_image,
                 config=map_config,
                 robot_xy=(float(state_xy[0]), float(state_xy[1])),
             )

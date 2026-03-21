@@ -17,6 +17,7 @@ try:
         TASK_ID_TO_GOAL_NAME,
         build_task_spec,
         build_default_map_config,
+        get_branch_detection_event,
         get_phase_name,
         get_task_start_region,
         get_task_waypoint_centers,
@@ -32,6 +33,7 @@ except ImportError:
         TASK_ID_TO_GOAL_NAME,
         build_task_spec,
         build_default_map_config,
+        get_branch_detection_event,
         get_phase_name,
         get_task_start_region,
         get_task_waypoint_centers,
@@ -41,19 +43,19 @@ except ImportError:
     )
 
 
-DEFAULT_SOLVE_TIME = 1.0
+DEFAULT_SOLVE_TIME = 10.0
 DEFAULT_GOAL_NAME = "G00"
 DEFAULT_STEP_SIZE = 2.5
 DEFAULT_CONNECT_TOLERANCE = 1.0
 DEFAULT_COLLISION_CHECK_RESOLUTION = 0.5
+DEFAULT_RAW_PATH_VALIDATION_RESOLUTION = 0.1
+DEFAULT_RAW_PATH_OUTPUT_RESOLUTION = 0.1
 DEFAULT_GOAL_SAMPLE_PROBABILITY = 0.15
 DEFAULT_MAX_ITERATIONS = 20000
-DEFAULT_RETRIES_PER_DEMO = 5
+DEFAULT_RETRIES_PER_DEMO = 10
 DEFAULT_LOW_SUCCESS_WARNING_THRESHOLD = 0.8
 DEFAULT_DATASET_VIS_SAMPLES = 12
-DEFAULT_DATASET_OUTPUT = (
-    "/home/jeong/zeno/corl/main/scripts/braidedhub_fourstart_implicit_cue_rrtconnect_demos.npz"
-)
+DEFAULT_DATASET_OUTPUT = "/home/jeong/zeno/corl/main/scripts/braidedhub_fourstart_implicit_cue_rrtconnect_demos.npz"
 TASK_COLOR_BY_ID = {
     0: "#1b9e77",
     1: "#66a61e",
@@ -115,13 +117,7 @@ def _distance(point_a: tuple[float, float], point_b: tuple[float, float]) -> flo
 
 def _mix_seed(state: int, value: int) -> int:
     return (
-        state
-        ^ (
-            value
-            + 0x9E3779B9
-            + ((state << 6) & 0xFFFFFFFF)
-            + (state >> 2)
-        )
+        state ^ (value + 0x9E3779B9 + ((state << 6) & 0xFFFFFFFF) + (state >> 2))
     ) & 0xFFFFFFFF
 
 
@@ -329,6 +325,33 @@ def _densify_path(
     return dense_path
 
 
+def _validate_collision_free_path(
+    path_xy: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    config: MapConfig,
+    resolution: float = DEFAULT_RAW_PATH_VALIDATION_RESOLUTION,
+) -> tuple[bool, str | None]:
+    if resolution <= 0.0:
+        raise ValueError("resolution must be positive.")
+    if len(path_xy) <= 1:
+        return True, None
+
+    for segment_index, (start_point, end_point) in enumerate(
+        zip(path_xy[:-1], path_xy[1:], strict=False)
+    ):
+        if _is_segment_valid(
+            start_point,
+            end_point,
+            config=config,
+            resolution=resolution,
+        ):
+            continue
+        return (
+            False,
+            f"segment {segment_index} failed collision validation at resolution={resolution:.3f}",
+        )
+    return True, None
+
+
 def _get_goal_center_for_task(
     task_id: int,
     config: MapConfig,
@@ -351,8 +374,8 @@ def _validate_task_conditioned_path(
     """Check that a demonstration path follows the branch choices encoded by task_id.
 
     Validation rule:
-    - The path must enter the task-matching branch at H1 and H2.
-    - The path must not enter the opposite branch at either decision stage.
+    - The path must enter the task-matching narrowed detection window at H1 and H2.
+    - The path must not enter the opposite detection window at either stage.
     """
 
     task_spec = build_task_spec(task_id)
@@ -362,15 +385,22 @@ def _validate_task_conditioned_path(
     saw_expected_branch2 = False
 
     for point in path_xy:
-        phase_name = get_phase_name(float(point[0]), float(point[1]), config=config)
-        if phase_name in BRANCH1_PHASES:
+        detection_event = get_branch_detection_event(
+            float(point[0]),
+            float(point[1]),
+            config=config,
+        )
+        if detection_event is None:
+            continue
+        stage_name, phase_name = detection_event
+        if stage_name == "H1":
             if phase_name != expected_branch1:
                 return (
                     False,
                     f"H1 branch mismatch: expected {expected_branch1}, observed {phase_name}",
                 )
             saw_expected_branch1 = True
-        if phase_name in BRANCH2_PHASES:
+        if stage_name == "H2":
             if phase_name != expected_branch2:
                 return (
                     False,
@@ -432,11 +462,16 @@ def plan_path_rrtconnect(
     ):
         straight_path = [start_xy, goal_xy]
         if interpolate_solution:
-            return _densify_path(
+            straight_path = _densify_path(
                 straight_path,
-                resolution=DEFAULT_COLLISION_CHECK_RESOLUTION,
+                resolution=DEFAULT_RAW_PATH_OUTPUT_RESOLUTION,
             )
-        return straight_path
+        path_ok, _ = _validate_collision_free_path(
+            straight_path,
+            config=resolved_config,
+            resolution=DEFAULT_RAW_PATH_VALIDATION_RESOLUTION,
+        )
+        return straight_path if path_ok else None
 
     seed = (
         _derive_seed(
@@ -509,11 +544,16 @@ def plan_path_rrtconnect(
                     rng=rng,
                 )
                 if interpolate_solution:
-                    return _densify_path(
+                    path = _densify_path(
                         path,
-                        resolution=DEFAULT_COLLISION_CHECK_RESOLUTION,
+                        resolution=DEFAULT_RAW_PATH_OUTPUT_RESOLUTION,
                     )
-                return path
+                path_ok, _ = _validate_collision_free_path(
+                    path,
+                    config=resolved_config,
+                    resolution=DEFAULT_RAW_PATH_VALIDATION_RESOLUTION,
+                )
+                return path if path_ok else None
 
         tree_start, tree_goal = tree_goal, tree_start
         trees_swapped = not trees_swapped
@@ -701,56 +741,82 @@ def generate_demonstrations(
         for sample_index in range(num_per_task):
             success_path: list[tuple[float, float]] | None = None
             start_xy: tuple[float, float] | None = None
-
-            for retry_index in range(max_retries_per_demo):
-                attempt_counts_by_task[task_id] += 1
-                start_xy = env.reset(task_id=task_id)
-                if env.start_region_name != task_spec.start_region_name:
-                    raise RuntimeError(
-                        "Environment reset returned a start region that does not match the task. "
-                        f"task_id={task_id}, expected={task_spec.start_region_name}, "
-                        f"got={env.start_region_name}"
-                    )
-                route_waypoints = _build_task_route_waypoints(
-                    task_id=task_id,
-                    start_xy=start_xy,
-                    goal_xy=goal_xy,
-                    config=resolved_config,
-                )
-                planning_seed = _derive_seed(seed, task_id, sample_index, retry_index)
-                success_path = plan_path_rrtconnect_via_waypoints(
-                    waypoints_xy=route_waypoints,
-                    solve_time=solve_time,
-                    config=resolved_config,
-                    rng_seed=planning_seed,
-                )
-                if success_path is not None:
-                    path_ok, reject_reason = _validate_task_conditioned_path(
+            retry_round = 0
+            while success_path is None:
+                retry_round += 1
+                for retry_index in range(max_retries_per_demo):
+                    attempt_counts_by_task[task_id] += 1
+                    start_xy = env.reset(task_id=task_id)
+                    if env.start_region_name != task_spec.start_region_name:
+                        raise RuntimeError(
+                            "Environment reset returned a start region that does not match the task. "
+                            f"task_id={task_id}, expected={task_spec.start_region_name}, "
+                            f"got={env.start_region_name}"
+                        )
+                    route_waypoints = _build_task_route_waypoints(
                         task_id=task_id,
-                        path_xy=success_path,
+                        start_xy=start_xy,
+                        goal_xy=goal_xy,
                         config=resolved_config,
                     )
-                    if not path_ok:
-                        success_path = None
-                        print(
-                            f"  retry {retry_index + 1}/{max_retries_per_demo} rejected "
-                            f"for sample {sample_index + 1}/{num_per_task}: {reject_reason}"
+                    planning_seed = _derive_seed(
+                        seed,
+                        task_id,
+                        sample_index,
+                        retry_round,
+                        retry_index,
+                    )
+                    success_path = plan_path_rrtconnect_via_waypoints(
+                        waypoints_xy=route_waypoints,
+                        solve_time=solve_time,
+                        config=resolved_config,
+                        rng_seed=planning_seed,
+                    )
+                    if success_path is not None:
+                        path_ok, reject_reason = _validate_task_conditioned_path(
+                            task_id=task_id,
+                            path_xy=success_path,
+                            config=resolved_config,
                         )
-                        continue
-                    break
+                        if not path_ok:
+                            success_path = None
+                            print(
+                                f"  retry {retry_index + 1}/{max_retries_per_demo} "
+                                f"(round {retry_round}) rejected for sample "
+                                f"{sample_index + 1}/{num_per_task}: {reject_reason}"
+                            )
+                            continue
+                        path_ok, reject_reason = _validate_collision_free_path(
+                            success_path,
+                            config=resolved_config,
+                            resolution=DEFAULT_RAW_PATH_VALIDATION_RESOLUTION,
+                        )
+                        if not path_ok:
+                            success_path = None
+                            print(
+                                f"  retry {retry_index + 1}/{max_retries_per_demo} "
+                                f"(round {retry_round}) rejected for sample "
+                                f"{sample_index + 1}/{num_per_task}: {reject_reason}"
+                            )
+                            continue
+                        break
 
-                print(
-                    f"  retry {retry_index + 1}/{max_retries_per_demo} failed "
-                    f"for sample {sample_index + 1}/{num_per_task}"
-                )
+                    print(
+                        f"  retry {retry_index + 1}/{max_retries_per_demo} "
+                        f"(round {retry_round}) failed "
+                        f"for sample {sample_index + 1}/{num_per_task}"
+                    )
 
-            if success_path is None or start_xy is None:
-                skipped_counts_by_task[task_id] += 1
-                print(
-                    f"  skipped sample {sample_index + 1}/{num_per_task} "
-                    f"after {max_retries_per_demo} failed attempts"
+                if success_path is None:
+                    print(
+                        f"  sample {sample_index + 1}/{num_per_task} did not succeed "
+                        f"in retry round {retry_round}; reseeding and continuing"
+                    )
+
+            if start_xy is None:
+                raise RuntimeError(
+                    "A successful path was found but the corresponding start state is missing."
                 )
-                continue
 
             episodes.append(
                 _make_episode(
@@ -836,7 +902,9 @@ def save_demonstrations(
         output_path,
         format_version=np.asarray("braidedhub_rrtconnect_fourstart_implicitcue_v3"),
         seed=np.asarray(dataset.seed, dtype=np.int64),
-        num_per_task_requested=np.asarray(dataset.num_per_task_requested, dtype=np.int64),
+        num_per_task_requested=np.asarray(
+            dataset.num_per_task_requested, dtype=np.int64
+        ),
         solve_time=np.asarray(dataset.solve_time, dtype=np.float64),
         retries_per_demo=np.asarray(dataset.retries_per_demo, dtype=np.int64),
         episode_id=episode_ids,
@@ -848,15 +916,24 @@ def save_demonstrations(
         path_length=path_length,
         success=success,
         success_counts_by_task=np.asarray(
-            [dataset.success_counts_by_task[task_id] for task_id in sorted(TASK_ID_TO_GOAL_NAME)],
+            [
+                dataset.success_counts_by_task[task_id]
+                for task_id in sorted(TASK_ID_TO_GOAL_NAME)
+            ],
             dtype=np.int64,
         ),
         attempt_counts_by_task=np.asarray(
-            [dataset.attempt_counts_by_task[task_id] for task_id in sorted(TASK_ID_TO_GOAL_NAME)],
+            [
+                dataset.attempt_counts_by_task[task_id]
+                for task_id in sorted(TASK_ID_TO_GOAL_NAME)
+            ],
             dtype=np.int64,
         ),
         skipped_counts_by_task=np.asarray(
-            [dataset.skipped_counts_by_task[task_id] for task_id in sorted(TASK_ID_TO_GOAL_NAME)],
+            [
+                dataset.skipped_counts_by_task[task_id]
+                for task_id in sorted(TASK_ID_TO_GOAL_NAME)
+            ],
             dtype=np.int64,
         ),
     )
@@ -940,7 +1017,8 @@ def run_single_rrtconnect_demo(
 
     resolved_config = build_default_map_config()
     goal_to_task_id = {
-        mapped_goal_name: task_id for task_id, mapped_goal_name in TASK_ID_TO_GOAL_NAME.items()
+        mapped_goal_name: task_id
+        for task_id, mapped_goal_name in TASK_ID_TO_GOAL_NAME.items()
     }
     goal_region = next(
         (goal for goal in resolved_config.goal_regions if goal.name == goal_name),

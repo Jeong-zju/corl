@@ -88,6 +88,16 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default=defaults["max_action_step"],
         help="Clamp action magnitude to avoid implausibly large jumps.",
     )
+    parser.add_argument(
+        "--collision-mode",
+        type=str,
+        default="reject",
+        choices=["reject", "detect"],
+        help=(
+            "Only used by braidedhub evaluation. "
+            "`reject` blocks invalid moves; `detect` records them but allows penetration."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda", help="cuda/cpu/mps")
     parser.add_argument(
         "--signature-backend",

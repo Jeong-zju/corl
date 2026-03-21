@@ -10,7 +10,7 @@ DATASET_ROOT="${DATASET_ROOT:-data/zeno-ai/braidedhub_fourstart_implicit_cue_v30
 DATASET_REPO_ID="${DATASET_REPO_ID:-zeno-ai/braidedhub_fourstart_implicit_cue_v30}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/train/braidedhub_fourstart_streaming_act}"
 JOB_NAME="${JOB_NAME:-streaming_act_braidedhub_fourstart}"
-WANDB_PROJECT="${WANDB_PROJECT:-lerobot-braidedhub-streaming-act}"
+WANDB_PROJECT="${WANDB_PROJECT:-lerobot-braidedhub}"
 WANDB_MODE="${WANDB_MODE:-online}"
 DEVICE="${DEVICE:-cuda}"
 STEPS="${STEPS:-50000}"
@@ -21,9 +21,10 @@ LOG_FREQ="${LOG_FREQ:-50}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 EVAL_FREQ="${EVAL_FREQ:--1}"
 CHUNK_SIZE="${CHUNK_SIZE:-5}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-0}"
 SIGNATURE_DIM="${SIGNATURE_DIM:-0}"
-SIGNATURE_DEPTH="${SIGNATURE_DEPTH:-6}"
+SIGNATURE_DEPTH="${SIGNATURE_DEPTH:-3}"
 SIGNATURE_HIDDEN_DIM="${SIGNATURE_HIDDEN_DIM:-512}"
 SIGNATURE_DROPOUT="${SIGNATURE_DROPOUT:-0.1}"
 WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
@@ -48,6 +49,7 @@ export WANDB__SERVICE_WAIT
   --eval-freq "${EVAL_FREQ}" \
   --device "${DEVICE}" \
   --chunk-size "${CHUNK_SIZE}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
   --history-length "${HISTORY_LENGTH}" \
   --signature-dim "${SIGNATURE_DIM}" \
   --signature-depth "${SIGNATURE_DEPTH}" \

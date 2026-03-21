@@ -10,7 +10,7 @@ DATASET_ROOT="${DATASET_ROOT:-data/zeno-ai/braidedhub_fourstart_implicit_cue_v30
 DATASET_REPO_ID="${DATASET_REPO_ID:-zeno-ai/braidedhub_fourstart_implicit_cue_v30}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/train/braidedhub_fourstart_act}"
 JOB_NAME="${JOB_NAME:-act_braidedhub_fourstart}"
-WANDB_PROJECT="${WANDB_PROJECT:-lerobot-braidedhub-act}"
+WANDB_PROJECT="${WANDB_PROJECT:-lerobot-braidedhub}"
 WANDB_MODE="${WANDB_MODE:-online}"
 DEVICE="${DEVICE:-cuda}"
 STEPS="${STEPS:-50000}"
@@ -21,6 +21,7 @@ LOG_FREQ="${LOG_FREQ:-50}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 EVAL_FREQ="${EVAL_FREQ:--1}"
 CHUNK_SIZE="${CHUNK_SIZE:-5}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
 WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
 WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-10}"
 
@@ -43,6 +44,7 @@ export WANDB__SERVICE_WAIT
   --eval-freq "${EVAL_FREQ}" \
   --device "${DEVICE}" \
   --chunk-size "${CHUNK_SIZE}" \
+  --n-action-steps "${N_ACTION_STEPS}" \
   --disable-imagenet-stats \
   --wandb-project "${WANDB_PROJECT}" \
   --wandb-mode "${WANDB_MODE}" \

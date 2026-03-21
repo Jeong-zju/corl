@@ -3151,7 +3151,8 @@ def dataset_summary(dataset: ProcessedDemonstrationDataset) -> dict[str, Any]:
         print(
             "  path_signature="
             f"{dataset.path_signature_key}, window={window_label}, "
-            f"depth={dataset.path_signature_depth}, backend={dataset.path_signature_backend}"
+            f"depth={dataset.path_signature_depth}, "
+            f"backend={dataset.path_signature_backend}"
         )
     print(f"  avg_raw_path_steps={avg_raw_steps:.2f}")
     print(f"  avg_raw_path_distance={avg_raw_distance:.4f}")

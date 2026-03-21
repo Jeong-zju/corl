@@ -818,7 +818,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "--t-fixed",
             type=int,
             default=defaults["t_fixed"],
-            help="Fixed resampled horizon used before LeRobot export.",
+            help=(
+                "Fixed resampled horizon used before LeRobot export. "
+                "Use 0 to auto-resolve the smallest common collision-free horizon."
+            ),
         )
         parser.add_argument(
             "--episodes-per-chunk",
