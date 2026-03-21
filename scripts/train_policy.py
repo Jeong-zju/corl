@@ -11,6 +11,7 @@ import numpy as np
 import warnings
 
 from env import get_env_choices, get_env_module
+from policy_defaults import load_policy_mode_defaults
 
 warnings.filterwarnings(
     "ignore",
@@ -73,9 +74,9 @@ def validate_dataset_root(dataset_root: Path) -> None:
 
 def resolve_use_imagenet_stats(
     dataset_root: Path,
-    disable_imagenet_stats: bool,
+    use_imagenet_stats: bool,
 ) -> bool:
-    if disable_imagenet_stats:
+    if not use_imagenet_stats:
         return False
 
     info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
@@ -176,8 +177,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
-    env_module = get_env_module(known_args.env)
-    defaults = env_module.get_train_defaults(known_args.policy)
+    defaults = load_policy_mode_defaults("train", known_args.env, known_args.policy)
 
     parser = argparse.ArgumentParser(
         description="Train LeRobot ACT or Streaming ACT on a selected environment dataset."
@@ -191,103 +191,199 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=defaults["dataset_root"],
+        default=defaults.get("dataset_root"),
         help="Path to local LeRobotDataset v3.0 directory.",
     )
     parser.add_argument(
         "--dataset-repo-id",
         type=str,
-        default=defaults["dataset_repo_id"],
+        default=defaults.get("dataset_repo_id"),
         help="Logical dataset repo_id used by LeRobot metadata APIs.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=defaults["output_root"],
+        default=defaults.get("output_root"),
         help="Root folder for training outputs.",
     )
-    parser.add_argument("--job-name", type=str, default=defaults["job_name"])
+    parser.add_argument("--job-name", type=str, default=defaults.get("job_name"))
     parser.add_argument(
         "--wandb-run-name",
         type=str,
-        default=None,
+        default=defaults.get("wandb_run_name"),
         help=(
             "Optional explicit Weights & Biases run name. "
             "Defaults to '<job-name>_s<seed>_<timestamp>'."
         ),
     )
-    parser.add_argument("--steps", type=int, default=10000)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log-freq", type=int, default=50)
-    parser.add_argument("--save-freq", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=defaults.get("steps", 10000))
     parser.add_argument(
-        "--eval-freq", type=int, default=-1, help="Set -1 to disable eval."
+        "--batch-size", type=int, default=defaults.get("batch_size", 32)
     )
-    parser.add_argument("--device", type=str, default="cuda", help="cuda / cpu / mps")
     parser.add_argument(
-        "--chunk-size", type=int, default=5, help="ACT action chunk size."
+        "--num-workers", type=int, default=defaults.get("num_workers", 4)
+    )
+    parser.add_argument("--seed", type=int, default=defaults.get("seed", 42))
+    parser.add_argument("--log-freq", type=int, default=defaults.get("log_freq", 50))
+    parser.add_argument(
+        "--save-freq", type=int, default=defaults.get("save_freq", 1000)
+    )
+    parser.add_argument(
+        "--eval-freq",
+        type=int,
+        default=defaults.get("eval_freq", -1),
+        help="Set -1 to disable eval.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=defaults.get("device", "cuda"),
+        help="cuda / cpu / mps",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=defaults.get("chunk_size", 5),
+        help="ACT action chunk size.",
     )
     parser.add_argument(
         "--n-action-steps",
         type=int,
-        default=1,
+        default=defaults.get("n_action_steps", 1),
         help=(
             "Number of predicted actions executed before querying the policy again. "
             "Set to 1 for per-step replanning."
         ),
     )
-    parser.add_argument(
-        "--disable-imagenet-stats",
+
+    imagenet_group = parser.add_mutually_exclusive_group()
+    imagenet_group.add_argument(
+        "--enable-imagenet-stats",
+        dest="use_imagenet_stats",
         action="store_true",
-        help="Disable replacing visual stats with ImageNet stats.",
+        help="Replace visual dataset stats with ImageNet stats when available.",
     )
-    parser.add_argument("--wandb-project", type=str, default=defaults["wandb_project"])
-    parser.add_argument("--wandb-entity", type=str, default=None)
+    imagenet_group.add_argument(
+        "--disable-imagenet-stats",
+        dest="use_imagenet_stats",
+        action="store_false",
+        help="Use dataset-provided visual stats instead of ImageNet stats.",
+    )
+    parser.set_defaults(
+        use_imagenet_stats=defaults.get("use_imagenet_stats", True),
+    )
+
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=defaults.get("wandb_project"),
+    )
+    parser.add_argument("--wandb-entity", type=str, default=defaults.get("wandb_entity"))
     parser.add_argument(
         "--wandb-mode",
         type=str,
-        default="online",
+        default=defaults.get("wandb_mode", "online"),
         choices=["online", "offline", "disabled"],
     )
-    parser.add_argument("--disable-wandb", action="store_true")
+
+    wandb_group = parser.add_mutually_exclusive_group()
+    wandb_group.add_argument(
+        "--enable-wandb",
+        dest="enable_wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging.",
+    )
+    wandb_group.add_argument(
+        "--disable-wandb",
+        dest="enable_wandb",
+        action="store_false",
+        help="Disable Weights & Biases logging.",
+    )
+    parser.set_defaults(enable_wandb=defaults.get("enable_wandb", True))
 
     parser.add_argument(
-        "--disable-path-signature",
-        action="store_true",
-        help="Disable path-signature token injection in StreamingACT.",
+        "--wandb-console",
+        type=str,
+        default=defaults.get("wandb_console", "off"),
+        help="Value exported to WANDB_CONSOLE before training starts.",
     )
     parser.add_argument(
-        "--history-length",
+        "--wandb-service-wait",
         type=int,
-        default=0,
-        help=(
-            "History window size used by path-signature settings in config. "
-            "Set 0 to auto-read the maximum episode length from the dataset."
-        ),
+        default=defaults.get("wandb_service_wait", 10),
+        help="Value exported to WANDB__SERVICE_WAIT before training starts.",
     )
-    parser.add_argument(
-        "--signature-dim",
-        type=int,
-        default=0,
-        help=("Path-signature feature dim. " "Set 0 to auto-read from meta/info.json."),
-    )
-    parser.add_argument("--signature-depth", type=int, default=3)
-    parser.add_argument("--signature-hidden-dim", type=int, default=512)
-    parser.add_argument("--signature-dropout", type=float, default=0.1)
+
+    if known_args.policy == "streaming_act":
+        path_signature_group = parser.add_mutually_exclusive_group()
+        path_signature_group.add_argument(
+            "--enable-path-signature",
+            dest="use_path_signature",
+            action="store_true",
+            help="Enable path-signature token injection in StreamingACT.",
+        )
+        path_signature_group.add_argument(
+            "--disable-path-signature",
+            dest="use_path_signature",
+            action="store_false",
+            help="Disable path-signature token injection in StreamingACT.",
+        )
+        parser.set_defaults(
+            use_path_signature=defaults.get("use_path_signature", True),
+        )
+        parser.add_argument(
+            "--history-length",
+            type=int,
+            default=defaults.get("history_length", 0),
+            help=(
+                "History window size used by path-signature settings in config. "
+                "Set 0 to auto-read the maximum episode length from the dataset."
+            ),
+        )
+        parser.add_argument(
+            "--signature-dim",
+            type=int,
+            default=defaults.get("signature_dim", 0),
+            help=(
+                "Path-signature feature dim. "
+                "Set 0 to auto-read from meta/info.json."
+            ),
+        )
+        parser.add_argument(
+            "--signature-depth",
+            type=int,
+            default=defaults.get("signature_depth", 3),
+        )
+        parser.add_argument(
+            "--signature-hidden-dim",
+            type=int,
+            default=defaults.get("signature_hidden_dim", 512),
+        )
+        parser.add_argument(
+            "--signature-dropout",
+            type=float,
+            default=defaults.get("signature_dropout", 0.1),
+        )
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser(argv)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not isinstance(args.dataset_root, Path):
+        args.dataset_root = Path(args.dataset_root)
+    if not isinstance(args.output_root, Path):
+        args.output_root = Path(args.output_root)
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
+
+    os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
+    os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
 
     try:
         from lerobot.configs.default import DatasetConfig, WandBConfig
@@ -307,7 +403,7 @@ def main(argv: list[str] | None = None) -> None:
         env_module.validate_training_dataset_root(dataset_root)
     use_imagenet_stats = resolve_use_imagenet_stats(
         dataset_root=dataset_root,
-        disable_imagenet_stats=args.disable_imagenet_stats,
+        use_imagenet_stats=args.use_imagenet_stats,
     )
 
     if args.policy == "streaming_act":
@@ -320,7 +416,7 @@ def main(argv: list[str] | None = None) -> None:
             streaming_config_cls=StreamingACTConfig,
         )
 
-        use_path_signature = not args.disable_path_signature
+        use_path_signature = args.use_path_signature
         resolved_history_length = resolve_history_length(
             dataset_root=dataset_root,
             history_length=args.history_length,
@@ -340,7 +436,7 @@ def main(argv: list[str] | None = None) -> None:
     run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (args.output_root / run_stamp).resolve()
 
-    wandb_enable = (not args.disable_wandb) and (args.wandb_mode != "disabled")
+    wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
     resolved_job_name = args.job_name
     if wandb_enable:
         resolved_job_name = (

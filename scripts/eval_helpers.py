@@ -9,10 +9,8 @@ from pathlib import Path
 import numpy as np
 
 
-def resolve_policy_dir(policy_path: Path) -> Path:
-    raw = policy_path.expanduser()
+def _resolve_path_candidates(raw: Path) -> list[Path]:
     repo_root = Path(__file__).resolve().parents[2]
-
     candidates = []
     if raw.is_absolute():
         candidates.append(raw)
@@ -36,6 +34,12 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         if resolved not in seen:
             seen.add(resolved)
             ordered.append(resolved)
+    return ordered
+
+
+def resolve_policy_dir(policy_path: Path) -> Path:
+    raw = policy_path.expanduser()
+    ordered = _resolve_path_candidates(raw)
 
     for base in ordered:
         if (base / "model.safetensors").exists():
@@ -56,6 +60,44 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         "- <base>/pretrained_model/model.safetensors\n"
         "- <base>/checkpoints/last/pretrained_model/model.safetensors"
     )
+
+
+def find_latest_run_dir(train_root: Path) -> Path | None:
+    for resolved_root in _resolve_path_candidates(train_root.expanduser()):
+        if not resolved_root.is_dir():
+            continue
+        candidates = [path for path in resolved_root.iterdir() if path.is_dir()]
+        if not candidates:
+            continue
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    return None
+
+
+def resolve_eval_policy_path(
+    policy_path: Path | None,
+    latest_run_dir: Path | None,
+    train_output_root: Path | None,
+) -> Path:
+    if policy_path is None and latest_run_dir is None:
+        if train_output_root is None:
+            raise ValueError(
+                "Either --policy-path, --latest-run-dir, or --train-output-root "
+                "must be provided."
+            )
+        latest_run_dir = find_latest_run_dir(train_output_root)
+        if latest_run_dir is None:
+            raise FileNotFoundError(
+                "Could not infer latest run from train_output_root="
+                f"{train_output_root}"
+            )
+
+    if policy_path is None and latest_run_dir is not None:
+        return resolve_policy_dir(latest_run_dir)
+
+    if policy_path is None:
+        raise FileNotFoundError("Policy path could not be resolved.")
+
+    return resolve_policy_dir(policy_path)
 
 
 def build_eval_observation(

@@ -34,6 +34,7 @@ from eval_helpers import (
     resolve_signature_backend,
     write_summary,
 )
+from policy_defaults import load_policy_mode_defaults
 
 
 DEFAULT_RANDOM_SEED = 7
@@ -2018,25 +2019,11 @@ def get_dataset_defaults() -> dict[str, Any]:
 
 
 def get_train_defaults(policy_type: str) -> dict[str, Any]:
-    defaults = dict(_TRAIN_DEFAULTS[policy_type])
-    defaults.update(
-        {
-            "dataset_root": DEFAULT_DATASET_ROOT,
-            "dataset_repo_id": DEFAULT_DATASET_REPO_ID,
-        }
-    )
-    return defaults
+    return load_policy_mode_defaults("train", ENV_NAME, policy_type)
 
 
 def get_eval_defaults(policy_type: str) -> dict[str, Any]:
-    return {
-        "output_dir": _TRAIN_DEFAULTS[policy_type]["eval_output_dir"],
-        "num_rollouts": DEFAULT_NUM_ROLLOUTS,
-        "max_steps": DEFAULT_MAX_STEPS,
-        "fps": DEFAULT_FPS,
-        "max_action_step": DEFAULT_MAX_ACTION_STEP,
-        "success_threshold": 0.0,
-    }
+    return load_policy_mode_defaults("eval", ENV_NAME, policy_type)
 
 
 def collect_dataset(args) -> Path:

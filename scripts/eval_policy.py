@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import sys
 from pathlib import Path
 
 import numpy as np
 
 from env import get_env_choices, get_env_module
-from eval_helpers import resolve_policy_dir
+from eval_helpers import resolve_eval_policy_path
+from policy_defaults import load_policy_mode_defaults
 
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
@@ -34,8 +36,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
-    env_module = get_env_module(known_args.env)
-    defaults = env_module.get_eval_defaults(known_args.policy)
+    defaults = load_policy_mode_defaults("eval", known_args.env, known_args.policy)
 
     parser = argparse.ArgumentParser(
         description="Evaluate LeRobot ACT or Streaming ACT in a selected environment."
@@ -49,28 +50,52 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--policy-path",
         type=Path,
-        required=True,
-        help="Checkpoint dir, pretrained_model dir, or training run dir.",
+        default=defaults.get("policy_path"),
+        help=(
+            "Checkpoint dir, pretrained_model dir, or training run dir. "
+            "If omitted, the latest run under --train-output-root is used."
+        ),
+    )
+    parser.add_argument(
+        "--latest-run-dir",
+        type=Path,
+        default=defaults.get("latest_run_dir"),
+        help="Explicit training run directory used when --policy-path is omitted.",
+    )
+    parser.add_argument(
+        "--train-output-root",
+        type=Path,
+        default=defaults.get("train_output_root"),
+        help="Training output root used to infer the latest run.",
+    )
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        help=(
+            "Value substituted into --output-dir when it contains '{run_tag}'. "
+            "Defaults to the current timestamp."
+        ),
     )
     parser.add_argument(
         "--output-dir",
-        type=Path,
-        default=defaults["output_dir"],
+        type=str,
+        default=defaults.get("output_dir"),
         help="Directory where rollout videos and summary are saved.",
     )
     parser.add_argument(
         "--num-rollouts",
         type=int,
-        default=defaults["num_rollouts"],
+        default=defaults.get("num_rollouts", 20),
         help="Number of evaluation rollouts.",
     )
-    parser.add_argument("--max-steps", type=int, default=defaults["max_steps"])
-    parser.add_argument("--fps", type=int, default=defaults["fps"])
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-steps", type=int, default=defaults.get("max_steps", 120))
+    parser.add_argument("--fps", type=int, default=defaults.get("fps", 20))
+    parser.add_argument("--seed", type=int, default=defaults.get("seed", 42))
     parser.add_argument(
         "--n-action-steps",
         type=int,
-        default=None,
+        default=defaults.get("n_action_steps"),
         help=(
             "Optional override for policy n_action_steps during rollout. "
             "Set to 1 for per-step replanning. Defaults to the checkpoint config."
@@ -79,47 +104,81 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--success-threshold",
         type=float,
-        default=defaults["success_threshold"],
+        default=defaults.get("success_threshold", 0.0),
         help="Only used by h_shape evaluation.",
     )
     parser.add_argument(
         "--max-action-step",
         type=float,
-        default=defaults["max_action_step"],
+        default=defaults.get("max_action_step", 1.0),
         help="Clamp action magnitude to avoid implausibly large jumps.",
     )
     parser.add_argument(
         "--collision-mode",
         type=str,
-        default="reject",
+        default=defaults.get("collision_mode", "reject"),
         choices=["reject", "detect"],
         help=(
             "Only used by braidedhub evaluation. "
             "`reject` blocks invalid moves; `detect` records them but allows penetration."
         ),
     )
-    parser.add_argument("--device", type=str, default="cuda", help="cuda/cpu/mps")
     parser.add_argument(
-        "--signature-backend",
+        "--device",
         type=str,
-        default="auto",
-        choices=["auto", "signatory", "simple"],
-        help="Backend for online path-signature computation during streaming eval.",
+        default=defaults.get("device", "cuda"),
+        help="cuda/cpu/mps",
     )
-    parser.add_argument(
+
+    randomize_group = parser.add_mutually_exclusive_group()
+    randomize_group.add_argument(
         "--enable-randomize",
+        dest="enable_randomize",
         action="store_true",
         help=(
             "Randomize the reset start state within "
             "the task start region instead of using the region center."
         ),
     )
+    randomize_group.add_argument(
+        "--disable-randomize",
+        dest="enable_randomize",
+        action="store_false",
+        help="Disable randomized reset start states during evaluation.",
+    )
+    parser.set_defaults(enable_randomize=defaults.get("enable_randomize", False))
+
+    if known_args.policy == "streaming_act":
+        parser.add_argument(
+            "--signature-backend",
+            type=str,
+            default=defaults.get("signature_backend", "auto"),
+            choices=["auto", "signatory", "simple"],
+            help="Backend for online path-signature computation during streaming eval.",
+        )
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser(argv)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if isinstance(args.output_dir, Path):
+        output_dir_s = str(args.output_dir)
+    else:
+        output_dir_s = args.output_dir
+    if output_dir_s is not None and "{run_tag}" in output_dir_s:
+        run_tag = args.run_tag or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir_s = output_dir_s.format(run_tag=run_tag)
+    args.output_dir = Path(output_dir_s)
+
+    if args.train_output_root is not None and not isinstance(args.train_output_root, Path):
+        args.train_output_root = Path(args.train_output_root)
+    if args.policy_path is not None and not isinstance(args.policy_path, Path):
+        args.policy_path = Path(args.policy_path)
+    if args.latest_run_dir is not None and not isinstance(args.latest_run_dir, Path):
+        args.latest_run_dir = Path(args.latest_run_dir)
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -151,7 +210,12 @@ def main(argv: list[str] | None = None) -> None:
 
         policy_cls = ACTPolicy
 
-    policy_dir = resolve_policy_dir(args.policy_path)
+    policy_dir = resolve_eval_policy_path(
+        policy_path=args.policy_path,
+        latest_run_dir=args.latest_run_dir,
+        train_output_root=args.train_output_root,
+    )
+    print(f"Using policy path: {policy_dir}")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 

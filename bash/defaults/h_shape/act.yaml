@@ -1,0 +1,34 @@
+train:
+  dataset_root: "data/zeno-ai/rrt_connect_h_v30"
+  dataset_repo_id: "zeno-ai/rrt_connect_h_v30"
+  output_root: "outputs/train/h_shape_act"
+  job_name: "act_h_shape"
+  wandb_project: "lerobot-rrt-act"
+  wandb_mode: "online"
+  device: "cuda"
+  steps: 10000
+  batch_size: 32
+  num_workers: 4
+  seed: 42
+  log_freq: 50
+  save_freq: 1000
+  eval_freq: -1
+  chunk_size: 5
+  n_action_steps: 1
+  use_imagenet_stats: false
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/h_shape_act"
+  output_dir: "outputs/eval/h_shape_act/{run_tag}"
+  num_rollouts: 20
+  max_steps: 120
+  fps: 20
+  seed: 42
+  device: "cuda"
+  n_action_steps: null
+  success_threshold: 0.2
+  max_action_step: 0.3
+  enable_randomize: false

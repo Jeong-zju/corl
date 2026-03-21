@@ -1,0 +1,41 @@
+train:
+  dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
+  dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
+  output_root: "outputs/train/braidedhub_fourstart_streaming_act"
+  job_name: "streaming_act_braidedhub_fourstart"
+  wandb_project: "lerobot-braidedhub"
+  wandb_mode: "online"
+  device: "cuda"
+  steps: 50000
+  batch_size: 32
+  num_workers: 4
+  seed: 42
+  log_freq: 50
+  save_freq: 10000
+  eval_freq: -1
+  chunk_size: 5
+  n_action_steps: 5
+  use_imagenet_stats: false
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+  use_path_signature: true
+  history_length: 0
+  signature_dim: 0
+  signature_depth: 3
+  signature_hidden_dim: 512
+  signature_dropout: 0.1
+
+eval:
+  train_output_root: "outputs/train/braidedhub_fourstart_streaming_act"
+  output_dir: "outputs/eval/braidedhub_fourstart_streaming_act/{run_tag}"
+  num_rollouts: 50
+  max_steps: 240
+  fps: 20
+  seed: 42
+  device: "cuda"
+  n_action_steps: 5
+  max_action_step: 2.5
+  collision_mode: "detect"
+  enable_randomize: true
+  signature_backend: "auto"
