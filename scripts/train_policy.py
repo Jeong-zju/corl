@@ -19,6 +19,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
+
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
     streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
@@ -29,18 +31,20 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def patch_lerobot_act_factory(streaming_policy_cls, streaming_config_cls) -> None:
+def patch_lerobot_act_factory(act_policy_cls, act_config_cls, streaming_policy_cls) -> None:
     import lerobot.policies.factory as policy_factory
 
     original_get_policy_class = policy_factory.get_policy_class
 
-    def get_policy_class_with_streaming_act(name: str):
-        if name in {"act", "streaming_act"}:
+    def get_policy_class_with_local_act(name: str):
+        if name == "act":
+            return act_policy_cls
+        if name == "streaming_act":
             return streaming_policy_cls
         return original_get_policy_class(name)
 
-    policy_factory.get_policy_class = get_policy_class_with_streaming_act
-    policy_factory.ACTConfig = streaming_config_cls
+    policy_factory.get_policy_class = get_policy_class_with_local_act
+    policy_factory.ACTConfig = act_config_cls
 
 
 def teardown_wandb_safely(exit_code: int) -> None:
@@ -168,6 +172,46 @@ def resolve_history_length(dataset_root: Path, history_length: int) -> int:
     )
 
 
+def validate_first_frame_anchor_support(
+    *,
+    env_name: str,
+    use_first_frame_anchor: bool,
+    context: str,
+) -> None:
+    if not use_first_frame_anchor:
+        return
+    if env_name != "braidedhub":
+        raise NotImplementedError(
+            "First-frame anchor support is currently implemented only for `braidedhub` "
+            f"during {context}. Got env={env_name!r}."
+        )
+
+
+def validate_first_frame_anchor_dataset(dataset_root: Path, use_first_frame_anchor: bool) -> None:
+    if not use_first_frame_anchor:
+        return
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
+    anchor_spec = info.get("features", {}).get(FIRST_FRAME_ANCHOR_KEY)
+    if anchor_spec is None:
+        raise KeyError(
+            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' not found in {dataset_root / 'meta/info.json'}. "
+            "Regenerate the dataset with "
+            "`main/scripts/collect_imitation_dataset.py --env braidedhub --enable-first-frame-anchor`."
+        )
+    if anchor_spec.get("dtype") not in {"image", "video"}:
+        raise ValueError(
+            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' must be stored as image/video, "
+            f"got dtype={anchor_spec.get('dtype')!r}."
+        )
+    if FIRST_FRAME_ANCHOR_KEY not in stats:
+        raise KeyError(
+            f"Dataset stats for '{FIRST_FRAME_ANCHOR_KEY}' are missing from {dataset_root / 'meta/stats.json'}. "
+            "Regenerate the dataset so the anchor feature participates in normalization."
+        )
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--env", choices=get_env_choices(), default="h_shape")
@@ -254,6 +298,22 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Number of predicted actions executed before querying the policy again. "
             "Set to 1 for per-step replanning."
         ),
+    )
+    anchor_group = parser.add_mutually_exclusive_group()
+    anchor_group.add_argument(
+        "--enable-first-frame-anchor",
+        dest="use_first_frame_anchor",
+        action="store_true",
+        help="Enable an episode-constant first-frame anchor token from observation.anchor_image.",
+    )
+    anchor_group.add_argument(
+        "--disable-first-frame-anchor",
+        dest="use_first_frame_anchor",
+        action="store_false",
+        help="Disable the first-frame anchor token input.",
+    )
+    parser.set_defaults(
+        use_first_frame_anchor=defaults.get("use_first_frame_anchor", False),
     )
 
     imagenet_group = parser.add_mutually_exclusive_group()
@@ -381,6 +441,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
+    ensure_streaming_act_importable(repo_root)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
@@ -401,21 +462,31 @@ def main(argv: list[str] | None = None) -> None:
     env_module = get_env_module(args.env)
     if hasattr(env_module, "validate_training_dataset_root"):
         env_module.validate_training_dataset_root(dataset_root)
+    use_first_frame_anchor = bool(args.use_first_frame_anchor)
+    validate_first_frame_anchor_support(
+        env_name=args.env,
+        use_first_frame_anchor=use_first_frame_anchor,
+        context="training",
+    )
+    validate_first_frame_anchor_dataset(
+        dataset_root=dataset_root,
+        use_first_frame_anchor=use_first_frame_anchor,
+    )
     use_imagenet_stats = resolve_use_imagenet_stats(
         dataset_root=dataset_root,
         use_imagenet_stats=args.use_imagenet_stats,
     )
 
+    from lerobot_policy_streaming_act.configuration_act import ACTConfig, StreamingACTConfig
+    from lerobot_policy_streaming_act.modeling_act import ACTPolicy, StreamingACTPolicy
+
+    patch_lerobot_act_factory(
+        act_policy_cls=ACTPolicy,
+        act_config_cls=ACTConfig,
+        streaming_policy_cls=StreamingACTPolicy,
+    )
+
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
-        from lerobot_policy_streaming_act.configuration_act import StreamingACTConfig
-        from lerobot_policy_streaming_act.modeling_act import StreamingACTPolicy
-
-        patch_lerobot_act_factory(
-            streaming_policy_cls=StreamingACTPolicy,
-            streaming_config_cls=StreamingACTConfig,
-        )
-
         use_path_signature = args.use_path_signature
         resolved_history_length = resolve_history_length(
             dataset_root=dataset_root,
@@ -427,8 +498,6 @@ def main(argv: list[str] | None = None) -> None:
             signature_dim=args.signature_dim,
         )
     else:
-        from lerobot.policies.act.configuration_act import ACTConfig
-
         use_path_signature = False
         resolved_history_length = 0
         signature_dim = 0
@@ -462,14 +531,13 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_act import StreamingACTConfig
-
         policy_cfg = StreamingACTConfig(
             device=args.device,
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
             n_action_steps=args.n_action_steps,
+            use_first_frame_anchor=use_first_frame_anchor,
             use_path_signature=use_path_signature,
             history_length=resolved_history_length,
             signature_dim=signature_dim,
@@ -478,14 +546,13 @@ def main(argv: list[str] | None = None) -> None:
             signature_dropout=args.signature_dropout,
         )
     else:
-        from lerobot.policies.act.configuration_act import ACTConfig
-
         policy_cfg = ACTConfig(
             device=args.device,
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
             n_action_steps=args.n_action_steps,
+            use_first_frame_anchor=use_first_frame_anchor,
         )
 
     wandb_cfg = WandBConfig(
@@ -525,6 +592,7 @@ def main(argv: list[str] | None = None) -> None:
         f"n_action_steps={args.n_action_steps}"
     )
     print(f"- use_imagenet_stats: {use_imagenet_stats}")
+    print(f"- use_first_frame_anchor: {use_first_frame_anchor}")
     if args.policy == "streaming_act":
         print(f"- use_path_signature: {use_path_signature}")
         if use_path_signature:

@@ -15,14 +15,21 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
+import lerobot.policies  # noqa: F401
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
+FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 
-@PreTrainedConfig.register_subclass("streaming_act")
+existing_act_config = PreTrainedConfig.get_known_choices().get("act")
+if existing_act_config is not None and existing_act_config.__module__.startswith("lerobot."):
+    PreTrainedConfig.get_known_choices().pop("act")
+
+
+@PreTrainedConfig.register_subclass("act")
 @dataclass
-class StreamingACTConfig(PreTrainedConfig):
+class ACTConfig(PreTrainedConfig):
     """Configuration class for the Action Chunking Transformers policy.
 
     Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
@@ -81,10 +88,12 @@ class StreamingACTConfig(PreTrainedConfig):
         signature_hidden_dim: Hidden dimension used by the projection MLP that maps high-dimensional
             signature vectors into model-friendly embeddings.
         signature_dropout: Dropout used in the signature projection MLP for regularization.
+        use_first_frame_anchor: Whether to consume an episode-constant first-frame anchor image
+            from `observation.anchor_image` and inject it as one extra encoder memory token.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
-            more information on how ensembling works, please see `StreamingACTTemporalEnsembler`.
+            more information on how ensembling works, please see `ACTTemporalEnsembler`.
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
@@ -124,8 +133,11 @@ class StreamingACTConfig(PreTrainedConfig):
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
+    # Extra conditioning inputs.
+    use_first_frame_anchor: bool = False
+    use_path_signature: bool = False
+
     # Streaming path-signature history module.
-    use_path_signature: bool = True
     history_length: int = 10
     # Signature output dimensionality is typically a function of channels and truncation depth.
     # Set to 0 to infer automatically in the model implementation.
@@ -169,20 +181,21 @@ class StreamingACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-        if self.history_length <= 0:
-            raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
-        if self.signature_dim < 0:
-            raise ValueError(f"`signature_dim` must be >= 0. Got {self.signature_dim}.")
-        if self.signature_depth <= 0:
-            raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
-        if self.signature_hidden_dim <= 0:
-            raise ValueError(
-                f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}."
-            )
-        if not (0.0 <= self.signature_dropout <= 1.0):
-            raise ValueError(
-                f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
-            )
+        if self.use_path_signature:
+            if self.history_length <= 0:
+                raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
+            if self.signature_dim < 0:
+                raise ValueError(f"`signature_dim` must be >= 0. Got {self.signature_dim}.")
+            if self.signature_depth <= 0:
+                raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
+            if self.signature_hidden_dim <= 0:
+                raise ValueError(
+                    f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}."
+                )
+            if not (0.0 <= self.signature_dropout <= 1.0):
+                raise ValueError(
+                    f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -194,8 +207,27 @@ class StreamingACTConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
-        if not self.image_features and not self.env_state_feature:
+        if not self.visual_observation_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_first_frame_anchor:
+            if not self.visual_observation_features:
+                raise ValueError(
+                    "`use_first_frame_anchor=True` requires at least one regular observation image "
+                    "feature in addition to the anchor image."
+                )
+            anchor_feature = self.first_frame_anchor_feature
+            if anchor_feature is None:
+                raise ValueError(
+                    "`use_first_frame_anchor=True` requires dataset/config input feature "
+                    f"`{FIRST_FRAME_ANCHOR_KEY}`."
+                )
+            first_visual_feature = next(iter(self.visual_observation_features.values()))
+            if tuple(anchor_feature.shape) != tuple(first_visual_feature.shape):
+                raise ValueError(
+                    "First-frame anchor image must match the regular observation image shape. "
+                    f"Got anchor={tuple(anchor_feature.shape)} vs "
+                    f"observation={tuple(first_visual_feature.shape)}."
+                )
 
     @property
     def observation_delta_indices(self) -> None:
@@ -208,3 +240,21 @@ class StreamingACTConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def visual_observation_features(self) -> dict:
+        return {
+            key: ft
+            for key, ft in self.image_features.items()
+            if key != FIRST_FRAME_ANCHOR_KEY
+        }
+
+    @property
+    def first_frame_anchor_feature(self):
+        return self.image_features.get(FIRST_FRAME_ANCHOR_KEY)
+
+
+@PreTrainedConfig.register_subclass("streaming_act")
+@dataclass
+class StreamingACTConfig(ACTConfig):
+    use_path_signature: bool = True

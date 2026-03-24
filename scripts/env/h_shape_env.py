@@ -483,6 +483,11 @@ def evaluate_policy(
     image_key = list(cfg.image_features.keys())[0]
     image_shape = tuple(cfg.image_features[image_key].shape)
     image_hw = (int(image_shape[1]), int(image_shape[2]))
+    if bool(getattr(cfg, "use_first_frame_anchor", False)):
+        raise NotImplementedError(
+            "First-frame anchor evaluation is not implemented for `h_shape` yet. "
+            "Only `braidedhub` currently supports the shared-backbone raw-anchor path."
+        )
 
     if cfg.robot_state_feature is None:
         raise RuntimeError("Policy has no observation.state feature.")

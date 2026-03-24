@@ -33,7 +33,7 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from .configuration_act import StreamingACTConfig
+from .configuration_act import ACTConfig, FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
@@ -45,7 +45,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
     """
 
     config_class = StreamingACTConfig
-    name = "act"
+    name = "streaming_act"
 
     def __init__(
         self,
@@ -126,18 +126,18 @@ class StreamingACTPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        if self.config.image_features:
+        if self.config.visual_observation_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.visual_observation_features]
 
         actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
+        if self.config.visual_observation_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.visual_observation_features]
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -160,6 +160,11 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         return loss, loss_dict
+
+
+class ACTPolicy(StreamingACTPolicy):
+    config_class = ACTConfig
+    name = "act"
 
 
 class StreamingACTTemporalEnsembler:
@@ -288,12 +293,13 @@ class StreamingACT(nn.Module):
                                 └───────────────────────┘
     """
 
-    def __init__(self, config: StreamingACTConfig):
+    def __init__(self, config: ACTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
         self.use_path_signature = config.use_path_signature
+        self.use_first_frame_anchor = config.use_first_frame_anchor
 
         if self.use_path_signature:
             assert config.signature_dim > 0, (
@@ -365,6 +371,9 @@ class StreamingACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+        if self.use_first_frame_anchor:
+            self.anchor_token_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.anchor_token_proj = nn.Linear(config.dim_model, config.dim_model)
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -397,7 +406,8 @@ class StreamingACT(nn.Module):
         {
             [robot_state_feature] (optional): (B, state_dim) batch of robot states.
 
-            [image_features]: (B, n_cameras, C, H, W) batch of images.
+            [image_features]: (B, n_cameras, C, H, W) batch of current-step images.
+            [FIRST_FRAME_ANCHOR_KEY] (optional): (B, C, H, W) first-frame anchor image.
                 AND/OR
             [env_state_feature]: (B, env_dim) batch of environment states.
 
@@ -442,6 +452,29 @@ class StreamingACT(nn.Module):
                 f"Got {tuple(signature_embed.shape)}."
             )
             signature_embed = signature_embed.unsqueeze(1)  # (B, 1, D)
+
+        if self.use_first_frame_anchor:
+            assert FIRST_FRAME_ANCHOR_KEY in batch, (
+                f"`{FIRST_FRAME_ANCHOR_KEY}` is required when `use_first_frame_anchor=True`."
+            )
+            anchor_image = batch[FIRST_FRAME_ANCHOR_KEY]
+            assert anchor_image.ndim == 4, (
+                f"`{FIRST_FRAME_ANCHOR_KEY}` must have shape (batch_size, C, H, W). "
+                f"Got ndim={anchor_image.ndim}, shape={tuple(anchor_image.shape)}."
+            )
+            assert anchor_image.shape[0] == batch_size, (
+                f"Batch mismatch for `{FIRST_FRAME_ANCHOR_KEY}`: expected {batch_size}, "
+                f"got {anchor_image.shape[0]}."
+            )
+            anchor_features = self.backbone(anchor_image)["feature_map"]
+            anchor_features = self.encoder_img_feat_input_proj(anchor_features)
+            anchor_embed = self.anchor_token_pool(anchor_features).flatten(1)
+            anchor_embed = self.anchor_token_proj(anchor_embed)
+            assert anchor_embed.shape == (batch_size, self.config.dim_model), (
+                f"`anchor_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(anchor_embed.shape)}."
+            )
+            anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -507,7 +540,7 @@ class StreamingACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
-        if self.config.image_features:
+        if self.config.visual_observation_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
@@ -532,6 +565,19 @@ class StreamingACT(nn.Module):
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
 
+        extra_memory_tokens = []
+        extra_memory_pos_embed = []
+        if self.use_first_frame_anchor:
+            anchor_token = anchor_embed.transpose(0, 1).to(
+                device=encoder_out.device, dtype=encoder_out.dtype
+            )  # (1, B, D)
+            anchor_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            extra_memory_tokens.append(anchor_token)
+            extra_memory_pos_embed.append(anchor_pos_embed)
         if self.use_path_signature:
             signature_token = signature_embed.transpose(0, 1).to(
                 device=encoder_out.device, dtype=encoder_out.dtype
@@ -541,11 +587,16 @@ class StreamingACT(nn.Module):
                 dtype=encoder_in_pos_embed.dtype,
                 device=encoder_in_pos_embed.device,
             )
-            encoder_out = torch.cat([signature_token, encoder_out], dim=0)
-            encoder_in_pos_embed = torch.cat([signature_pos_embed, encoder_in_pos_embed], dim=0)
+            extra_memory_tokens.append(signature_token)
+            extra_memory_pos_embed.append(signature_pos_embed)
+
+        if extra_memory_tokens:
+            # Extra non-image context tokens are injected into encoder memory before decoder cross-attention.
+            encoder_out = torch.cat([*extra_memory_tokens, encoder_out], dim=0)
+            encoder_in_pos_embed = torch.cat([*extra_memory_pos_embed, encoder_in_pos_embed], dim=0)
             assert encoder_out.shape[0] == encoder_in_pos_embed.shape[0], (
                 "Encoder token length and positional embedding length must match after "
-                "signature token injection."
+                "extra memory token injection."
             )
 
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
@@ -572,7 +623,7 @@ class StreamingACT(nn.Module):
 class StreamingACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
-    def __init__(self, config: StreamingACTConfig, is_vae_encoder: bool = False):
+    def __init__(self, config: ACTConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
         num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
@@ -589,7 +640,7 @@ class StreamingACTEncoder(nn.Module):
 
 
 class StreamingACTEncoderLayer(nn.Module):
-    def __init__(self, config: StreamingACTConfig):
+    def __init__(self, config: ACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
@@ -628,7 +679,7 @@ class StreamingACTEncoderLayer(nn.Module):
 
 
 class StreamingACTDecoder(nn.Module):
-    def __init__(self, config: StreamingACTConfig):
+    def __init__(self, config: ACTConfig):
         """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
         self.layers = nn.ModuleList([StreamingACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
@@ -651,7 +702,7 @@ class StreamingACTDecoder(nn.Module):
 
 
 class StreamingACTDecoderLayer(nn.Module):
-    def __init__(self, config: StreamingACTConfig):
+    def __init__(self, config: ACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)

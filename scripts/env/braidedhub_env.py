@@ -119,6 +119,7 @@ DEFAULT_T_FIXED = 100
 DEFAULT_LAST_ACTION_MODE = "zero"
 DEFAULT_INCLUDE_PATH_SIGNATURES = True
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 DEFAULT_SIGNATURE_WINDOW_SIZE = 0
 DEFAULT_SIGNATURE_DEPTH = 3
 DEFAULT_SIGNATURE_BACKEND = "auto"
@@ -2076,6 +2077,7 @@ def collect_dataset(args) -> Path:
         image_size=args.image_size,
         config=map_config,
         episodes_per_chunk=args.episodes_per_chunk,
+        use_first_frame_anchor=bool(getattr(args, "enable_first_frame_anchor", False)),
     )
     return output_path
 
@@ -2157,6 +2159,7 @@ def evaluate_policy(
     use_path_signature = bool(
         policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
     )
+    use_first_frame_anchor = bool(getattr(cfg, "use_first_frame_anchor", False))
     signature_key = "observation.path_signature"
     signature_backend = None
     if use_path_signature:
@@ -2172,6 +2175,11 @@ def evaluate_policy(
             "[info] online path-signature enabled: "
             f"backend={signature_backend}, history=full_prefix, "
             f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+    if use_first_frame_anchor:
+        print(
+            "[info] first-frame anchor enabled: "
+            f"key={FIRST_FRAME_ANCHOR_KEY}, cache_lifetime=one_episode"
         )
 
     map_config = build_default_map_config()
@@ -2243,6 +2251,7 @@ def evaluate_policy(
 
         trajectory = [state_xy]
         state_history = deque() if use_path_signature else None
+        first_frame_anchor = None
         last_info = {
             **env.last_info,
             "phase_name": env.get_phase_name(state_xy),
@@ -2259,6 +2268,8 @@ def evaluate_policy(
                 config=map_config,
                 robot_xy=state_xy,
             )
+            if use_first_frame_anchor and first_frame_anchor is None:
+                first_frame_anchor = frame.copy()
             writer.stdin.write(frame.astype(np.uint8).tobytes())
 
             obs = build_eval_observation(
@@ -2268,6 +2279,16 @@ def evaluate_policy(
                 image_key=image_key,
                 state_dim=state_dim,
             )
+            if use_first_frame_anchor:
+                if first_frame_anchor is None:
+                    raise RuntimeError("First-frame anchor cache was not initialized at rollout start.")
+                obs[FIRST_FRAME_ANCHOR_KEY] = (
+                    torch.from_numpy(first_frame_anchor)
+                    .permute(2, 0, 1)
+                    .contiguous()
+                    .float()
+                    / 255.0
+                )
 
             if use_path_signature:
                 assert state_history is not None
@@ -2306,6 +2327,24 @@ def evaluate_policy(
                         f"got shape={tuple(path_signature.shape)}"
                     )
                 obs[signature_key] = path_signature.to(
+                    device=obs[state_key].device,
+                    dtype=obs[state_key].dtype,
+                )
+            if use_first_frame_anchor:
+                if FIRST_FRAME_ANCHOR_KEY not in obs:
+                    raise KeyError(
+                        f"`{FIRST_FRAME_ANCHOR_KEY}` missing after preprocessor; "
+                        "cannot run policy with use_first_frame_anchor=True."
+                    )
+                anchor_image = obs[FIRST_FRAME_ANCHOR_KEY]
+                if anchor_image.ndim == 3:
+                    anchor_image = anchor_image.unsqueeze(0)
+                elif anchor_image.ndim != 4:
+                    raise RuntimeError(
+                        f"`{FIRST_FRAME_ANCHOR_KEY}` must be 3D/4D after preprocessing, "
+                        f"got shape={tuple(anchor_image.shape)}"
+                    )
+                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_image.to(
                     device=obs[state_key].device,
                     dtype=obs[state_key].dtype,
                 )
@@ -3242,6 +3281,51 @@ def build_stats(values: np.ndarray | list[float]) -> dict[str, Any]:
     }
 
 
+def init_visual_feature_stats() -> dict[str, Any]:
+    return {
+        "min": np.full((3,), np.inf, dtype=np.float64),
+        "max": np.full((3,), -np.inf, dtype=np.float64),
+        "sum": np.zeros((3,), dtype=np.float64),
+        "sum_sq": np.zeros((3,), dtype=np.float64),
+        "count": 0,
+    }
+
+
+def update_visual_feature_stats(stats: dict[str, Any], frame: np.ndarray, weight: int = 1) -> None:
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"Expected RGB frame with shape (H, W, 3), got {frame.shape}.")
+    if weight <= 0:
+        raise ValueError(f"weight must be positive, got {weight}.")
+
+    frame_arr = frame.astype(np.float64, copy=False) / 255.0
+    frame_chw = np.transpose(frame_arr, (2, 0, 1)).reshape(3, -1)
+    stats["min"] = np.minimum(stats["min"], frame_chw.min(axis=1))
+    stats["max"] = np.maximum(stats["max"], frame_chw.max(axis=1))
+    stats["sum"] += frame_chw.sum(axis=1) * weight
+    stats["sum_sq"] += np.square(frame_chw).sum(axis=1) * weight
+    stats["count"] += int(frame_chw.shape[1] * weight)
+
+
+def finalize_visual_feature_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    count = int(stats["count"])
+    if count <= 0:
+        raise ValueError("Cannot finalize visual stats with zero pixels.")
+
+    mean = stats["sum"] / count
+    variance = np.maximum(stats["sum_sq"] / count - mean**2, 0.0)
+
+    def _reshape(value: np.ndarray) -> list:
+        return np.asarray(value, dtype=np.float64).reshape(3, 1, 1).tolist()
+
+    return {
+        "min": _reshape(stats["min"]),
+        "max": _reshape(stats["max"]),
+        "mean": _reshape(mean),
+        "std": _reshape(np.sqrt(variance)),
+        "count": [count],
+    }
+
+
 def fixed_size_list_array(pa: Any, values: np.ndarray, width: int):
     flat = pa.array(values.reshape(-1), type=pa.float32())
     return pa.FixedSizeListArray.from_arrays(flat, width)
@@ -3315,7 +3399,7 @@ def validate_lerobot_v30_consistency(
     splits: dict[str, str],
     total_frames: int,
     total_episodes: int,
-    video_frame_counts: dict[int, int],
+    video_frame_counts_by_key: dict[str, dict[int, int]],
 ) -> None:
     if total_frames != len(records["index"]):
         raise ValueError("total_frames mismatch with frame table")
@@ -3326,11 +3410,13 @@ def validate_lerobot_v30_consistency(
     ):
         raise ValueError("global index must be continuous and monotonic")
 
-    total_video_frames = int(sum(video_frame_counts.values()))
-    if total_video_frames != total_frames:
-        raise ValueError(
-            f"video frame count mismatch: video={total_video_frames}, parquet={total_frames}"
-        )
+    for video_key, video_frame_counts in video_frame_counts_by_key.items():
+        total_video_frames = int(sum(video_frame_counts.values()))
+        if total_video_frames != total_frames:
+            raise ValueError(
+                f"video frame count mismatch for {video_key}: "
+                f"video={total_video_frames}, parquet={total_frames}"
+            )
 
     total_length = sum(episode["length"] for episode in episodes_meta)
     if total_length != total_frames:
@@ -3347,13 +3433,14 @@ def validate_lerobot_v30_consistency(
             raise ValueError(
                 f"episode length mismatch in episode {episode_meta['episode_index']}"
             )
-        video_frames = video_frame_counts.get(int(episode_meta["episode_index"]))
-        if video_frames != int(episode_meta["length"]):
-            raise ValueError(
-                "per-episode video frame count mismatch in "
-                f"episode {episode_meta['episode_index']}: "
-                f"video={video_frames}, episode_length={episode_meta['length']}"
-            )
+        for video_key, video_frame_counts in video_frame_counts_by_key.items():
+            video_frames = video_frame_counts.get(int(episode_meta["episode_index"]))
+            if video_frames != int(episode_meta["length"]):
+                raise ValueError(
+                    "per-episode video frame count mismatch in "
+                    f"episode {episode_meta['episode_index']} for {video_key}: "
+                    f"video={video_frames}, episode_length={episode_meta['length']}"
+                )
 
     for split_name, split_spec in splits.items():
         split_start, split_end = split_spec.split(":", 1)
@@ -3732,6 +3819,7 @@ def generate_lerobot_v30_dataset(
     image_size: int = DEFAULT_VIDEO_IMAGE_SIZE,
     config: MapConfig | None = None,
     episodes_per_chunk: int = DEFAULT_LEROBOT_EPISODES_PER_CHUNK,
+    use_first_frame_anchor: bool = False,
 ) -> Path:
     pa, pq = _require_lerobot_export_dependencies()
 
@@ -3770,6 +3858,9 @@ def generate_lerobot_v30_dataset(
     )
 
     base_image = make_lerobot_base_image(map_config, image_size=image_size)
+    video_keys = [VIDEO_KEY]
+    if use_first_frame_anchor:
+        video_keys.append(FIRST_FRAME_ANCHOR_KEY)
     records: dict[str, list[Any]] = {
         "timestamp": [],
         "frame_index": [],
@@ -3786,10 +3877,15 @@ def generate_lerobot_v30_dataset(
         records[DEFAULT_PATH_SIGNATURE_KEY] = []
     episodes_meta: list[dict[str, Any]] = []
     global_index = 0
-    video_frame_counts: dict[int, int] = {}
+    video_frame_counts_by_key: dict[str, dict[int, int]] = {
+        video_key: {} for video_key in video_keys
+    }
+    visual_stats_by_key: dict[str, dict[str, Any]] = {
+        video_key: init_visual_feature_stats() for video_key in video_keys
+    }
     data_files: list[Path] = []
     video_files: list[Path] = []
-    first_video_info: dict[str, Any] | None = None
+    first_video_info_by_key: dict[str, dict[str, Any]] = {}
 
     for episode_idx, source_idx in enumerate(episode_order.tolist()):
         observations = processed_dataset.observations[source_idx]
@@ -3809,12 +3905,27 @@ def generate_lerobot_v30_dataset(
             root
             / f"videos/{VIDEO_KEY}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
         )
+        anchor_video_file = (
+            None
+            if not use_first_frame_anchor
+            else root
+            / f"videos/{FIRST_FRAME_ANCHOR_KEY}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+        )
         data_file.parent.mkdir(parents=True, exist_ok=True)
         video_file.parent.mkdir(parents=True, exist_ok=True)
+        if anchor_video_file is not None:
+            anchor_video_file.parent.mkdir(parents=True, exist_ok=True)
 
         ffmpeg_proc = start_ffmpeg_raw_writer(video_file, image_size, image_size, fps)
         if ffmpeg_proc.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for raw video writing.")
+        anchor_ffmpeg_proc = None
+        if anchor_video_file is not None:
+            anchor_ffmpeg_proc = start_ffmpeg_raw_writer(
+                anchor_video_file, image_size, image_size, fps
+            )
+            if anchor_ffmpeg_proc.stdin is None:
+                raise RuntimeError("Failed to open ffmpeg stdin for anchor video writing.")
         episode_base_image = make_lerobot_episode_base_image(
             base_image,
             config=map_config,
@@ -3836,6 +3947,7 @@ def generate_lerobot_v30_dataset(
         }
         if processed_dataset.path_signatures is not None:
             episode_records[DEFAULT_PATH_SIGNATURE_KEY] = []
+        anchor_frame = None
 
         for frame_idx in range(episode_length):
             state_xy = observations[frame_idx]
@@ -3876,44 +3988,82 @@ def generate_lerobot_v30_dataset(
                 config=map_config,
                 robot_xy=(float(state_xy[0]), float(state_xy[1])),
             )
+            update_visual_feature_stats(visual_stats_by_key[VIDEO_KEY], frame)
+            if use_first_frame_anchor and anchor_frame is None:
+                anchor_frame = frame.copy()
             ffmpeg_proc.stdin.write(frame.astype(np.uint8).tobytes())
+            if anchor_ffmpeg_proc is not None:
+                if anchor_frame is None:
+                    raise RuntimeError("Anchor frame was not initialized before anchor video write.")
+                anchor_ffmpeg_proc.stdin.write(anchor_frame.astype(np.uint8).tobytes())
             global_index += 1
 
         episode_to_index = global_index
+        if use_first_frame_anchor:
+            if anchor_frame is None:
+                raise RuntimeError("Anchor frame was not captured for the episode.")
+            update_visual_feature_stats(
+                visual_stats_by_key[FIRST_FRAME_ANCHOR_KEY],
+                anchor_frame,
+                weight=episode_length,
+            )
         ffmpeg_proc.stdin.close()
         return_code = ffmpeg_proc.wait()
         if return_code != 0:
             raise RuntimeError(
                 f"ffmpeg failed with code {return_code} for episode {episode_idx}"
             )
+        if anchor_ffmpeg_proc is not None:
+            anchor_ffmpeg_proc.stdin.close()
+            anchor_return_code = anchor_ffmpeg_proc.wait()
+            if anchor_return_code != 0:
+                raise RuntimeError(
+                    f"ffmpeg failed with code {anchor_return_code} for anchor episode {episode_idx}"
+                )
 
         episode_table = build_episode_data_table(pa, episode_records)
         pq.write_table(episode_table, data_file, compression="snappy")
 
         video_info = ffprobe_video(video_file)
-        if first_video_info is None:
-            first_video_info = video_info
-        video_frame_counts[episode_idx] = int(video_info["frames"])
+        if VIDEO_KEY not in first_video_info_by_key:
+            first_video_info_by_key[VIDEO_KEY] = video_info
+        video_frame_counts_by_key[VIDEO_KEY][episode_idx] = int(video_info["frames"])
         data_files.append(data_file)
         video_files.append(video_file)
+        if anchor_video_file is not None:
+            anchor_video_info = ffprobe_video(anchor_video_file)
+            if FIRST_FRAME_ANCHOR_KEY not in first_video_info_by_key:
+                first_video_info_by_key[FIRST_FRAME_ANCHOR_KEY] = anchor_video_info
+            video_frame_counts_by_key[FIRST_FRAME_ANCHOR_KEY][episode_idx] = int(
+                anchor_video_info["frames"]
+            )
+            video_files.append(anchor_video_file)
 
-        episodes_meta.append(
-            {
-                "episode_index": episode_idx,
-                "tasks": [task_text],
-                "length": episode_length,
-                "data/chunk_index": chunk_index,
-                "data/file_index": file_index,
-                "dataset_from_index": episode_from_index,
-                "dataset_to_index": episode_to_index,
-                f"videos/{VIDEO_KEY}/chunk_index": chunk_index,
-                f"videos/{VIDEO_KEY}/file_index": file_index,
-                f"videos/{VIDEO_KEY}/from_timestamp": 0.0,
-                f"videos/{VIDEO_KEY}/to_timestamp": float(episode_length / fps),
-                "meta/episodes/chunk_index": 0,
-                "meta/episodes/file_index": 0,
-            }
-        )
+        episode_meta = {
+            "episode_index": episode_idx,
+            "tasks": [task_text],
+            "length": episode_length,
+            "data/chunk_index": chunk_index,
+            "data/file_index": file_index,
+            "dataset_from_index": episode_from_index,
+            "dataset_to_index": episode_to_index,
+            f"videos/{VIDEO_KEY}/chunk_index": chunk_index,
+            f"videos/{VIDEO_KEY}/file_index": file_index,
+            f"videos/{VIDEO_KEY}/from_timestamp": 0.0,
+            f"videos/{VIDEO_KEY}/to_timestamp": float(episode_length / fps),
+            "meta/episodes/chunk_index": 0,
+            "meta/episodes/file_index": 0,
+        }
+        if anchor_video_file is not None:
+            episode_meta.update(
+                {
+                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/chunk_index": chunk_index,
+                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/file_index": file_index,
+                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/from_timestamp": 0.0,
+                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/to_timestamp": float(episode_length / fps),
+                }
+            )
+        episodes_meta.append(episode_meta)
 
     total_frames = len(records["index"])
     state_array = np.asarray(records["observation.state"], dtype=np.float32)
@@ -3924,38 +4074,54 @@ def generate_lerobot_v30_dataset(
         else np.asarray(records[DEFAULT_PATH_SIGNATURE_KEY], dtype=np.float32)
     )
 
-    episodes_table = pa.Table.from_arrays(
+    episode_arrays = [
+        pa.array([episode["episode_index"] for episode in episodes_meta], type=pa.int64()),
+        pa.array([episode["tasks"] for episode in episodes_meta], type=pa.list_(pa.string())),
+        pa.array([episode["length"] for episode in episodes_meta], type=pa.int64()),
+        pa.array([episode["data/chunk_index"] for episode in episodes_meta], type=pa.int64()),
+        pa.array([episode["data/file_index"] for episode in episodes_meta], type=pa.int64()),
+        pa.array([episode["dataset_from_index"] for episode in episodes_meta], type=pa.int64()),
+        pa.array([episode["dataset_to_index"] for episode in episodes_meta], type=pa.int64()),
+    ]
+    episode_names = [
+        "episode_index",
+        "tasks",
+        "length",
+        "data/chunk_index",
+        "data/file_index",
+        "dataset_from_index",
+        "dataset_to_index",
+    ]
+    for video_key in video_keys:
+        episode_arrays.extend(
+            [
+                pa.array([episode[f"videos/{video_key}/chunk_index"] for episode in episodes_meta], type=pa.int64()),
+                pa.array([episode[f"videos/{video_key}/file_index"] for episode in episodes_meta], type=pa.int64()),
+                pa.array([episode[f"videos/{video_key}/from_timestamp"] for episode in episodes_meta], type=pa.float32()),
+                pa.array([episode[f"videos/{video_key}/to_timestamp"] for episode in episodes_meta], type=pa.float32()),
+            ]
+        )
+        episode_names.extend(
+            [
+                f"videos/{video_key}/chunk_index",
+                f"videos/{video_key}/file_index",
+                f"videos/{video_key}/from_timestamp",
+                f"videos/{video_key}/to_timestamp",
+            ]
+        )
+    episode_arrays.extend(
         [
-            pa.array([episode["episode_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode["tasks"] for episode in episodes_meta], type=pa.list_(pa.string())),
-            pa.array([episode["length"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode["data/chunk_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode["data/file_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode["dataset_from_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode["dataset_to_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode[f"videos/{VIDEO_KEY}/chunk_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode[f"videos/{VIDEO_KEY}/file_index"] for episode in episodes_meta], type=pa.int64()),
-            pa.array([episode[f"videos/{VIDEO_KEY}/from_timestamp"] for episode in episodes_meta], type=pa.float32()),
-            pa.array([episode[f"videos/{VIDEO_KEY}/to_timestamp"] for episode in episodes_meta], type=pa.float32()),
             pa.array([episode["meta/episodes/chunk_index"] for episode in episodes_meta], type=pa.int64()),
             pa.array([episode["meta/episodes/file_index"] for episode in episodes_meta], type=pa.int64()),
-        ],
-        names=[
-            "episode_index",
-            "tasks",
-            "length",
-            "data/chunk_index",
-            "data/file_index",
-            "dataset_from_index",
-            "dataset_to_index",
-            f"videos/{VIDEO_KEY}/chunk_index",
-            f"videos/{VIDEO_KEY}/file_index",
-            f"videos/{VIDEO_KEY}/from_timestamp",
-            f"videos/{VIDEO_KEY}/to_timestamp",
+        ]
+    )
+    episode_names.extend(
+        [
             "meta/episodes/chunk_index",
             "meta/episodes/file_index",
-        ],
+        ]
     )
+    episodes_table = pa.Table.from_arrays(episode_arrays, names=episode_names)
     pq.write_table(episodes_table, episodes_file, compression="snappy")
 
     with tasks_jsonl_file.open("w", encoding="utf-8") as task_file:
@@ -3980,8 +4146,9 @@ def generate_lerobot_v30_dataset(
     )
     pq.write_table(tasks_table, tasks_parquet_file, compression="snappy")
 
-    if first_video_info is None:
+    if VIDEO_KEY not in first_video_info_by_key:
         raise RuntimeError("No episodes were exported, so no video metadata was created.")
+    front_video_info = first_video_info_by_key[VIDEO_KEY]
 
     total_episodes = len(processed_dataset)
     val_start = int(round(total_episodes * 0.8))
@@ -4031,13 +4198,13 @@ def generate_lerobot_v30_dataset(
             },
             VIDEO_KEY: {
                 "dtype": "video",
-                "shape": [first_video_info["height"], first_video_info["width"], 3],
+                "shape": [front_video_info["height"], front_video_info["width"], 3],
                 "names": ["height", "width", "channels"],
                 "info": {
-                    "video.height": first_video_info["height"],
-                    "video.width": first_video_info["width"],
-                    "video.codec": first_video_info["codec"],
-                    "video.pix_fmt": first_video_info["pix_fmt"],
+                    "video.height": front_video_info["height"],
+                    "video.width": front_video_info["width"],
+                    "video.codec": front_video_info["codec"],
+                    "video.pix_fmt": front_video_info["pix_fmt"],
                     "video.is_depth_map": False,
                     "video.fps": int(fps),
                     "video.channels": 3,
@@ -4051,6 +4218,28 @@ def generate_lerobot_v30_dataset(
             "task_index": {"dtype": "int64", "shape": [1], "names": None},
         },
     }
+    if use_first_frame_anchor:
+        anchor_video_info = first_video_info_by_key[FIRST_FRAME_ANCHOR_KEY]
+        info["features"][FIRST_FRAME_ANCHOR_KEY] = {
+            "dtype": "video",
+            "shape": [anchor_video_info["height"], anchor_video_info["width"], 3],
+            "names": ["height", "width", "channels"],
+            "info": {
+                "video.height": anchor_video_info["height"],
+                "video.width": anchor_video_info["width"],
+                "video.codec": anchor_video_info["codec"],
+                "video.pix_fmt": anchor_video_info["pix_fmt"],
+                "video.is_depth_map": False,
+                "video.fps": int(fps),
+                "video.channels": 3,
+                "has_audio": False,
+            },
+        }
+        info["first_frame_anchor"] = {
+            "key": FIRST_FRAME_ANCHOR_KEY,
+            "storage": "video",
+            "semantics": "episode_reset_first_frame_repeated_for_all_timesteps",
+        }
     if (
         processed_dataset.path_signatures is not None
         and processed_dataset.path_signature_key is not None
@@ -4086,7 +4275,12 @@ def generate_lerobot_v30_dataset(
         "action": build_stats(action_array),
         "next.reward": build_stats(np.asarray(records["next.reward"], dtype=np.float32)),
         "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
+        VIDEO_KEY: finalize_visual_feature_stats(visual_stats_by_key[VIDEO_KEY]),
     }
+    if use_first_frame_anchor:
+        stats[FIRST_FRAME_ANCHOR_KEY] = finalize_visual_feature_stats(
+            visual_stats_by_key[FIRST_FRAME_ANCHOR_KEY]
+        )
     if (
         processed_dataset.path_signatures is not None
         and processed_dataset.path_signature_key is not None
@@ -4105,13 +4299,15 @@ def generate_lerobot_v30_dataset(
         splits=splits,
         total_frames=total_frames,
         total_episodes=total_episodes,
-        video_frame_counts=video_frame_counts,
+        video_frame_counts_by_key=video_frame_counts_by_key,
     )
 
+    front_video_frames = sum(video_frame_counts_by_key[VIDEO_KEY].values())
     print(f"Generated LeRobotDataset v3.0 at: {root.resolve()}")
     print(
         f"Episodes: {total_episodes}, Frames: {total_frames}, "
-        f"Video frames: {sum(video_frame_counts.values())}, "
+        f"Video frames per stream: {front_video_frames}, "
+        f"Video streams: {len(video_keys)}, "
         f"Data files: {len(data_files)}, Video files: {len(video_files)}"
     )
     return root

@@ -757,6 +757,20 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=defaults["output_dir"])
     parser.add_argument("--fps", type=int, default=defaults["fps"])
     parser.add_argument("--image-size", type=int, default=defaults["image_size"])
+    anchor_group = parser.add_mutually_exclusive_group()
+    anchor_group.add_argument(
+        "--enable-first-frame-anchor",
+        dest="enable_first_frame_anchor",
+        action="store_true",
+        help="Export an episode-constant first-frame anchor video feature for each sample.",
+    )
+    anchor_group.add_argument(
+        "--disable-first-frame-anchor",
+        dest="enable_first_frame_anchor",
+        action="store_false",
+        help="Do not export the first-frame anchor feature.",
+    )
+    parser.set_defaults(enable_first_frame_anchor=False)
 
     if known_args.env == "h_shape":
         parser.add_argument(
@@ -883,6 +897,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.enable_first_frame_anchor and args.env != "braidedhub":
+        raise NotImplementedError(
+            "First-frame anchor dataset export is currently implemented only for `braidedhub`. "
+            f"Got env={args.env!r}."
+        )
     if args.env == "h_shape":
         output_path = generate_lerobot_v30_dataset(
             num_episodes=args.num_episodes,

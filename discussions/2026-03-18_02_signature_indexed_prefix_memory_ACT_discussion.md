@@ -1,33 +1,82 @@
 # Coding Prompts
 
+## 0. 共享实现约定
+
+以下 prompts 是修订版。它们保留原有实验路线，但补齐了工程落地时最容易出问题的实现契约。若各 prompt 内未特别说明，统一遵守以下约定：
+
+1. 所有新特性默认关闭；关闭时，现有 `act`、现有 `streaming_act`、现有 checkpoint 加载行为必须保持不变。
+2. 训练和评估必须语义一致，不允许训练时看完整未来、评估时只看在线历史。
+3. 所有新增输入都必须走完整链路：dataset export -> `meta/info.json` -> `meta/stats.json` -> preprocessing -> model forward -> online eval。缺任一环都不算完成。
+4. 所有新增特性都必须通过明确的 config 和 CLI 控制，命名要自解释，不要用模糊短名。
+5. 所有 shape 约定都必须在代码里通过断言或显式报错检查，而不是依赖隐式广播。
+6. 新增 prefix 序列时，统一按时间从旧到新排列，最后一个 valid 元素就是“当前时刻”。禁止未来泄漏。
+7. prefix 序列统一采用右侧 padding，并显式提供 `prefix_mask` 或语义等价的 valid-length 信息；`True` 表示有效位置。
+8. 新增非图像 token 统一先投影到 `dim_model`，再以 `(batch, 1, dim_model)` 或 `(batch, num_slots, dim_model)` 的形式注入 encoder memory。不要把历史特征硬拼到图像通道维。
+9. 除非 prompt 明确要求，否则不要重构 ACT 主干，不要修改 chunk prediction 机制，不要顺手引入额外方法学扩展。
+10. 每一步都要给出至少一个最小 smoke test，优先使用真实 train/eval 命令而不是伪代码。
+
+推荐统一的数据接口如下；如果代码库已有更自然的命名，也可以采用等价命名，但必须在最终回复中明确写出映射关系：
+
+- 单时刻输入：
+  - `observation.state`: `(B, state_dim)`
+  - `observation.path_signature`: `(B, signature_dim)`
+  - `observation.delta_signature`: `(B, signature_dim)`，仅在启用时存在
+  - `observation.anchor_image` 或等价 anchor 字段
+- prefix 序列输入：
+  - `observation.prefix_state`: `(B, T_prefix, state_dim)`
+  - `observation.prefix_path_signature`: `(B, T_prefix, signature_dim)`
+  - `observation.prefix_delta_signature`: `(B, T_prefix, signature_dim)`，仅在启用时存在
+  - `observation.prefix_mask`: `(B, T_prefix)`，`True` 表示有效
+  - `observation.prefix_images.<camera>` 或等价 prefix 图像字段：`(B, T_prefix, C, H, W)`
+
+若某个环境暂时不支持某一步，请显式报错并解释原因，不允许静默 fallback。
+
 - [ ] Prompt 1：实现 First-Frame Anchor 基线
 
 ```
-你在 `/home/jeong/zeno/corl` 仓库和conda环境`corl-py312'中工作。当前仓库已经实现了 `Vanilla ACT` 和 `ACT + State Signature`，其中 `ACT + State Signature` 对应现有 `streaming_act`。你的任务不是重构方法，而是在现有代码上最小侵入地新增 first-frame anchor 输入链路，得到两个可运行基线：
+你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。当前仓库已经实现了 `Vanilla ACT` 和 `ACT + State Signature`，其中 `ACT + State Signature` 对应现有 `streaming_act`。你的任务是在不重构主干的前提下，以最小侵入方式新增 first-frame anchor 输入链路，得到两个可运行基线：
 
 1. `ACT + First-Frame Anchor`
 2. `ACT + First-Frame Anchor + State Signature`
 
-先阅读这些文件再开始改代码：
+你需要先详细阅读并理解`main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`的`共享实现约定`部分，这是基础。
+
+开始前先阅读这些文件：
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/configuration_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/modeling_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/processor_act.py`
 - `main/scripts/train_policy.py`
 - `main/scripts/eval_policy.py`
-- `main/scripts/env/panda_route_env.py`
-- 如有必要，再看 `main/scripts/env/h_shape_env.py` 和 `main/scripts/env/braidedhub_env.py`
+- `main/scripts/env/braidedhub_env.py`
+- 如有必要，再看 `main/scripts/env/panda_route_env.py` 和 `main/scripts/env/h_shape_env.py`
+
+任务定义：
+anchor 的语义被严格定义为“episode reset 之后、执行第一步动作之前采集到的第一帧视觉观测”。它不是任意历史帧，也不是滑动窗口中的旧帧。
 
 实现要求：
-1. 新增一个可选 anchor 输入开关，默认关闭。关闭时，现有 `act` 和 `streaming_act` 的行为必须完全不变。
-2. anchor 的语义必须严格定义为“当前 episode 的第一帧图像”，而不是任意历史帧。
-3. 训练和评估必须语义一致。训练数据里若使用 anchor，就必须在 dataset export 时写入；评估时必须在 rollout 开始后缓存第一帧并持续复用。
-4. anchor 进入模型后要作为额外的 encoder memory token 注入，不能粗暴拼接到当前图像通道上。
-5. 优先先让 `panda_route` 跑通；`h_shape` 和 `braidedhub` 如果容易支持就一起补，否则至少不要被破坏。
-6. 配置命名要清晰，例如 `use_first_frame_anchor`、`anchor_hidden_dim` 之类；不要复用含糊名字。
-7. 所有新特性都必须通过 config 和 CLI 显式控制。
-8. 数据集 metadata 和 stats 要同步更新，确保 preprocessing 能正确归一化该特征。
-9. 不能删除或破坏现有 `observation.path_signature` 流程。
-10. 不要只给设计说明，直接完成代码修改。
+1. 新增显式开关，例如 `use_first_frame_anchor`，默认关闭。
+2. anchor 训练语义和评估语义必须完全一致：
+   - 训练时：dataset export 阶段把 first-frame anchor 写入数据集；
+   - 评估时：rollout 开始后缓存第一帧，并在整个 episode 中重复复用。
+3. anchor 最终必须作为额外的 encoder memory token 注入，而不是与当前图像做 channel concat。
+4. 优先使用“原始 anchor 图像 -> 共享 backbone 编码 -> 压缩成单个 anchor token”的方案。
+   - 若代码库限制导致必须存储离线 anchor embedding，也可以接受；
+   - 但必须在训练和评估都采用同一表示，并在最终回复中说明原因。
+5. 若使用原始 anchor 图像，必须明确 anchor token 的构造方式，例如：
+   - 共享当前图像 backbone；
+   - 再通过 pooling / projection 得到一个 `(B, dim_model)` anchor 表示；
+   - 最终注入为 `(B, 1, dim_model)` token。
+6. `act` 和 `streaming_act` 都要支持该特性；关闭时两条路径的行为必须和当前完全一致。
+7. 数据集 metadata、stats、feature schema、preprocessor 都要同步更新，确保该特征不会绕过归一化和类型检查。
+8. 不能删除或破坏现有 `observation.path_signature` 流程。
+9. 优先先让 `braidedhub` 跑通；其它环境如果短时间内不支持，要显式报错并说明原因。
+
+需要你在代码里明确写清的细节：
+- anchor 数据字段的名字
+- anchor 在 dataset 中存的是原图还是 embedding
+- anchor token 的 shape
+- anchor token 注入 encoder 的位置
+- rollout 中 anchor 的缓存生命周期
 
 边界条件：
 - 保持 checkpoint 向后兼容，老模型在不开 anchor 时仍可加载。
@@ -36,75 +85,100 @@
 - 不要把这一步扩展成 visual prefix memory。
 
 验收标准：
-1. `--policy act` 且不启用 anchor 时，训练和评估路径与当前行为一致。
-2. `--policy streaming_act` 且不启用 anchor 时，训练和评估路径与当前行为一致。
-3. 启用 anchor 时，模型能接收一个额外 anchor token，并顺利完成一次前向与一次 rollout。
-4. `panda_route` 至少提供一个最小 smoke test 命令，证明 train/eval 参数链路打通。
-5. 若某环境尚未支持 anchor，请明确写出原因，并确保代码不会静默错误。
+1. `--policy act` 且不启用 anchor 时，训练与评估路径和当前行为一致。
+2. `--policy streaming_act` 且不启用 anchor 时，训练与评估路径和当前行为一致。
+3. 启用 anchor 时，模型前向图中确实多出一个 anchor token，并能完成一次 batch forward 和一次 rollout。
+4. `braidedhub` 至少提供一个最小 smoke test，证明 train/eval 参数链路打通。
+5. 若某环境尚未支持 anchor，不允许静默忽略，必须给出明确错误信息。
 
-请直接改代码，并在最终回复中给出：
-- 修改了哪些文件
-- 新增了哪些配置/CLI 参数
-- 最小 smoke test 命令
-- 仍未覆盖的风险点
+请直接改代码。最终回复必须包含：
+- 修改文件列表
+- 新增配置项和 CLI
+- anchor 数据字段与 tensor shape
+- 最小训练 / 评估 smoke test 命令
+- 尚未覆盖的风险点
 ```
 
 - [ ] Prompt 2：补齐 prefix-sequence 训练基础设施
 
 ```
-你在 `/home/jeong/zeno/corl` 仓库和conda环境`corl-py312'中工作。当前 `streaming_act` 只实现了“当前时刻输入 + path signature token”，但讨论中的 SIPM-ACT 需要训练可在线更新的 prefix memory。现有单时刻训练样本不足以学习 `M_t = U(M_{t-1}, ...)`。你的任务是先补齐 sequence-aware 的 prefix 训练基础设施，但此步先不要真正实现 visual prefix memory。
+你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。当前 `streaming_act` 只实现了“当前时刻输入 + path signature token”，但讨论中的 SIPM-ACT 需要训练可在线更新的 prefix memory。现有单时刻训练样本不足以学习 `M_t = U(M_{t-1}, ...)`。你的任务是先补齐 sequence-aware 的 prefix 训练基础设施，但这一步先不要真正实现 visual prefix memory。
 
-先阅读这些文件再改代码：
+你需要先详细阅读并理解`main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`的`共享实现约定`部分，这是基础。
+
+开始前先阅读：
 - `main/scripts/train_policy.py`
 - `main/scripts/eval_policy.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/configuration_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/modeling_act.py`
 - `main/scripts/env/panda_route_env.py`
-- 如训练数据读取逻辑不清楚，再从仓库中继续追踪 dataset 构造/导出相关代码
+- 若训练数据读取逻辑不清楚，再继续追踪 dataset 构造、导出与 collate 代码
 
 任务目标：
-为后续 prefix memory 提供训练所需的 prefix-sequence 输入链路，使一个训练样本不再只包含当前帧，而是可以包含“从 episode 开始到当前时刻”的 prefix 子序列。
+为后续 prefix memory 提供训练所需的数据和接口，使一个训练样本不再只包含当前帧，而是可以包含“从 episode 开始到当前时刻”的 prefix 子序列。
 
-具体要求：
-1. 保留现有单时刻训练路径，作为默认行为；新 prefix 训练路径必须通过显式配置开启。
-2. 新路径下，每个训练样本至少要能返回：
+必须明确的数据契约：
+1. 保留现有单时刻训练路径作为默认行为；新的 prefix 路径必须由显式开关启用，例如 `use_prefix_sequence_training`。
+2. prefix 样本必须按时间从旧到新排列，并满足：
+   - 最后一个 valid prefix 元素对应当前时刻；
+   - 不包含任何未来帧；
+   - 支持右侧 padding 和显式 mask。
+3. 新路径下，每个训练样本至少返回：
    - prefix 图像序列
    - prefix 状态序列
    - prefix path_signature 序列
+   - prefix 有效位 mask 或 valid-length
    - 当前时刻对应的监督动作 chunk
-3. 新增长度控制参数，例如 `prefix_train_max_steps`、`prefix_frame_stride` 或等价参数，避免显存和时间爆炸。
-4. 在模型侧，为后续 prefix memory 预留输入接口，例如允许 forward 接收 prefix sequence tensors；但这一步先不要引入可学习记忆模块。
-5. 训练和推理语义要保持清晰：训练中的 prefix 表示“从 episode 起点到当前时刻”，不能偷看未来。
-6. 优先先在 `panda_route` 打通；如能顺带兼容其它环境更好，但不是硬要求。
-7. 新增的代码必须包含 shape 断言和错误信息，避免后续 memory 开发时难以排查。
-8. 不要在这一步顺手加入 anchor loss、memory loss 或辅助任务。
-9. 不要破坏现有 `Vanilla ACT` 和 `ACT + State Signature` 的训练可用性。
+4. 推荐新增如下字段或语义等价字段：
+   - `observation.prefix_state`
+   - `observation.prefix_path_signature`
+   - `observation.prefix_mask`
+   - `observation.prefix_images.<camera>`
+5. 新增长度预算控制参数，例如：
+   - `prefix_train_max_steps`
+   - `prefix_frame_stride`
+   - 如有必要，再加 `prefix_pad_value` 或等价参数
+6. 模型侧要为后续 prefix memory 预留 forward 接口，例如允许 forward 接收 prefix sequence tensors 和 mask；
+   - 但这一步先不要引入任何可学习 memory 模块；
+   - 也不要把完整 prefix 直接展平成最终的 encoder token 方案。
+7. 代码里必须包含 shape 断言和错误信息，至少覆盖：
+   - mask 与 prefix 长度不一致
+   - prefix 最后一个 valid 位置缺失
+   - 字段缺失
+   - `state_dim` / `signature_dim` / 图像 shape 不匹配
+
+环境范围：
+- 优先先在 `panda_route` 打通。
+- 若其它环境短期内不补齐，至少不要被破坏，并给出清晰报错。
 
 边界条件：
-- 这一步的本质是“数据和接口建设”，不是“方法主结果实现”。
-- 不要让 prefix 长度无限增长到不可控；必须有预算控制。
-- 不要把完整历史直接展平成巨量 transformer token 送进现有主干作为最终方案；这里只是训练基础设施。
+- 这一步的本质是“数据和接口建设”，不是“主方法结果实现”。
+- 不要加入 anchor loss、memory loss 或其它辅助任务。
+- 不要破坏现有 `Vanilla ACT` 和 `ACT + State Signature` 的训练可用性。
 
 验收标准：
 1. 默认配置下，当前训练行为不变。
-2. 开启 prefix-sequence 模式后，dataset -> preprocessor -> model forward 的 tensor shape 全链路打通。
+2. 开启 prefix-sequence 模式后，dataset -> preprocessor -> collate -> model forward 的 tensor shape 全链路打通。
 3. 至少有一个最小 smoke test，能在 `panda_route` 上跑通一个 batch 的前向或极短训练。
 4. 对 prefix 长度超限、缺失字段、shape 不匹配等情况有明确报错。
 
-请直接修改代码。最终回复必须包含：
-- 你如何区分“旧的单时刻模式”和“新的 prefix 模式”
+请直接改代码。最终回复必须包含：
+- 旧的单时刻模式与新的 prefix 模式如何区分
+- prefix 数据字段、shape、padding/mask 语义
 - 修改文件列表
-- 新增配置和 CLI
+- 新增配置项和 CLI
 - 一个最小 smoke test 命令
-- 你认为后续实现 visual prefix memory 时将复用哪些接口
+- 后续实现 visual prefix memory 时将复用哪些接口
 ```
 
 - [ ] Prompt 3：实现 Visual Prefix Memory Only 基线
 
 ```
-你在 `/home/jeong/zeno/corl` 仓库和conda环境`corl-py312'中工作。现在仓库应已具备 prefix-sequence 训练接口。你的任务是在此基础上实现一个最小可用的 `ACT + Visual Prefix Memory Only` 基线，用来回答“仅视觉前缀记忆本身是否有效”。这一步不要做 signature indexing，也不要加复杂辅助损失。
+你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。现在仓库应已具备 prefix-sequence 训练接口。你的任务是在此基础上实现一个最小可用的 `ACT + Visual Prefix Memory Only` 基线，用来回答“仅视觉前缀记忆本身是否有效”。这一步不要做 signature indexing，也不要加复杂辅助损失。
 
-先阅读这些文件：
+你需要先详细阅读并理解`main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`的`共享实现约定`部分，这是基础。
+
+开始前先阅读：
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/configuration_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/modeling_act.py`
 - `main/scripts/train_policy.py`
@@ -112,27 +186,43 @@
 - `main/scripts/env/panda_route_env.py`
 - 以及你上一阶段加入的 prefix-sequence 相关代码
 
-任务要求：
-1. 新增 `use_visual_prefix_memory` 开关，默认关闭。
-2. 先只实现最小版本：`B=1` 的单槽位 visual prefix memory。
-3. memory 更新器先采用 GRU 风格更新，不要一开始做多槽位 attention。
-4. memory 的输入只允许依赖 prefix 视觉信息和必要的当前状态信息；这一步不要使用 `g_t`，不要使用 `delta_signature`。
-5. 更新后的 memory 必须作为额外的 encoder memory token 注入主干，而不是作为 loss side feature。
-6. 推理时 memory 必须随 episode 在线更新，并在 `policy.reset()` 时清空。
-7. memory 长度预算必须固定，不能引入增长式 memory bank。
-8. 默认关闭时，当前 `streaming_act` 行为必须完全不变。
-9. 优先先支持 `panda_route`，其它环境至少不要被破坏。
-10. 这一步不要顺手加 anchor、不要顺手加辅助损失、不要顺手做 signature indexing。
+任务定义：
+实现一个 fixed-budget 的视觉前缀记忆模块，只依赖 prefix 视觉信息和必要的状态信息，对完整 prefix 做在线压缩，并把最终 memory 作为额外 token 注入 ACT encoder。
 
-实现建议：
-- memory token 维度与 `dim_model` 对齐
-- 更新器输入如果需要视觉特征，可复用 backbone 或已有 image embedding
-- 注意训练和评估的更新语义一致性
+实现要求：
+1. 新增显式开关，例如 `use_visual_prefix_memory`，默认关闭。
+2. 先只实现最小版本：`num_memory_slots=1`。
+   - 不要再用 `B=1` 这个写法，以免和 batch size 混淆。
+3. memory 状态的标准表示定义为：
+   - 内部更新态：`(batch, dim_model)` 或 `(batch, 1, dim_model)`；
+   - encoder 注入态：`(batch, 1, dim_model)`。
+4. memory 更新器先采用 GRU 风格更新，不要一开始做多槽位 attention。
+5. 更新器输入只允许依赖：
+   - prefix 视觉特征
+   - 必要的当前/对应时刻状态特征
+   - prefix mask
+   这一步不要使用 `g_t`，不要使用 `delta_signature`。
+6. 训练时，必须通过扫描 prefix 序列来重建 `m_t`：
+   - 从零初始化或明确声明的可学习初始态开始；
+   - 按时间顺序仅使用 valid prefix 步更新；
+   - 最终得到当前时刻的 memory token。
+7. 评估时，memory 必须随 episode 在线更新，并在 `policy.reset()` 时清空。
+8. 更新后的 memory 必须作为额外 encoder memory token 注入主干，而不是作为 loss-side feature。
+9. 默认关闭时，当前 `streaming_act` 行为必须完全不变。
+10. 优先先支持 `panda_route`，其它环境至少不要被破坏。
+11. 这一步不要顺手加 anchor、不要顺手加辅助损失、不要顺手做 signature indexing。
+
+需要你在代码里写清楚的细节：
+- memory 初始态是什么
+- 训练时 memory 如何从 prefix 序列扫描得到
+- 评估时 memory 在哪一步更新
+- `policy.reset()` 清空哪些缓存
+- memory token 注入 encoder 的位置
 
 边界条件：
-- 不要让模型依赖未来 prefix 帧
-- 不要在 config 里加入一堆暂时不用的复杂参数
-- 不要把 memory 存成整个 prefix 序列；memory 必须是固定维度状态
+- 不要让模型依赖未来 prefix 帧。
+- 不要在 config 里加入一堆暂时不用的复杂参数。
+- 不要把 memory 存成整个 prefix 序列；memory 必须是固定维度状态。
 
 验收标准：
 1. `use_visual_prefix_memory=false` 时行为与当前完全一致。
@@ -142,20 +232,22 @@
 5. 至少提供一个最小训练 smoke test 和一个最小评估 smoke test。
 
 请直接改代码。最终回复必须包含：
-- visual prefix memory 的状态表示长什么样
+- visual prefix memory 的状态表示
 - 更新发生在训练哪里、评估哪里
 - 修改文件列表
 - 新配置项
-- 最小 smoke test 命令
+- 最小训练 / 评估 smoke test 命令
 - 仍然简化了哪些地方
 ```
 
-- [ ] 实现完整 Signature-Indexed Prefix Memory ACT
+- [ ] Prompt 4：实现完整 Signature-Indexed Prefix Memory ACT
 
 ```
-你在 `/home/jeong/zeno/corl` 仓库和conda环境`corl-py312'中工作。当前目标是在已有 `ACT + State Signature` 和 `Visual Prefix Memory Only` 基础上，实现讨论稿中的完整 `Signature-Indexed Prefix Memory ACT`，即让 visual prefix memory 的更新显式依赖状态前缀摘要 `g_t`，以及可选的 `delta-signature`。这是主方法实现，不再是基线。
+你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。当前目标是在已有 `ACT + State Signature` 和 `Visual Prefix Memory Only` 基础上，实现讨论稿中的完整 `Signature-Indexed Prefix Memory ACT`，即让 visual prefix memory 的更新显式依赖状态前缀摘要 `g_t`，以及可选的 `delta_signature`。这是主方法实现，不再是基线。
 
-先阅读这些内容：
+你需要先详细阅读并理解`main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`的`共享实现约定`部分，这是基础。
+
+开始前先阅读：
 - `main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/configuration_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/modeling_act.py`
@@ -170,33 +262,44 @@
 3. signature-indexed visual prefix memory update
 4. prefix memory token 注入 encoder memory
 
-具体要求：
+实现要求：
 1. 新增 `observation.delta_signature` 的全链路支持：
    - dataset 导出
-   - metadata/info/stats
+   - metadata / info / stats
    - preprocessing
    - training input
    - online evaluation
-2. `delta_signature` 定义为 `g_t - g_{t-1}`，首时刻要有明确处理规则，不能留模糊行为。
+2. `delta_signature` 必须被严格定义为 `g_t - g_{t-1}`。
+   - 第一个 valid prefix 步的 `delta_signature` 必须明确约定，推荐使用全零向量；
+   - 训练和评估必须采用同一规则。
 3. visual prefix memory 更新器必须显式接收 `g_t`，并可选接收 `delta_signature`。
-4. 仍先支持 `B=1` 的单槽位 memory，但代码结构必须为未来 `B>1` 多槽位扩展留接口。
-5. 模型 encoder memory 中要清晰区分：
+4. 仍先支持 `num_memory_slots=1` 的单槽位 memory，但代码结构必须为未来 `num_memory_slots>1` 留清晰接口。
+5. 训练时必须通过扫描 prefix 序列显式构建当前 memory；评估时必须在线逐步更新，不能偷看未来。
+6. 模型 encoder memory 中要清晰区分并文档化以下 token：
    - 当前图像 token
    - 当前状态 token
    - signature token
    - optional delta-signature token
    - prefix memory token
    - optional latent token
-6. 所有新增特性都必须由 config 控制，默认关闭，保证老 checkpoint 和老训练脚本不坏。
-7. 优先先让 `panda_route` 跑通；如果 `h_shape` / `braidedhub` 也能平滑兼容更好。
-8. 不能把这一步退化成“只是多加一个 delta-signature token”，核心是 visual memory update 被 signature conditioning。
-9. 不要在这一步加入辅助损失，先把主结构跑通。
+7. 对新增 1D token 的位置编码或类型编码策略要明确：
+   - 可以用单独 learnable slot，也可以用零位置编码；
+   - 但必须在实现和最终回复中写清楚，不要含糊。
+8. 所有新增特性都必须由 config 控制，默认关闭，保证老 checkpoint 和老训练脚本不坏。
+9. 优先先让 `panda_route` 跑通；如果 `h_shape` / `braidedhub` 也能兼容更好。
+10. 不能把这一步退化成“只是多加一个 delta-signature token”，核心是 visual memory update 被 signature conditioning。
+11. 不要在这一步加入辅助损失，先把主结构跑通。
+
+建议你在代码中提供一个清晰的 memory updater 接口，语义类似：
+- 输入：`memory_prev, visual_t, state_t, signature_t, delta_signature_t, valid_t`
+- 输出：`memory_t`
+接口名不强制一致，但语义必须清楚。
 
 设计约束：
-- 这是 fixed-budget streaming prefix memory，不是增长式 bank
-- 这是 prefix compression，不是 sliding event retrieval
-- 不能破坏 ACT 的 chunk prediction 机制
-- 训练和推理必须共享一致的更新语义
+- 这是 fixed-budget streaming prefix memory，不是增长式 bank。
+- 这是 prefix compression，不是 sliding event retrieval。
+- 不能破坏 ACT 的 chunk prediction 机制。
+- 训练和推理必须共享一致的更新语义。
 
 验收标准：
 1. full model 的前向图中，确实存在 signature-conditioned memory update，而不是空挂 config。
@@ -205,21 +308,24 @@
 4. full model 至少有一个最小 batch forward smoke test 和一个最小 rollout smoke test。
 5. 如果某些环境暂未补齐，要显式说明，不允许静默 fallback。
 
-请直接改代码。最终回复中必须包含：
-- 你如何定义并使用 `delta_signature`
-- visual memory update 的输入和输出
+请直接改代码。最终回复必须包含：
+- `delta_signature` 的定义、首时刻处理规则和使用方式
+- visual memory update 的输入、输出和扫描时序
+- encoder token 组成
 - 修改文件列表
 - 新增配置项
-- 最小 smoke test 命令
-- 还未做的扩展点，例如多槽位 B>1
+- 最小训练 / 评估 smoke test 命令
+- 还未做的扩展点，例如多槽位 `num_memory_slots>1`
 ```
 
-- [ ] 加入辅助损失与消融开关
+- [ ] Prompt 5：加入辅助损失与消融开关
 
 ```
-你在 `/home/jeong/zeno/corl` 仓库和conda环境`corl-py312'中工作。当前 full SIPM-ACT 主结构应已稳定。你的任务是在不破坏原始 `recon + KL` 训练路径的前提下，新增可选辅助损失和对应消融开关，便于后续系统实验。默认情况下，这些辅助损失必须全部关闭。
+你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。当前 full SIPM-ACT 主结构应已稳定。你的任务是在不破坏原始 `recon + KL` 训练路径的前提下，新增可选辅助损失和对应消融开关，便于后续系统实验。默认情况下，这些辅助损失必须全部关闭。
 
-先阅读：
+你需要先详细阅读并理解`main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`的`共享实现约定`部分，这是基础。
+
+开始前先阅读：
 - `main/discussions/2026-03-18_02_signature_indexed_prefix_memory_ACT_discussion.md`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/modeling_act.py`
 - `main/policy/lerobot_policy_streaming_act/src/lerobot_policy_streaming_act/configuration_act.py`
@@ -228,31 +334,50 @@
 优先实现三项辅助损失，按这个优先级：
 1. `anchor reconstruction loss`
 2. `signature consistency loss`
-3. `past-action` 或 `past-token prediction loss`
+3. `past-action prediction loss`
 
-具体要求：
-1. 每项损失都必须有独立 config 开关和权重，例如 `use_anchor_loss`、`anchor_loss_weight`。
+注意：这里把原来含糊的 “past-action / past-token” 收紧为一个更容易复现的最小版本。若后续要做 past-token 变体，可以再单独扩展。
+
+实现要求：
+1. 每项损失都必须有独立 config 开关和权重，例如：
+   - `use_anchor_loss`
+   - `anchor_loss_weight`
+   - `use_signature_consistency_loss`
+   - `signature_consistency_loss_weight`
+   - `use_past_action_loss`
+   - `past_action_loss_weight`
 2. 默认关闭时，总训练行为必须与现有 full model 一致。
-3. 如果某项损失所需输入不存在，例如没启用 anchor、没启用 delta_signature，则该损失必须自动跳过，并在日志或代码路径中可解释。
+3. 缺失输入时必须自动跳过并可解释，例如：
+   - 没启用 anchor 时，`anchor_loss` 自动跳过；
+   - 没启用 visual prefix memory 时，所有依赖 memory 的辅助损失都自动跳过；
+   - 没启用 `delta_signature` 时，不允许静默读取不存在的字段。
 4. 训练日志必须分别记录：
    - `l1_loss`
    - `kld_loss`（若有）
-   - 每个辅助损失
+   - `anchor_loss`
+   - `signature_consistency_loss`
+   - `past_action_loss`
    - `total_loss`
-5. `anchor reconstruction loss` 的目标要有明确来源，例如第一帧 anchor embedding 或压缩后的 anchor target，不能含糊。
-6. `signature consistency loss` 要明确是让 visual memory 预测 `g_t` 还是 `delta_signature`，并在实现中写清楚。
-7. `past-action/past-token` 任务如果实现成本高，可以先做最小版本，但不要影响主路径稳定性。
-8. 提供便于 ablation 的 CLI/config 组合，支持后续做：
+5. `anchor reconstruction loss` 的目标必须明确。推荐目标：
+   - 用一个小头从最终 visual memory 预测 anchor token / anchor embedding；
+   - target 必须来源于与主路径一致的 anchor 表示，而不是另起一套模糊目标。
+6. `signature consistency loss` 必须明确默认预测目标。推荐默认：
+   - 从最终 visual memory 预测当前 `g_t`；
+   - 若要支持预测 `delta_signature`，必须通过显式配置切换。
+7. `past_action_loss` 先做最小版本：
+   - 预测上一时刻单步动作 `a_{t-1}` 或语义等价的最近已执行动作；
+   - 不要为了这一步重构复杂 token-level 自监督接口。
+8. 所有辅助损失的实现都要尽量低侵入，不要因为加损失而重构整套模型输入输出。
+9. 提供便于 ablation 的 CLI / config 组合，支持后续做：
    - full model w/o anchor loss
    - full model w/o sig consistency
-   - full model w/o past prediction
-9. 不要引入任何需要人工事件标注的监督。
-10. 不要因为加辅助损失而重构整个模型接口，优先低侵入实现。
+   - full model w/o past action
+10. 不要引入任何需要人工事件标注的监督。
 
 边界条件：
-- 主方法核心仍然是动作块重建；辅助损失只能辅助，不能主导接口设计
-- 不要默认启用所有 loss
-- 不要破坏已有 checkpoint 的加载
+- 主方法核心仍然是动作块重建；辅助损失只能辅助，不能主导接口设计。
+- 不要默认启用所有 loss。
+- 不要破坏已有 checkpoint 的加载。
 
 验收标准：
 1. 所有辅助损失默认关闭时，行为与当前 full model 一致。
@@ -260,13 +385,13 @@
 3. 对缺失输入的情况有明确保护逻辑，不会产生难懂的 shape 错误。
 4. 至少提供一个最小 ablation 训练命令示例。
 
-请直接修改代码。最终回复中必须包含：
+请直接改代码。最终回复必须包含：
 - 每项辅助损失的数学目标在实现里如何落地
 - 修改文件列表
 - 新增配置和 CLI
 - 日志中新增的字段
 - 最小 ablation 命令
-- 你认为哪项辅助损失最值得先做真实实验
+- 你认为哪项辅助损失最值得先做真实实验，以及原因
 ```
 
 # Signature-Indexed Prefix Memory ACT

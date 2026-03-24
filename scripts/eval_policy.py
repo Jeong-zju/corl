@@ -21,10 +21,24 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def patch_lerobot_processor_factory(streaming_config_cls) -> None:
+def patch_lerobot_processor_factory(act_config_cls) -> None:
     import lerobot.policies.factory as policy_factory
 
-    policy_factory.ACTConfig = streaming_config_cls
+    policy_factory.ACTConfig = act_config_cls
+
+
+def validate_first_frame_anchor_support(
+    *,
+    env_name: str,
+    use_first_frame_anchor: bool,
+) -> None:
+    if not use_first_frame_anchor:
+        return
+    if env_name != "braidedhub":
+        raise NotImplementedError(
+            "First-frame anchor evaluation is currently implemented only for `braidedhub`. "
+            f"Got env={env_name!r}."
+        )
 
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
@@ -187,8 +201,7 @@ def main(argv: list[str] | None = None) -> None:
     import torch
 
     repo_root = Path(__file__).resolve().parents[2]
-    if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
+    ensure_streaming_act_importable(repo_root)
 
     try:
         from lerobot.policies.factory import make_pre_post_processors
@@ -199,16 +212,11 @@ def main(argv: list[str] | None = None) -> None:
             "your platform."
         ) from exc
 
-    if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_act import StreamingACTConfig
-        from lerobot_policy_streaming_act.modeling_act import StreamingACTPolicy
+    from lerobot_policy_streaming_act.configuration_act import ACTConfig, StreamingACTConfig
+    from lerobot_policy_streaming_act.modeling_act import ACTPolicy, StreamingACTPolicy
 
-        patch_lerobot_processor_factory(streaming_config_cls=StreamingACTConfig)
-        policy_cls = StreamingACTPolicy
-    else:
-        from lerobot.policies.act.modeling_act import ACTPolicy
-
-        policy_cls = ACTPolicy
+    patch_lerobot_processor_factory(act_config_cls=ACTConfig)
+    policy_cls = StreamingACTPolicy if args.policy == "streaming_act" else ACTPolicy
 
     policy_dir = resolve_eval_policy_path(
         policy_path=args.policy_path,
@@ -222,6 +230,10 @@ def main(argv: list[str] | None = None) -> None:
     policy = policy_cls.from_pretrained(policy_dir)
     cfg = policy.config
     cfg.device = args.device
+    validate_first_frame_anchor_support(
+        env_name=args.env,
+        use_first_frame_anchor=bool(getattr(cfg, "use_first_frame_anchor", False)),
+    )
     if args.n_action_steps is not None:
         cfg.n_action_steps = int(args.n_action_steps)
         if cfg.n_action_steps <= 0:
