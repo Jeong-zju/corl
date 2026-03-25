@@ -31,7 +31,7 @@
 
 若某个环境暂时不支持某一步，请显式报错并解释原因，不允许静默 fallback。
 
-- [ ] Prompt 1：实现 First-Frame Anchor 基线
+- [x] Prompt 1：实现 First-Frame Anchor 基线
 
 ```
 你在 `/home/jeong/zeno/corl` 仓库和 conda 环境 `corl-py312` 中工作。当前仓库已经实现了 `Vanilla ACT` 和 `ACT + State Signature`，其中 `ACT + State Signature` 对应现有 `streaming_act`。你的任务是在不重构主干的前提下，以最小侵入方式新增 first-frame anchor 输入链路，得到两个可运行基线：
