@@ -15,7 +15,7 @@ train:
   eval_freq: -1
   chunk_size: 5
   n_action_steps: 5
-  use_first_frame_anchor: false
+  use_first_frame_anchor: true
   use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
