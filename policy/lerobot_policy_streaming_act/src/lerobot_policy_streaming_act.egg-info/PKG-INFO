@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: lerobot_policy_streaming_act
+Version: 0.1.0
+Summary: Streaming ACT policy package for LeRobot.
+Requires-Python: >=3.12
+Requires-Dist: lerobot

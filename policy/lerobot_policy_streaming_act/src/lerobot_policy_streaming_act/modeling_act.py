@@ -34,6 +34,11 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .configuration_act import ACTConfig, FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
+from .prefix_sequence import (
+    PREFIX_MASK_KEY,
+    PREFIX_PATH_SIGNATURE_KEY,
+    PREFIX_STATE_KEY,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
@@ -95,6 +100,9 @@ class StreamingACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._visual_prefix_memory_state = None
+        self._visual_prefix_memory_update_count = 0
+        self._visual_prefix_memory_last_state_norm = 0.0
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -130,8 +138,34 @@ class StreamingACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.visual_observation_features]
 
-        actions = self.model(batch)[0]
+        if self.config.use_visual_prefix_memory:
+            memory_token, memory_state = self.model.compute_online_visual_prefix_memory_token(
+                batch,
+                previous_state=self._visual_prefix_memory_state,
+            )
+            self._visual_prefix_memory_state = memory_state.detach()
+            self._visual_prefix_memory_update_count += 1
+            self._visual_prefix_memory_last_state_norm = float(
+                self._visual_prefix_memory_state.norm(dim=-1).mean().detach().cpu().item()
+            )
+            actions = self.model(
+                batch,
+                visual_prefix_memory_token=memory_token,
+                skip_prefix_sequence_validation=True,
+            )[0]
+        else:
+            actions = self.model(batch)[0]
         return actions
+
+    def get_visual_prefix_memory_debug_stats(self) -> dict[str, float | int | bool]:
+        state = self._visual_prefix_memory_state
+        return {
+            "enabled": bool(self.config.use_visual_prefix_memory),
+            "initialized": state is not None,
+            "num_slots": int(self.config.num_memory_slots),
+            "update_count": int(self._visual_prefix_memory_update_count),
+            "state_norm": float(self._visual_prefix_memory_last_state_norm),
+        }
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -300,6 +334,7 @@ class StreamingACT(nn.Module):
         self.config = config
         self.use_path_signature = config.use_path_signature
         self.use_first_frame_anchor = config.use_first_frame_anchor
+        self.use_visual_prefix_memory = config.use_visual_prefix_memory
 
         if self.use_path_signature:
             assert config.signature_dim > 0, (
@@ -374,6 +409,19 @@ class StreamingACT(nn.Module):
         if self.use_first_frame_anchor:
             self.anchor_token_pool = nn.AdaptiveAvgPool2d((1, 1))
             self.anchor_token_proj = nn.Linear(config.dim_model, config.dim_model)
+        if self.use_visual_prefix_memory:
+            self.visual_prefix_memory_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.visual_prefix_memory_update = nn.GRUCell(
+                input_size=config.dim_model * 2,
+                hidden_size=config.dim_model,
+            )
+            self.visual_prefix_memory_extra_updates = nn.ModuleList(
+                nn.GRUCell(
+                    input_size=config.dim_model * 2,
+                    hidden_size=config.dim_model,
+                )
+                for _ in range(config.num_memory_slots - 1)
+            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -399,7 +447,339 @@ class StreamingACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def _validate_prefix_sequence_inputs(self, batch: dict[str, Tensor], batch_size: int) -> None:
+        if not self.config.use_prefix_sequence_training:
+            return
+
+        prefix_mask = batch.get(PREFIX_MASK_KEY)
+        assert prefix_mask is not None, (
+            f"`{PREFIX_MASK_KEY}` is required when `use_prefix_sequence_training=True`."
+        )
+        assert prefix_mask.ndim == 2, (
+            f"`{PREFIX_MASK_KEY}` must have shape (batch_size, T_prefix). "
+            f"Got ndim={prefix_mask.ndim}, shape={tuple(prefix_mask.shape)}."
+        )
+        assert prefix_mask.shape[0] == batch_size, (
+            f"Batch mismatch for `{PREFIX_MASK_KEY}`: expected {batch_size}, "
+            f"got {prefix_mask.shape[0]}."
+        )
+        assert prefix_mask.shape[1] == self.config.prefix_train_max_steps, (
+            f"`{PREFIX_MASK_KEY}` second dim must equal "
+            f"`prefix_train_max_steps={self.config.prefix_train_max_steps}`. "
+            f"Got {prefix_mask.shape[1]}."
+        )
+        prefix_mask = prefix_mask.to(dtype=torch.bool)
+        valid_lengths = prefix_mask.sum(dim=1)
+        assert torch.all(valid_lengths > 0), (
+            f"Every prefix row must contain at least one valid step in `{PREFIX_MASK_KEY}`."
+        )
+        monotonic_mask = prefix_mask[:, 1:] <= prefix_mask[:, :-1]
+        assert torch.all(monotonic_mask), (
+            f"`{PREFIX_MASK_KEY}` must use left-aligned valid steps with right padding only."
+        )
+        last_valid_positions = valid_lengths - 1
+        gathered_last_valid = prefix_mask.gather(1, last_valid_positions.unsqueeze(1)).squeeze(1)
+        assert torch.all(gathered_last_valid), (
+            f"`{PREFIX_MASK_KEY}` is missing the last valid prefix element for at least one batch row."
+        )
+
+        prefix_state = batch.get(PREFIX_STATE_KEY)
+        assert prefix_state is not None, (
+            f"`{PREFIX_STATE_KEY}` is required when `use_prefix_sequence_training=True`."
+        )
+        assert prefix_state.ndim == 3, (
+            f"`{PREFIX_STATE_KEY}` must have shape (batch_size, T_prefix, state_dim). "
+            f"Got ndim={prefix_state.ndim}, shape={tuple(prefix_state.shape)}."
+        )
+        assert prefix_state.shape[0] == batch_size, (
+            f"Batch mismatch for `{PREFIX_STATE_KEY}`: expected {batch_size}, "
+            f"got {prefix_state.shape[0]}."
+        )
+        assert prefix_state.shape[1] == prefix_mask.shape[1], (
+            f"`{PREFIX_STATE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+            f"Got state_time={prefix_state.shape[1]}, mask_time={prefix_mask.shape[1]}."
+        )
+        assert prefix_state.shape[2] == self.config.robot_state_feature.shape[0], (
+            f"`{PREFIX_STATE_KEY}` state dim must equal "
+            f"`observation.state` dim {self.config.robot_state_feature.shape[0]}. "
+            f"Got {prefix_state.shape[2]}."
+        )
+
+        if self.use_path_signature:
+            prefix_signature = batch.get(PREFIX_PATH_SIGNATURE_KEY)
+            assert prefix_signature is not None, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required when "
+                "`use_prefix_sequence_training=True`."
+            )
+            assert prefix_signature.ndim == 3, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` must have shape "
+                f"(batch_size, T_prefix, signature_dim). "
+                f"Got ndim={prefix_signature.ndim}, shape={tuple(prefix_signature.shape)}."
+            )
+            assert prefix_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{PREFIX_PATH_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {prefix_signature.shape[0]}."
+            )
+            assert prefix_signature.shape[1] == prefix_mask.shape[1], (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got sig_time={prefix_signature.shape[1]}, mask_time={prefix_mask.shape[1]}."
+            )
+            assert prefix_signature.shape[2] == self.config.signature_dim, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` signature dim must equal "
+                f"`signature_dim={self.config.signature_dim}`. Got {prefix_signature.shape[2]}."
+            )
+
+        for prefix_image_key, prefix_image_feature in self.config.prefix_image_features.items():
+            assert prefix_image_key in batch, (
+                f"`{prefix_image_key}` is required when `use_prefix_sequence_training=True`."
+            )
+            prefix_images = batch[prefix_image_key]
+            assert prefix_images.ndim == 5, (
+                f"`{prefix_image_key}` must have shape (batch_size, T_prefix, C, H, W). "
+                f"Got ndim={prefix_images.ndim}, shape={tuple(prefix_images.shape)}."
+            )
+            assert prefix_images.shape[0] == batch_size, (
+                f"Batch mismatch for `{prefix_image_key}`: expected {batch_size}, "
+                f"got {prefix_images.shape[0]}."
+            )
+            assert prefix_images.shape[1] == prefix_mask.shape[1], (
+                f"`{prefix_image_key}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got image_time={prefix_images.shape[1]}, mask_time={prefix_mask.shape[1]}."
+            )
+            expected_image_shape = tuple(prefix_image_feature.shape[1:])
+            assert tuple(prefix_images.shape[2:]) == expected_image_shape, (
+                f"`{prefix_image_key}` trailing dims must equal {expected_image_shape}. "
+                f"Got {tuple(prefix_images.shape[2:])}."
+            )
+
+    def _build_zero_visual_prefix_memory_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return torch.zeros(
+            (batch_size, self.config.num_memory_slots, self.config.dim_model),
+            device=device,
+            dtype=dtype,
+        )
+
+    def _normalize_visual_prefix_memory_state(
+        self,
+        hidden: Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        context: str,
+    ) -> Tensor:
+        expected_shape = (batch_size, self.config.num_memory_slots, self.config.dim_model)
+        if hidden.ndim == 2:
+            if self.config.num_memory_slots != 1:
+                raise ValueError(
+                    f"{context} expects hidden state shape {expected_shape}. "
+                    f"Got legacy single-slot shape {tuple(hidden.shape)}."
+                )
+            if hidden.shape != (batch_size, self.config.dim_model):
+                raise ValueError(
+                    f"{context} shape mismatch. Expected {(batch_size, self.config.dim_model)}, "
+                    f"got {tuple(hidden.shape)}."
+                )
+            hidden = hidden.unsqueeze(1)
+        elif hidden.ndim != 3:
+            raise ValueError(
+                f"{context} must have shape {expected_shape}. Got {tuple(hidden.shape)}."
+            )
+        if tuple(hidden.shape) != expected_shape:
+            raise ValueError(
+                f"{context} shape mismatch. Expected {expected_shape}, got {tuple(hidden.shape)}."
+            )
+        return hidden.to(device=device, dtype=dtype)
+
+    def _iter_visual_prefix_memory_updates(self) -> list[nn.GRUCell]:
+        updates = [self.visual_prefix_memory_update, *self.visual_prefix_memory_extra_updates]
+        assert len(updates) == self.config.num_memory_slots, (
+            "Number of visual prefix memory updaters must match `num_memory_slots`. "
+            f"Got updaters={len(updates)} vs slots={self.config.num_memory_slots}."
+        )
+        return updates
+
+    def _pool_visual_features_for_memory(self, features: Tensor) -> Tensor:
+        pooled = self.visual_prefix_memory_pool(features).flatten(1)
+        assert pooled.ndim == 2 and pooled.shape[1] == self.config.dim_model, (
+            "Visual prefix memory pooled features must have shape "
+            f"(batch_like, {self.config.dim_model}). Got {tuple(pooled.shape)}."
+        )
+        return pooled
+
+    def _encode_images_for_visual_prefix_memory(self, images: Tensor) -> Tensor:
+        if images.ndim == 4:
+            flat_images = images
+            batch_size = images.shape[0]
+            time_steps = None
+        elif images.ndim == 5:
+            batch_size, time_steps = images.shape[:2]
+            flat_images = images.reshape(batch_size * time_steps, *images.shape[2:])
+        else:
+            raise ValueError(
+                "Visual prefix memory images must have shape (B, C, H, W) or "
+                f"(B, T, C, H, W). Got {tuple(images.shape)}."
+            )
+
+        features = self.backbone(flat_images)["feature_map"]
+        features = self.encoder_img_feat_input_proj(features)
+        pooled = self._pool_visual_features_for_memory(features)
+        if time_steps is None:
+            return pooled
+        return pooled.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _reduce_camera_embeddings_for_visual_prefix_memory(
+        self,
+        camera_embeddings: list[Tensor],
+    ) -> Tensor:
+        if not camera_embeddings:
+            raise ValueError("Visual prefix memory requires at least one camera embedding.")
+        if len(camera_embeddings) == 1:
+            return camera_embeddings[0]
+        return torch.stack(camera_embeddings, dim=0).mean(dim=0)
+
+    def _project_prefix_states_for_visual_prefix_memory(self, prefix_state: Tensor) -> Tensor:
+        batch_size, time_steps, state_dim = prefix_state.shape
+        flat_prefix_state = prefix_state.reshape(batch_size * time_steps, state_dim)
+        projected = self.encoder_robot_state_input_proj(flat_prefix_state)
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _scan_visual_prefix_memory(
+        self,
+        *,
+        visual_embeddings: Tensor,
+        state_embeddings: Tensor,
+        prefix_mask: Tensor,
+        initial_state: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, time_steps, hidden_dim = visual_embeddings.shape
+        assert state_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+            "Visual prefix memory state embeddings must match visual embeddings. "
+            f"Got visual={tuple(visual_embeddings.shape)} vs "
+            f"state={tuple(state_embeddings.shape)}."
+        )
+        assert prefix_mask.shape == (batch_size, time_steps), (
+            "Visual prefix memory mask must match the prefix sequence shape. "
+            f"Got mask={tuple(prefix_mask.shape)} vs sequence={(batch_size, time_steps)}."
+        )
+
+        if initial_state is None:
+            hidden = self._build_zero_visual_prefix_memory_state(
+                batch_size=batch_size,
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
+            )
+        else:
+            hidden = self._normalize_visual_prefix_memory_state(
+                initial_state,
+                batch_size=batch_size,
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
+                context="Visual prefix memory initial state",
+            )
+
+        prefix_mask = prefix_mask.to(dtype=torch.bool, device=visual_embeddings.device)
+        slot_updates = self._iter_visual_prefix_memory_updates()
+        for step_idx in range(time_steps):
+            step_input = torch.cat(
+                [visual_embeddings[:, step_idx], state_embeddings[:, step_idx]],
+                dim=-1,
+            )
+            updated_hidden = torch.stack(
+                [
+                    slot_update(step_input, hidden[:, slot_idx, :])
+                    for slot_idx, slot_update in enumerate(slot_updates)
+                ],
+                dim=1,
+            )
+            mask_t = prefix_mask[:, step_idx].view(batch_size, 1, 1)
+            hidden = torch.where(mask_t, updated_hidden, hidden)
+        return hidden
+
+    def _compute_visual_prefix_memory_token_from_prefix_sequence(
+        self,
+        batch: dict[str, Tensor],
+    ) -> Tensor:
+        assert PREFIX_STATE_KEY in batch, (
+            f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
+        )
+        assert PREFIX_MASK_KEY in batch, (
+            f"`{PREFIX_MASK_KEY}` is required to reconstruct visual prefix memory during training."
+        )
+        camera_embeddings = [
+            self._encode_images_for_visual_prefix_memory(batch[prefix_image_key])
+            for prefix_image_key in self.config.prefix_image_features
+        ]
+        visual_embeddings = self._reduce_camera_embeddings_for_visual_prefix_memory(camera_embeddings)
+        state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
+        memory_state = self._scan_visual_prefix_memory(
+            visual_embeddings=visual_embeddings,
+            state_embeddings=state_embeddings,
+            prefix_mask=batch[PREFIX_MASK_KEY],
+        )
+        return memory_state
+
+    def compute_online_visual_prefix_memory_token(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        previous_state: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.use_visual_prefix_memory:
+            raise RuntimeError(
+                "`compute_online_visual_prefix_memory_token` requires "
+                "`use_visual_prefix_memory=True`."
+            )
+        assert OBS_IMAGES in batch, (
+            "Online visual prefix memory update requires current-step images in `batch[OBS_IMAGES]`."
+        )
+        assert OBS_STATE in batch, (
+            "Online visual prefix memory update requires `observation.state` in the batch."
+        )
+
+        camera_embeddings = [
+            self._encode_images_for_visual_prefix_memory(img) for img in batch[OBS_IMAGES]
+        ]
+        visual_embedding = self._reduce_camera_embeddings_for_visual_prefix_memory(camera_embeddings)
+        state_embedding = self.encoder_robot_state_input_proj(batch[OBS_STATE])
+        if previous_state is None:
+            hidden = self._build_zero_visual_prefix_memory_state(
+                batch_size=visual_embedding.shape[0],
+                device=visual_embedding.device,
+                dtype=visual_embedding.dtype,
+            )
+        else:
+            hidden = self._normalize_visual_prefix_memory_state(
+                previous_state,
+                batch_size=visual_embedding.shape[0],
+                device=visual_embedding.device,
+                dtype=visual_embedding.dtype,
+                context="Cached visual prefix memory state",
+            )
+
+        step_input = torch.cat([visual_embedding, state_embedding], dim=-1)
+        next_state = torch.stack(
+            [
+                slot_update(step_input, hidden[:, slot_idx, :])
+                for slot_idx, slot_update in enumerate(self._iter_visual_prefix_memory_updates())
+            ],
+            dim=1,
+        )
+        return next_state, next_state
+
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        visual_prefix_memory_token: Tensor | None = None,
+        skip_prefix_sequence_validation: bool = False,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -408,6 +788,9 @@ class StreamingACT(nn.Module):
 
             [image_features]: (B, n_cameras, C, H, W) batch of current-step images.
             [FIRST_FRAME_ANCHOR_KEY] (optional): (B, C, H, W) first-frame anchor image.
+            [PREFIX_STATE_KEY] (optional): (B, T_prefix, state_dim) prefix state sequence.
+            [PREFIX_PATH_SIGNATURE_KEY] (optional): (B, T_prefix, signature_dim) prefix signature sequence.
+            [PREFIX_MASK_KEY] (optional): (B, T_prefix) prefix valid mask.
                 AND/OR
             [env_state_feature]: (B, env_dim) batch of environment states.
 
@@ -425,6 +808,8 @@ class StreamingACT(nn.Module):
             )
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        if not skip_prefix_sequence_validation:
+            self._validate_prefix_sequence_inputs(batch, batch_size)
 
         if self.use_path_signature:
             path_signature_key = "observation.path_signature"
@@ -475,6 +860,33 @@ class StreamingACT(nn.Module):
                 f"Got {tuple(anchor_embed.shape)}."
             )
             anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
+
+        visual_prefix_memory_embed = None
+        if self.use_visual_prefix_memory:
+            if visual_prefix_memory_token is None:
+                visual_prefix_memory_embed = self._compute_visual_prefix_memory_token_from_prefix_sequence(
+                    batch
+                )
+            else:
+                if visual_prefix_memory_token.ndim != 3:
+                    raise ValueError(
+                        "Visual prefix memory token override must have shape "
+                        f"(batch_size, num_memory_slots, dim_model). Got {tuple(visual_prefix_memory_token.shape)}."
+                    )
+                expected_shape = (
+                    batch_size,
+                    self.config.num_memory_slots,
+                    self.config.dim_model,
+                )
+                if tuple(visual_prefix_memory_token.shape) != expected_shape:
+                    raise ValueError(
+                        "Visual prefix memory token override shape mismatch. "
+                        f"Expected {expected_shape}, got {tuple(visual_prefix_memory_token.shape)}."
+                    )
+                visual_prefix_memory_embed = visual_prefix_memory_token.to(
+                    device=batch[OBS_STATE].device,
+                    dtype=self.encoder_latent_input_proj.weight.dtype,
+                )
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -589,6 +1001,19 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(signature_token)
             extra_memory_pos_embed.append(signature_pos_embed)
+        if self.use_visual_prefix_memory:
+            assert visual_prefix_memory_embed is not None
+            visual_prefix_memory_token = visual_prefix_memory_embed.transpose(0, 1).to(
+                device=encoder_out.device,
+                dtype=encoder_out.dtype,
+            )
+            visual_prefix_memory_pos_embed = torch.zeros(
+                (self.config.num_memory_slots, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            extra_memory_tokens.append(visual_prefix_memory_token)
+            extra_memory_pos_embed.append(visual_prefix_memory_pos_embed)
 
         if extra_memory_tokens:
             # Extra non-image context tokens are injected into encoder memory before decoder cross-attention.

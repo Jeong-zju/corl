@@ -19,6 +19,13 @@ import lerobot.policies  # noqa: F401
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from .prefix_sequence import (
+    PREFIX_IMAGES_PREFIX,
+    PREFIX_MASK_KEY,
+    PREFIX_PATH_SIGNATURE_KEY,
+    PREFIX_STATE_KEY,
+    is_prefix_image_key,
+)
 
 FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 
@@ -90,6 +97,18 @@ class ACTConfig(PreTrainedConfig):
         signature_dropout: Dropout used in the signature projection MLP for regularization.
         use_first_frame_anchor: Whether to consume an episode-constant first-frame anchor image
             from `observation.anchor_image` and inject it as one extra encoder memory token.
+        use_prefix_sequence_training: Whether to expose episode-prefix sequence tensors
+            alongside the current-step observation for future streaming prefix memory updates.
+        prefix_train_max_steps: Fixed prefix length budget used by the prefix-sequence
+            training interface. Prefix tensors are right padded to this length.
+        prefix_frame_stride: Subsampling stride used when extracting the episode prefix.
+            The current step is always kept as the last valid prefix element.
+        prefix_pad_value: Numeric padding value used for prefix state/signature tensors.
+        use_visual_prefix_memory: Whether to enable a fixed-budget visual prefix memory
+            branch that scans the prefix sequence and injects extra encoder memory tokens.
+        num_memory_slots: Number of visual prefix memory slots injected into the encoder.
+            Each slot keeps an independent GRU-style memory state. The minimal
+            experiments in this repository use 1 or 2 slots.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
@@ -136,6 +155,12 @@ class ACTConfig(PreTrainedConfig):
     # Extra conditioning inputs.
     use_first_frame_anchor: bool = False
     use_path_signature: bool = False
+    use_prefix_sequence_training: bool = False
+    prefix_train_max_steps: int = 32
+    prefix_frame_stride: int = 1
+    prefix_pad_value: float = 0.0
+    use_visual_prefix_memory: bool = False
+    num_memory_slots: int = 1
 
     # Streaming path-signature history module.
     history_length: int = 10
@@ -196,6 +221,29 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
                 )
+        if self.use_prefix_sequence_training:
+            if self.prefix_train_max_steps <= 0:
+                raise ValueError(
+                    "`prefix_train_max_steps` must be > 0 when "
+                    f"`use_prefix_sequence_training=True`. Got {self.prefix_train_max_steps}."
+                )
+            if self.prefix_frame_stride <= 0:
+                raise ValueError(
+                    "`prefix_frame_stride` must be > 0 when "
+                    f"`use_prefix_sequence_training=True`. Got {self.prefix_frame_stride}."
+                )
+        if self.use_visual_prefix_memory:
+            if not self.use_prefix_sequence_training:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires "
+                    "`use_prefix_sequence_training=True` so the training path can "
+                    "reconstruct memory from prefix sequences."
+                )
+            if self.num_memory_slots <= 0:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires "
+                    f"`num_memory_slots > 0`. Got {self.num_memory_slots}."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -228,6 +276,108 @@ class ACTConfig(PreTrainedConfig):
                     f"Got anchor={tuple(anchor_feature.shape)} vs "
                     f"observation={tuple(first_visual_feature.shape)}."
                 )
+        if self.use_prefix_sequence_training:
+            if not self.robot_state_feature:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires a current "
+                    "`observation.state` feature."
+                )
+            prefix_state_feature = self.prefix_state_feature
+            if prefix_state_feature is None:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires input feature "
+                    f"`{PREFIX_STATE_KEY}`."
+                )
+            expected_prefix_state_shape = (
+                self.prefix_train_max_steps,
+                self.robot_state_feature.shape[0],
+            )
+            if tuple(prefix_state_feature.shape) != expected_prefix_state_shape:
+                raise ValueError(
+                    "Prefix state feature shape mismatch. "
+                    f"Expected {expected_prefix_state_shape}, got {tuple(prefix_state_feature.shape)}."
+                )
+
+            prefix_mask_feature = self.prefix_mask_feature
+            if prefix_mask_feature is None:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires input feature "
+                    f"`{PREFIX_MASK_KEY}`."
+                )
+            if tuple(prefix_mask_feature.shape) != (self.prefix_train_max_steps,):
+                raise ValueError(
+                    "Prefix mask feature shape mismatch. "
+                    f"Expected {(self.prefix_train_max_steps,)}, got {tuple(prefix_mask_feature.shape)}."
+                )
+
+            if not self.prefix_image_features:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires at least one "
+                    "`observation.prefix_images.*` feature."
+                )
+
+            if len(self.prefix_image_features) != len(self.visual_observation_features):
+                raise ValueError(
+                    "Prefix image feature count must match the number of regular observation cameras. "
+                    f"Got prefix={len(self.prefix_image_features)} vs "
+                    f"current={len(self.visual_observation_features)}."
+                )
+
+            current_image_shapes = {}
+            for key, feature in self.visual_observation_features.items():
+                if key.startswith("observation.images."):
+                    suffix = key.removeprefix("observation.images.")
+                elif key == "observation.image":
+                    suffix = "main"
+                else:
+                    raise ValueError(
+                        "Unsupported current image feature name for prefix-sequence mode. "
+                        f"Got `{key}`."
+                    )
+                current_image_shapes[suffix] = tuple(feature.shape)
+            for prefix_key, prefix_feature in self.prefix_image_features.items():
+                suffix = prefix_key.removeprefix(PREFIX_IMAGES_PREFIX)
+                current_shape = current_image_shapes.get(suffix)
+                if current_shape is None:
+                    raise ValueError(
+                        "Prefix image feature does not map to any regular observation image. "
+                        f"Got prefix key `{prefix_key}`."
+                    )
+                expected_prefix_shape = (self.prefix_train_max_steps, *current_shape)
+                if tuple(prefix_feature.shape) != expected_prefix_shape:
+                    raise ValueError(
+                        "Prefix image feature shape mismatch. "
+                        f"Expected {expected_prefix_shape} for `{prefix_key}`, "
+                        f"got {tuple(prefix_feature.shape)}."
+                    )
+
+            if self.use_path_signature:
+                prefix_signature_feature = self.prefix_path_signature_feature
+                if prefix_signature_feature is None:
+                    raise ValueError(
+                        "`use_prefix_sequence_training=True` requires input feature "
+                        f"`{PREFIX_PATH_SIGNATURE_KEY}` when `use_path_signature=True`."
+                    )
+                expected_prefix_signature_shape = (
+                    self.prefix_train_max_steps,
+                    self.signature_dim,
+                )
+                if tuple(prefix_signature_feature.shape) != expected_prefix_signature_shape:
+                    raise ValueError(
+                        "Prefix path-signature feature shape mismatch. "
+                        f"Expected {expected_prefix_signature_shape}, got "
+                        f"{tuple(prefix_signature_feature.shape)}."
+                    )
+        if self.use_visual_prefix_memory:
+            if not self.visual_observation_features:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires at least one regular "
+                    "observation image feature."
+                )
+            if not self.robot_state_feature:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires `observation.state`."
+                )
 
     @property
     def observation_delta_indices(self) -> None:
@@ -246,12 +396,36 @@ class ACTConfig(PreTrainedConfig):
         return {
             key: ft
             for key, ft in self.image_features.items()
-            if key != FIRST_FRAME_ANCHOR_KEY
+            if key != FIRST_FRAME_ANCHOR_KEY and not is_prefix_image_key(key)
         }
 
     @property
     def first_frame_anchor_feature(self):
         return self.image_features.get(FIRST_FRAME_ANCHOR_KEY)
+
+    @property
+    def prefix_state_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_STATE_KEY)
+
+    @property
+    def prefix_path_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_PATH_SIGNATURE_KEY)
+
+    @property
+    def prefix_mask_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_MASK_KEY)
+
+    @property
+    def prefix_image_features(self) -> dict:
+        return {
+            key: ft for key, ft in self.image_features.items() if is_prefix_image_key(key)
+        }
 
 
 @PreTrainedConfig.register_subclass("streaming_act")
