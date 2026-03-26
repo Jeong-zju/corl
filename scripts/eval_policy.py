@@ -41,6 +41,49 @@ def validate_first_frame_anchor_support(
         )
 
 
+def validate_prefix_sequence_support(
+    *,
+    env_name: str,
+    policy_name: str,
+    use_prefix_sequence_training: bool,
+) -> None:
+    if not use_prefix_sequence_training:
+        return
+    if policy_name != "streaming_act":
+        raise NotImplementedError(
+            "Prefix-sequence evaluation is currently implemented only for `streaming_act`. "
+            f"Got policy={policy_name!r}."
+        )
+
+
+def validate_visual_prefix_memory_support(
+    *,
+    policy_name: str,
+    use_visual_prefix_memory: bool,
+) -> None:
+    if not use_visual_prefix_memory:
+        return
+    if policy_name != "streaming_act":
+        raise NotImplementedError(
+            "Visual prefix memory evaluation is currently implemented only for "
+            f"`streaming_act`. Got policy={policy_name!r}."
+        )
+
+
+def validate_delta_signature_support(
+    *,
+    policy_name: str,
+    use_delta_signature: bool,
+) -> None:
+    if not use_delta_signature:
+        return
+    if policy_name != "streaming_act":
+        raise NotImplementedError(
+            "Delta-signature evaluation is currently implemented only for "
+            f"`streaming_act`. Got policy={policy_name!r}."
+        )
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--env", choices=get_env_choices(), default="h_shape")
@@ -233,6 +276,23 @@ def main(argv: list[str] | None = None) -> None:
     validate_first_frame_anchor_support(
         env_name=args.env,
         use_first_frame_anchor=bool(getattr(cfg, "use_first_frame_anchor", False)),
+    )
+    validate_prefix_sequence_support(
+        env_name=args.env,
+        policy_name=args.policy,
+        use_prefix_sequence_training=bool(
+            getattr(cfg, "use_prefix_sequence_training", False)
+        ),
+    )
+    validate_visual_prefix_memory_support(
+        policy_name=args.policy,
+        use_visual_prefix_memory=bool(
+            getattr(cfg, "use_visual_prefix_memory", False)
+        ),
+    )
+    validate_delta_signature_support(
+        policy_name=args.policy,
+        use_delta_signature=bool(getattr(cfg, "use_delta_signature", False)),
     )
     if args.n_action_steps is not None:
         cfg.n_action_steps = int(args.n_action_steps)

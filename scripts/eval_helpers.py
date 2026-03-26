@@ -9,6 +9,60 @@ from pathlib import Path
 import numpy as np
 
 
+def compute_delta_signature_sequence_np(signatures: np.ndarray) -> np.ndarray:
+    signatures_array = np.asarray(signatures, dtype=np.float32)
+    if signatures_array.ndim != 2:
+        raise ValueError(
+            "Expected signature trajectory with shape (T, signature_dim). "
+            f"Got {signatures_array.shape}."
+        )
+    if signatures_array.shape[0] == 0:
+        raise ValueError("Signature trajectory must contain at least one step.")
+
+    delta = np.zeros_like(signatures_array, dtype=np.float32)
+    if signatures_array.shape[0] > 1:
+        delta[1:] = signatures_array[1:] - signatures_array[:-1]
+    return delta
+
+
+def compute_delta_signature_step_np(
+    current_signature: np.ndarray,
+    previous_signature: np.ndarray | None,
+) -> np.ndarray:
+    current = np.asarray(current_signature, dtype=np.float32)
+    if current.ndim != 1:
+        raise ValueError(
+            "Current signature must be 1D when computing online delta signature. "
+            f"Got shape={current.shape}."
+        )
+    if previous_signature is None:
+        return np.zeros_like(current, dtype=np.float32)
+    previous = np.asarray(previous_signature, dtype=np.float32)
+    if previous.shape != current.shape:
+        raise ValueError(
+            "Previous signature shape mismatch when computing online delta signature. "
+            f"previous={previous.shape}, current={current.shape}."
+        )
+    return current - previous
+
+
+def resolve_single_visual_observation_feature(cfg) -> tuple[str, tuple[int, ...]]:
+    visual_features = getattr(cfg, "visual_observation_features", None)
+    if visual_features is None:
+        visual_features = getattr(cfg, "image_features", {})
+    if len(visual_features) == 0:
+        raise RuntimeError("Policy has no regular observation image feature.")
+
+    image_key = next(iter(visual_features))
+    image_shape = tuple(visual_features[image_key].shape)
+    if len(image_shape) != 3:
+        raise RuntimeError(
+            "Observation image feature must have shape (C, H, W). "
+            f"Got key={image_key!r}, shape={image_shape}."
+        )
+    return image_key, image_shape
+
+
 def _resolve_path_candidates(raw: Path) -> list[Path]:
     repo_root = Path(__file__).resolve().parents[2]
     candidates = []
@@ -123,6 +177,192 @@ def build_eval_observation(
         image_key: torch.from_numpy(rgb_frame).permute(2, 0, 1).contiguous().float()
         / 255.0,
     }
+
+
+def build_prefix_sequence_eval_inputs(
+    *,
+    obs: dict[str, object],
+    cfg,
+    state_key: str,
+    image_key: str,
+    signature_key: str | None,
+    delta_signature_key: str | None,
+    prefix_state_history: list,
+    prefix_signature_history: list | None,
+    prefix_delta_signature_history: list | None,
+    prefix_image_history: list,
+) -> None:
+    import torch
+
+    from lerobot_policy_streaming_act.prefix_sequence import (
+        PREFIX_MASK_KEY,
+        PREFIX_DELTA_SIGNATURE_KEY,
+        PREFIX_PATH_SIGNATURE_KEY,
+        PREFIX_STATE_KEY,
+        build_padded_prefix_from_history,
+        prefix_image_key_from_camera_key,
+    )
+
+    prefix_state_history.append(obs[state_key].detach().clone())
+    prefix_image_history.append(obs[image_key].detach().clone())
+    if signature_key is not None:
+        if signature_key not in obs:
+            raise KeyError(
+                f"`{signature_key}` must be present in the current observation before "
+                "building prefix-sequence eval inputs."
+            )
+        if prefix_signature_history is None:
+            raise ValueError(
+                "`prefix_signature_history` must be provided when `signature_key` is set."
+            )
+        prefix_signature_history.append(obs[signature_key].detach().clone())
+    if delta_signature_key is not None:
+        if delta_signature_key not in obs:
+            raise KeyError(
+                f"`{delta_signature_key}` must be present in the current observation before "
+                "building prefix-sequence eval inputs."
+            )
+        if prefix_delta_signature_history is None:
+            raise ValueError(
+                "`prefix_delta_signature_history` must be provided when `delta_signature_key` is set."
+            )
+        prefix_delta_signature_history.append(obs[delta_signature_key].detach().clone())
+
+    prefix_state, prefix_mask = build_padded_prefix_from_history(
+        prefix_state_history,
+        prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+        prefix_frame_stride=int(cfg.prefix_frame_stride),
+        pad_value=float(cfg.prefix_pad_value),
+    )
+    prefix_images, prefix_image_mask = build_padded_prefix_from_history(
+        prefix_image_history,
+        prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+        prefix_frame_stride=int(cfg.prefix_frame_stride),
+        pad_value=0.0,
+    )
+    if signature_key is not None:
+        assert prefix_signature_history is not None
+        prefix_signature, prefix_signature_mask = build_padded_prefix_from_history(
+            prefix_signature_history,
+            prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+            prefix_frame_stride=int(cfg.prefix_frame_stride),
+            pad_value=float(cfg.prefix_pad_value),
+        )
+        if not torch.equal(prefix_mask, prefix_signature_mask):
+            raise RuntimeError("Prefix state/signature masks diverged during online eval.")
+    if delta_signature_key is not None:
+        assert prefix_delta_signature_history is not None
+        prefix_delta_signature, prefix_delta_signature_mask = build_padded_prefix_from_history(
+            prefix_delta_signature_history,
+            prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+            prefix_frame_stride=int(cfg.prefix_frame_stride),
+            pad_value=float(cfg.prefix_pad_value),
+        )
+        if not torch.equal(prefix_mask, prefix_delta_signature_mask):
+            raise RuntimeError(
+                "Prefix state/delta-signature masks diverged during online eval."
+            )
+    if not torch.equal(prefix_mask, prefix_image_mask):
+        raise RuntimeError("Prefix state/image masks diverged during online eval.")
+
+    obs[PREFIX_STATE_KEY] = prefix_state
+    obs[PREFIX_MASK_KEY] = prefix_mask
+    obs[prefix_image_key_from_camera_key(image_key)] = prefix_images
+    if signature_key is not None:
+        obs[PREFIX_PATH_SIGNATURE_KEY] = prefix_signature
+    if delta_signature_key is not None:
+        obs[PREFIX_DELTA_SIGNATURE_KEY] = prefix_delta_signature
+
+
+def ensure_prefix_sequence_batch_dims(
+    *,
+    obs: dict[str, object],
+    state_key: str,
+    image_key: str,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+) -> None:
+    from lerobot_policy_streaming_act.prefix_sequence import (
+        PREFIX_MASK_KEY,
+        PREFIX_DELTA_SIGNATURE_KEY,
+        PREFIX_PATH_SIGNATURE_KEY,
+        PREFIX_STATE_KEY,
+        prefix_image_key_from_camera_key,
+    )
+
+    prefix_image_key = prefix_image_key_from_camera_key(image_key)
+    required_prefix_keys = [
+        PREFIX_STATE_KEY,
+        PREFIX_MASK_KEY,
+        prefix_image_key,
+    ]
+    if use_path_signature:
+        required_prefix_keys.append(PREFIX_PATH_SIGNATURE_KEY)
+    if use_delta_signature:
+        required_prefix_keys.append(PREFIX_DELTA_SIGNATURE_KEY)
+    missing_prefix_keys = [key for key in required_prefix_keys if key not in obs]
+    if missing_prefix_keys:
+        raise KeyError(
+            "Missing prefix-sequence keys after preprocessing: "
+            f"{missing_prefix_keys}."
+        )
+
+    device = obs[state_key].device
+    dtype = obs[state_key].dtype
+
+    prefix_state = obs[PREFIX_STATE_KEY]
+    if prefix_state.ndim == 2:
+        prefix_state = prefix_state.unsqueeze(0)
+    elif prefix_state.ndim != 3:
+        raise RuntimeError(
+            f"`{PREFIX_STATE_KEY}` must be 2D/3D after preprocessing, "
+            f"got shape={tuple(prefix_state.shape)}"
+        )
+    obs[PREFIX_STATE_KEY] = prefix_state.to(device=device, dtype=dtype)
+
+    if use_path_signature:
+        prefix_signature = obs[PREFIX_PATH_SIGNATURE_KEY]
+        if prefix_signature.ndim == 2:
+            prefix_signature = prefix_signature.unsqueeze(0)
+        elif prefix_signature.ndim != 3:
+            raise RuntimeError(
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` must be 2D/3D after preprocessing, "
+                f"got shape={tuple(prefix_signature.shape)}"
+        )
+        obs[PREFIX_PATH_SIGNATURE_KEY] = prefix_signature.to(device=device, dtype=dtype)
+    if use_delta_signature:
+        prefix_delta_signature = obs[PREFIX_DELTA_SIGNATURE_KEY]
+        if prefix_delta_signature.ndim == 2:
+            prefix_delta_signature = prefix_delta_signature.unsqueeze(0)
+        elif prefix_delta_signature.ndim != 3:
+            raise RuntimeError(
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` must be 2D/3D after preprocessing, "
+                f"got shape={tuple(prefix_delta_signature.shape)}"
+            )
+        obs[PREFIX_DELTA_SIGNATURE_KEY] = prefix_delta_signature.to(
+            device=device,
+            dtype=dtype,
+        )
+
+    prefix_mask = obs[PREFIX_MASK_KEY]
+    if prefix_mask.ndim == 1:
+        prefix_mask = prefix_mask.unsqueeze(0)
+    elif prefix_mask.ndim != 2:
+        raise RuntimeError(
+            f"`{PREFIX_MASK_KEY}` must be 1D/2D after preprocessing, "
+            f"got shape={tuple(prefix_mask.shape)}"
+        )
+    obs[PREFIX_MASK_KEY] = prefix_mask.to(device=device)
+
+    prefix_images = obs[prefix_image_key]
+    if prefix_images.ndim == 4:
+        prefix_images = prefix_images.unsqueeze(0)
+    elif prefix_images.ndim != 5:
+        raise RuntimeError(
+            f"`{prefix_image_key}` must be 4D/5D after preprocessing, "
+            f"got shape={tuple(prefix_images.shape)}"
+        )
+    obs[prefix_image_key] = prefix_images.to(device=device, dtype=dtype)
 
 
 def compute_signatory_signature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:

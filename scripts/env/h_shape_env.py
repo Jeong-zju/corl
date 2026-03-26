@@ -11,9 +11,13 @@ import numpy as np
 
 from eval_helpers import (
     build_eval_observation,
+    build_prefix_sequence_eval_inputs,
+    compute_delta_signature_step_np,
     compute_signatory_signature_np,
     compute_simple_signature_np,
+    ensure_prefix_sequence_batch_dims,
     resolve_signature_backend,
+    resolve_single_visual_observation_feature,
     write_summary,
 )
 from policy_defaults import load_policy_mode_defaults
@@ -29,6 +33,12 @@ DEFAULT_FPS = 20
 DEFAULT_IMAGE_SIZE = 128
 DEFAULT_SUCCESS_THRESHOLD = 0.20
 DEFAULT_MAX_ACTION_STEP = 0.30
+DEFAULT_INCLUDE_PATH_SIGNATURES = True
+DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+DEFAULT_SIGNATURE_WINDOW_SIZE = 0
+DEFAULT_SIGNATURE_DEPTH = 3
+DEFAULT_SIGNATURE_BACKEND = "auto"
 
 TASK_ID_TO_NAME = {
     0: "upper_bridge",
@@ -478,10 +488,7 @@ def evaluate_policy(
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if len(cfg.image_features) == 0:
-        raise RuntimeError("Policy has no image input feature; visual eval assumes image input.")
-    image_key = list(cfg.image_features.keys())[0]
-    image_shape = tuple(cfg.image_features[image_key].shape)
+    image_key, image_shape = resolve_single_visual_observation_feature(cfg)
     image_hw = (int(image_shape[1]), int(image_shape[2]))
     if bool(getattr(cfg, "use_first_frame_anchor", False)):
         raise NotImplementedError(
@@ -497,7 +504,21 @@ def evaluate_policy(
     use_path_signature = bool(
         policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
     )
-    signature_key = "observation.path_signature"
+    use_prefix_sequence_training = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_prefix_sequence_training", False)
+    )
+    use_visual_prefix_memory = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_visual_prefix_memory", False)
+    )
+    use_delta_signature = bool(
+        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
+    )
+    build_explicit_prefix_eval_inputs = (
+        use_prefix_sequence_training and not use_visual_prefix_memory
+    )
+    signature_key = DEFAULT_PATH_SIGNATURE_KEY
     signature_backend = None
     if use_path_signature:
         signature_backend = resolve_signature_backend(args.signature_backend)
@@ -514,6 +535,23 @@ def evaluate_policy(
             "[info] online path-signature enabled: "
             f"backend={signature_backend}, history={cfg.history_length}, "
             f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+    if use_delta_signature:
+        print(
+            "[info] online delta-signature enabled: "
+            f"key={DEFAULT_DELTA_SIGNATURE_KEY}, rule=g_t-g_(t-1), first_step=zeros"
+        )
+    if build_explicit_prefix_eval_inputs:
+        print(
+            "[info] online prefix-sequence enabled: "
+            f"max_steps={cfg.prefix_train_max_steps}, stride={cfg.prefix_frame_stride}, "
+            f"pad_value={cfg.prefix_pad_value}"
+        )
+    elif use_visual_prefix_memory:
+        print(
+            "[info] visual prefix memory online update enabled: "
+            "rollout uses fixed-size recurrent memory without rebuilding "
+            "explicit prefix-sequence tensors each step"
         )
 
     env = HShape2DEnv(seed=args.seed, success_threshold=args.success_threshold)
@@ -542,6 +580,15 @@ def evaluate_policy(
         state_history = (
             deque(maxlen=int(cfg.history_length)) if use_path_signature else None
         )
+        prefix_state_history = [] if build_explicit_prefix_eval_inputs else None
+        prefix_signature_history = (
+            [] if build_explicit_prefix_eval_inputs and use_path_signature else None
+        )
+        prefix_delta_signature_history = (
+            [] if build_explicit_prefix_eval_inputs and use_delta_signature else None
+        )
+        prefix_image_history = [] if build_explicit_prefix_eval_inputs else None
+        previous_signature_vec = None
         success = False
 
         for _step_idx in range(args.max_steps):
@@ -577,6 +624,37 @@ def evaluate_policy(
                 obs[signature_key] = torch.from_numpy(
                     signature_vec.astype(np.float32, copy=False)
                 )
+                if use_delta_signature:
+                    delta_signature_vec = compute_delta_signature_step_np(
+                        signature_vec,
+                        previous_signature_vec,
+                    )
+                    obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
+                        delta_signature_vec.astype(np.float32, copy=False)
+                    )
+                    previous_signature_vec = signature_vec.astype(np.float32, copy=True)
+
+            if build_explicit_prefix_eval_inputs:
+                assert prefix_state_history is not None
+                assert prefix_image_history is not None
+                if use_path_signature:
+                    assert prefix_signature_history is not None
+                if use_delta_signature:
+                    assert prefix_delta_signature_history is not None
+                build_prefix_sequence_eval_inputs(
+                    obs=obs,
+                    cfg=cfg,
+                    state_key=state_key,
+                    image_key=image_key,
+                    signature_key=signature_key if use_path_signature else None,
+                    delta_signature_key=(
+                        DEFAULT_DELTA_SIGNATURE_KEY if use_delta_signature else None
+                    ),
+                    prefix_state_history=prefix_state_history,
+                    prefix_signature_history=prefix_signature_history,
+                    prefix_delta_signature_history=prefix_delta_signature_history,
+                    prefix_image_history=prefix_image_history,
+                )
 
             obs = preprocessor(obs)
             if use_path_signature:
@@ -596,6 +674,32 @@ def evaluate_policy(
                 obs[signature_key] = path_signature.to(
                     device=obs[state_key].device,
                     dtype=obs[state_key].dtype,
+                )
+            if use_delta_signature:
+                if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
+                    raise KeyError(
+                        f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessor; "
+                        "cannot run policy with use_delta_signature=True."
+                    )
+                delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
+                if delta_signature.ndim == 1:
+                    delta_signature = delta_signature.unsqueeze(0)
+                elif delta_signature.ndim != 2:
+                    raise RuntimeError(
+                        f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                        f"got shape={tuple(delta_signature.shape)}"
+                    )
+                obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
+                    device=obs[state_key].device,
+                    dtype=obs[state_key].dtype,
+                )
+            if build_explicit_prefix_eval_inputs:
+                ensure_prefix_sequence_batch_dims(
+                    obs=obs,
+                    state_key=state_key,
+                    image_key=image_key,
+                    use_path_signature=use_path_signature,
+                    use_delta_signature=use_delta_signature,
                 )
 
             with torch.no_grad():

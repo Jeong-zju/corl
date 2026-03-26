@@ -10,9 +10,11 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 
 PREFIX_STATE_KEY = "observation.prefix_state"
 PREFIX_PATH_SIGNATURE_KEY = "observation.prefix_path_signature"
+PREFIX_DELTA_SIGNATURE_KEY = "observation.prefix_delta_signature"
 PREFIX_MASK_KEY = "observation.prefix_mask"
 PREFIX_IMAGES_PREFIX = "observation.prefix_images."
 PATH_SIGNATURE_KEY = "observation.path_signature"
+DELTA_SIGNATURE_KEY = "observation.delta_signature"
 
 
 def is_prefix_image_key(key: str) -> bool:
@@ -158,6 +160,7 @@ def clone_prefix_stats(
     base_stats: dict[str, dict[str, Any]],
     camera_keys: Sequence[str],
     use_path_signature: bool,
+    use_delta_signature: bool,
 ) -> dict[str, dict[str, Any]]:
     stats = deepcopy(base_stats)
     if "observation.state" not in stats:
@@ -173,6 +176,13 @@ def clone_prefix_stats(
                 "is enabled with path signatures."
             )
         stats[PREFIX_PATH_SIGNATURE_KEY] = deepcopy(stats[PATH_SIGNATURE_KEY])
+    if use_delta_signature:
+        if DELTA_SIGNATURE_KEY not in stats:
+            raise KeyError(
+                f"`{DELTA_SIGNATURE_KEY}` stats are required when prefix-sequence mode "
+                "is enabled with delta signatures."
+            )
+        stats[PREFIX_DELTA_SIGNATURE_KEY] = deepcopy(stats[DELTA_SIGNATURE_KEY])
 
     for camera_key in camera_keys:
         if camera_key not in stats:
@@ -188,6 +198,7 @@ def build_prefix_sequence_input_features(
     base_input_features: dict[str, PolicyFeature],
     prefix_train_max_steps: int,
     use_path_signature: bool,
+    use_delta_signature: bool,
 ) -> dict[str, PolicyFeature]:
     if "observation.state" not in base_input_features:
         raise KeyError(
@@ -215,6 +226,17 @@ def build_prefix_sequence_input_features(
         updated[PREFIX_PATH_SIGNATURE_KEY] = PolicyFeature(
             type=FeatureType.STATE,
             shape=(prefix_train_max_steps, *signature_feature.shape),
+        )
+    if use_delta_signature:
+        delta_signature_feature = base_input_features.get(DELTA_SIGNATURE_KEY)
+        if delta_signature_feature is None:
+            raise KeyError(
+                f"`{DELTA_SIGNATURE_KEY}` input feature is required when "
+                "`use_prefix_sequence_training=True` and delta signatures are enabled."
+            )
+        updated[PREFIX_DELTA_SIGNATURE_KEY] = PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(prefix_train_max_steps, *delta_signature_feature.shape),
         )
 
     for key, feature in list(base_input_features.items()):
@@ -250,6 +272,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         prefix_frame_stride: int,
         prefix_pad_value: float,
         use_path_signature: bool,
+        use_delta_signature: bool,
     ) -> None:
         super().__init__()
         if prefix_train_max_steps <= 0:
@@ -267,6 +290,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         self.prefix_frame_stride = int(prefix_frame_stride)
         self.prefix_pad_value = float(prefix_pad_value)
         self.use_path_signature = bool(use_path_signature)
+        self.use_delta_signature = bool(use_delta_signature)
         self.camera_keys = tuple(
             key
             for key in base_dataset.meta.camera_keys
@@ -282,6 +306,7 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             base_stats=self.meta.stats,
             camera_keys=self.camera_keys,
             use_path_signature=self.use_path_signature,
+            use_delta_signature=self.use_delta_signature,
         )
 
     def __len__(self) -> int:
@@ -323,6 +348,8 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] = {"observation.state": abs_indices}
         if self.use_path_signature:
             query_indices[PATH_SIGNATURE_KEY] = abs_indices
+        if self.use_delta_signature:
+            query_indices[DELTA_SIGNATURE_KEY] = abs_indices
         for camera_key in self.camera_keys:
             query_indices[camera_key] = abs_indices
 
@@ -350,6 +377,18 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
                 )
             prefix[PREFIX_PATH_SIGNATURE_KEY] = pad_prefix_tensor(
                 signature_tensor,
+                target_length=self.prefix_train_max_steps,
+                pad_value=self.prefix_pad_value,
+            )
+        if self.use_delta_signature:
+            delta_signature_tensor = hf_result[DELTA_SIGNATURE_KEY]
+            if delta_signature_tensor.ndim != 2:
+                raise ValueError(
+                    f"`{DELTA_SIGNATURE_KEY}` prefix query must return shape "
+                    f"(T, signature_dim). Got shape={tuple(delta_signature_tensor.shape)}."
+                )
+            prefix[PREFIX_DELTA_SIGNATURE_KEY] = pad_prefix_tensor(
+                delta_signature_tensor,
                 target_length=self.prefix_train_max_steps,
                 pad_value=self.prefix_pad_value,
             )

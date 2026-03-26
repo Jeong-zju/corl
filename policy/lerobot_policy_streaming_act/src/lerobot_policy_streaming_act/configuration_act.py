@@ -20,10 +20,13 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from .prefix_sequence import (
+    DELTA_SIGNATURE_KEY,
     PREFIX_IMAGES_PREFIX,
+    PREFIX_DELTA_SIGNATURE_KEY,
     PREFIX_MASK_KEY,
     PREFIX_PATH_SIGNATURE_KEY,
     PREFIX_STATE_KEY,
+    PATH_SIGNATURE_KEY,
     is_prefix_image_key,
 )
 
@@ -106,6 +109,16 @@ class ACTConfig(PreTrainedConfig):
         prefix_pad_value: Numeric padding value used for prefix state/signature tensors.
         use_visual_prefix_memory: Whether to enable a fixed-budget visual prefix memory
             branch that scans the prefix sequence and injects extra encoder memory tokens.
+        use_delta_signature: Whether to consume `observation.delta_signature`
+            and optionally inject it as an extra encoder memory token.
+        use_signature_conditioned_visual_prefix_memory: Whether the visual prefix
+            memory updater should explicitly condition on path signatures (and on
+            delta signatures if enabled) instead of using only visual/state inputs.
+        use_memory_conditioned_encoder_film: Whether to let the pooled visual prefix
+            memory state FiLM-modulate the current-step ACT encoder tokens before
+            the transformer encoder runs. This gives the encoder a direct
+            task-context pathway instead of relying only on decoder cross-attention
+            to the memory token.
         num_memory_slots: Number of visual prefix memory slots injected into the encoder.
             Each slot keeps an independent GRU-style memory state. The minimal
             experiments in this repository use 1 or 2 slots.
@@ -160,6 +173,9 @@ class ACTConfig(PreTrainedConfig):
     prefix_frame_stride: int = 1
     prefix_pad_value: float = 0.0
     use_visual_prefix_memory: bool = False
+    use_delta_signature: bool = False
+    use_signature_conditioned_visual_prefix_memory: bool = False
+    use_memory_conditioned_encoder_film: bool = False
     num_memory_slots: int = 1
 
     # Streaming path-signature history module.
@@ -221,6 +237,11 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
                 )
+        if self.use_delta_signature and not self.use_path_signature:
+            raise ValueError(
+                "`use_delta_signature=True` requires `use_path_signature=True` "
+                "because delta signatures are defined as differences between path signatures."
+            )
         if self.use_prefix_sequence_training:
             if self.prefix_train_max_steps <= 0:
                 raise ValueError(
@@ -244,6 +265,22 @@ class ACTConfig(PreTrainedConfig):
                     "`use_visual_prefix_memory=True` requires "
                     f"`num_memory_slots > 0`. Got {self.num_memory_slots}."
                 )
+        if self.use_signature_conditioned_visual_prefix_memory:
+            if not self.use_visual_prefix_memory:
+                raise ValueError(
+                    "`use_signature_conditioned_visual_prefix_memory=True` requires "
+                    "`use_visual_prefix_memory=True`."
+                )
+            if not self.use_path_signature:
+                raise ValueError(
+                    "`use_signature_conditioned_visual_prefix_memory=True` requires "
+                    "`use_path_signature=True`."
+                )
+        if self.use_memory_conditioned_encoder_film and not self.use_visual_prefix_memory:
+            raise ValueError(
+                "`use_memory_conditioned_encoder_film=True` requires "
+                "`use_visual_prefix_memory=True` so the FiLM path has a memory state to use."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -275,6 +312,19 @@ class ACTConfig(PreTrainedConfig):
                     "First-frame anchor image must match the regular observation image shape. "
                     f"Got anchor={tuple(anchor_feature.shape)} vs "
                     f"observation={tuple(first_visual_feature.shape)}."
+                )
+        if self.use_path_signature:
+            path_signature_feature = self.path_signature_feature
+            if path_signature_feature is None:
+                raise ValueError(
+                    f"`use_path_signature=True` requires input feature `{PATH_SIGNATURE_KEY}`."
+                )
+            expected_signature_shape = (self.signature_dim,)
+            if tuple(path_signature_feature.shape) != expected_signature_shape:
+                raise ValueError(
+                    "Path-signature feature shape mismatch. "
+                    f"Expected {expected_signature_shape}, got "
+                    f"{tuple(path_signature_feature.shape)}."
                 )
         if self.use_prefix_sequence_training:
             if not self.robot_state_feature:
@@ -368,6 +418,49 @@ class ACTConfig(PreTrainedConfig):
                         f"Expected {expected_prefix_signature_shape}, got "
                         f"{tuple(prefix_signature_feature.shape)}."
                     )
+            if self.use_delta_signature:
+                delta_signature_feature = self.delta_signature_feature
+                if delta_signature_feature is None:
+                    raise ValueError(
+                        f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
+                    )
+                expected_delta_signature_shape = (self.signature_dim,)
+                if tuple(delta_signature_feature.shape) != expected_delta_signature_shape:
+                    raise ValueError(
+                        "Delta-signature feature shape mismatch. "
+                        f"Expected {expected_delta_signature_shape}, got "
+                        f"{tuple(delta_signature_feature.shape)}."
+                    )
+
+                prefix_delta_signature_feature = self.prefix_delta_signature_feature
+                if prefix_delta_signature_feature is None:
+                    raise ValueError(
+                        "`use_prefix_sequence_training=True` requires input feature "
+                        f"`{PREFIX_DELTA_SIGNATURE_KEY}` when `use_delta_signature=True`."
+                    )
+                expected_prefix_delta_signature_shape = (
+                    self.prefix_train_max_steps,
+                    self.signature_dim,
+                )
+                if tuple(prefix_delta_signature_feature.shape) != expected_prefix_delta_signature_shape:
+                    raise ValueError(
+                        "Prefix delta-signature feature shape mismatch. "
+                        f"Expected {expected_prefix_delta_signature_shape}, got "
+                        f"{tuple(prefix_delta_signature_feature.shape)}."
+                    )
+        elif self.use_delta_signature:
+            delta_signature_feature = self.delta_signature_feature
+            if delta_signature_feature is None:
+                raise ValueError(
+                    f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
+                )
+            expected_delta_signature_shape = (self.signature_dim,)
+            if tuple(delta_signature_feature.shape) != expected_delta_signature_shape:
+                raise ValueError(
+                    "Delta-signature feature shape mismatch. "
+                    f"Expected {expected_delta_signature_shape}, got "
+                    f"{tuple(delta_signature_feature.shape)}."
+                )
         if self.use_visual_prefix_memory:
             if not self.visual_observation_features:
                 raise ValueError(
@@ -414,6 +507,24 @@ class ACTConfig(PreTrainedConfig):
         if not self.input_features:
             return None
         return self.input_features.get(PREFIX_PATH_SIGNATURE_KEY)
+
+    @property
+    def path_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PATH_SIGNATURE_KEY)
+
+    @property
+    def delta_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(DELTA_SIGNATURE_KEY)
+
+    @property
+    def prefix_delta_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_DELTA_SIGNATURE_KEY)
 
     @property
     def prefix_mask_feature(self):

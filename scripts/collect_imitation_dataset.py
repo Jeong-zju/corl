@@ -9,9 +9,21 @@ from pathlib import Path
 import numpy as np
 
 from env import get_env_choices, get_env_module
+from eval_helpers import (
+    compute_delta_signature_sequence_np,
+    compute_signatory_signature_np,
+    compute_simple_signature_np,
+    resolve_signature_backend,
+)
 
 
 VIDEO_KEY = "observation.images.front"
+DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+DEFAULT_INCLUDE_PATH_SIGNATURES = True
+DEFAULT_SIGNATURE_WINDOW_SIZE = 0
+DEFAULT_SIGNATURE_DEPTH = 3
+DEFAULT_SIGNATURE_BACKEND = "auto"
 TASKS = [
     "Navigate through the upper bridge of the H-maze from left to right.",
     "Navigate through the lower bridge of the H-maze from left to right.",
@@ -374,6 +386,96 @@ def build_stats(values):
     }
 
 
+def init_image_stats_accumulator(num_channels):
+    if num_channels <= 0:
+        raise ValueError(f"`num_channels` must be positive, got {num_channels}.")
+    channel_shape = (num_channels, 1, 1)
+    return {
+        "sum": np.zeros(channel_shape, dtype=np.float64),
+        "sumsq": np.zeros(channel_shape, dtype=np.float64),
+        "min": np.full(channel_shape, np.inf, dtype=np.float64),
+        "max": np.full(channel_shape, -np.inf, dtype=np.float64),
+        "pixel_count": 0,
+        "frame_count": 0,
+    }
+
+
+def update_image_stats_accumulator(accumulator, frame_hwc_uint8):
+    frame = np.asarray(frame_hwc_uint8, dtype=np.float32)
+    if frame.ndim != 3 or frame.shape[2] <= 0:
+        raise ValueError(
+            "Expected an HWC image array with a positive channel dimension. "
+            f"Got shape={tuple(frame.shape)}."
+        )
+    chw = np.transpose(frame / 255.0, (2, 0, 1))
+    channel_min = chw.min(axis=(1, 2), keepdims=True).astype(np.float64)
+    channel_max = chw.max(axis=(1, 2), keepdims=True).astype(np.float64)
+    accumulator["sum"] += chw.sum(axis=(1, 2), keepdims=True, dtype=np.float64)
+    accumulator["sumsq"] += np.square(chw, dtype=np.float64).sum(
+        axis=(1, 2), keepdims=True, dtype=np.float64
+    )
+    accumulator["min"] = np.minimum(accumulator["min"], channel_min)
+    accumulator["max"] = np.maximum(accumulator["max"], channel_max)
+    accumulator["pixel_count"] += int(chw.shape[1] * chw.shape[2])
+    accumulator["frame_count"] += 1
+
+
+def finalize_image_stats(accumulator):
+    pixel_count = int(accumulator["pixel_count"])
+    frame_count = int(accumulator["frame_count"])
+    if pixel_count <= 0 or frame_count <= 0:
+        raise ValueError("Image stats accumulator is empty.")
+    mean = accumulator["sum"] / pixel_count
+    variance = accumulator["sumsq"] / pixel_count - np.square(mean, dtype=np.float64)
+    variance = np.maximum(variance, 0.0)
+    std = np.sqrt(variance, dtype=np.float64)
+    return {
+        "min": accumulator["min"].tolist(),
+        "max": accumulator["max"].tolist(),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "count": [frame_count],
+    }
+
+
+def compute_path_signature_sequence(
+    states,
+    *,
+    window_size,
+    sig_depth,
+    signature_backend,
+):
+    states_array = np.asarray(states, dtype=np.float32)
+    if states_array.ndim != 2:
+        raise ValueError(
+            "Expected state trajectory with shape (T, state_dim). "
+            f"Got {states_array.shape}."
+        )
+    if states_array.shape[0] == 0:
+        raise ValueError("State trajectory must contain at least one step.")
+    if sig_depth <= 0:
+        raise ValueError(f"`sig_depth` must be positive, got {sig_depth}.")
+
+    signatures = []
+    signature_dim = None
+    for end_idx in range(int(states_array.shape[0])):
+        start_idx = 0 if window_size <= 0 else max(0, end_idx + 1 - int(window_size))
+        window = states_array[start_idx : end_idx + 1]
+        if signature_backend == "signatory":
+            signature = compute_signatory_signature_np(window, sig_depth)
+        else:
+            signature = compute_simple_signature_np(window, sig_depth)
+        if signature_dim is None:
+            signature_dim = int(signature.shape[0])
+        elif int(signature.shape[0]) != signature_dim:
+            raise RuntimeError(
+                "Path-signature dimension changed across timesteps. "
+                f"Expected {signature_dim}, got {int(signature.shape[0])}."
+            )
+        signatures.append(signature.astype(np.float32, copy=False))
+    return np.stack(signatures, axis=0)
+
+
 def validate_consistency(records, episodes_meta, splits, total_frames, total_episodes, video_frame_count):
     if total_frames != len(records["index"]):
         raise ValueError("total_frames mismatch with frame table")
@@ -413,6 +515,13 @@ def generate_lerobot_v30_dataset(
     seed=42,
     fps=20,
     image_size=128,
+    include_path_signatures=DEFAULT_INCLUDE_PATH_SIGNATURES,
+    include_delta_signatures=False,
+    path_signature_key=DEFAULT_PATH_SIGNATURE_KEY,
+    delta_signature_key=DEFAULT_DELTA_SIGNATURE_KEY,
+    path_signature_window_size=DEFAULT_SIGNATURE_WINDOW_SIZE,
+    path_signature_depth=DEFAULT_SIGNATURE_DEPTH,
+    path_signature_backend=DEFAULT_SIGNATURE_BACKEND,
 ):
     pa, pq, pd = _require_h_shape_export_dependencies()
     rng = random.Random(seed)
@@ -459,11 +568,29 @@ def generate_lerobot_v30_dataset(
         "next.done": [],
         "next.success": [],
     }
+    if include_path_signatures:
+        records[path_signature_key] = []
+    if include_delta_signatures:
+        records[delta_signature_key] = []
 
     episodes_meta = []
     global_index = 0
     cumulative_video_frames = 0
     corners = find_fixed_h_corners(grid, extent)
+    image_stats_accumulator = init_image_stats_accumulator(num_channels=3)
+    resolved_signature_backend = None
+    if include_path_signatures:
+        resolved_signature_backend = resolve_signature_backend(path_signature_backend)
+        window_label = (
+            "full_prefix"
+            if int(path_signature_window_size) <= 0
+            else str(int(path_signature_window_size))
+        )
+        print(
+            "Collecting h_shape path signatures: "
+            f"key={path_signature_key}, window={window_label}, "
+            f"depth={path_signature_depth}, backend={resolved_signature_backend}"
+        )
 
     for ep_idx in range(num_episodes):
         use_upper = (ep_idx % 2 == 0)
@@ -486,6 +613,17 @@ def generate_lerobot_v30_dataset(
             path = list(reversed(path))
 
         trajectory = densify_path(path, step=0.12, min_points=12, max_points=42)
+        signature_sequence = None
+        delta_signature_sequence = None
+        if include_path_signatures:
+            signature_sequence = compute_path_signature_sequence(
+                trajectory,
+                window_size=path_signature_window_size,
+                sig_depth=path_signature_depth,
+                signature_backend=str(resolved_signature_backend),
+            )
+            if include_delta_signatures:
+                delta_signature_sequence = compute_delta_signature_sequence_np(signature_sequence)
         ep_len = len(trajectory)
         task_index = 0 if use_upper else 1
 
@@ -513,8 +651,17 @@ def generate_lerobot_v30_dataset(
             records["next.reward"].append(float(reward))
             records["next.done"].append(bool(done))
             records["next.success"].append(bool(success))
+            if signature_sequence is not None:
+                records[path_signature_key].append(
+                    signature_sequence[frame_idx].astype(np.float32).tolist()
+                )
+            if delta_signature_sequence is not None:
+                records[delta_signature_key].append(
+                    delta_signature_sequence[frame_idx].astype(np.float32).tolist()
+                )
 
             frame = render_frame(base_img, extent, pos)
+            update_image_stats_accumulator(image_stats_accumulator, frame)
             ffmpeg_proc.stdin.write(frame.astype(np.uint8).tobytes())
 
             global_index += 1
@@ -550,14 +697,33 @@ def generate_lerobot_v30_dataset(
 
     state_arr = np.asarray(records["observation.state"], dtype=np.float32)
     action_arr = np.asarray(records["action"], dtype=np.float32)
+    signature_arr = (
+        None
+        if path_signature_key not in records
+        else np.asarray(records[path_signature_key], dtype=np.float32)
+    )
+    delta_signature_arr = (
+        None
+        if delta_signature_key not in records
+        else np.asarray(records[delta_signature_key], dtype=np.float32)
+    )
 
     def fixed_size_list(values, width):
         flat = pa.array(values.reshape(-1), type=pa.float32())
         return pa.FixedSizeListArray.from_arrays(flat, width)
 
-    data_table = pa.Table.from_arrays(
+    data_arrays = [fixed_size_list(state_arr, 2)]
+    data_names = ["observation.state"]
+    if signature_arr is not None:
+        data_arrays.append(fixed_size_list(signature_arr, int(signature_arr.shape[1])))
+        data_names.append(path_signature_key)
+    if delta_signature_arr is not None:
+        data_arrays.append(
+            fixed_size_list(delta_signature_arr, int(delta_signature_arr.shape[1]))
+        )
+        data_names.append(delta_signature_key)
+    data_arrays.extend(
         [
-            fixed_size_list(state_arr, 2),
             fixed_size_list(action_arr, 2),
             pa.array(records["next.reward"], type=pa.float32()),
             pa.array(records["next.done"], type=pa.bool_()),
@@ -567,9 +733,10 @@ def generate_lerobot_v30_dataset(
             pa.array(records["episode_index"], type=pa.int64()),
             pa.array(records["index"], type=pa.int64()),
             pa.array(records["task_index"], type=pa.int64()),
-        ],
-        names=[
-            "observation.state",
+        ]
+    )
+    data_names.extend(
+        [
             "action",
             "next.reward",
             "next.done",
@@ -579,8 +746,9 @@ def generate_lerobot_v30_dataset(
             "episode_index",
             "index",
             "task_index",
-        ],
+        ]
     )
+    data_table = pa.Table.from_arrays(data_arrays, names=data_names)
     pq.write_table(data_table, data_file, compression="snappy")
 
     episodes_table = pa.Table.from_arrays(
@@ -714,13 +882,54 @@ def generate_lerobot_v30_dataset(
             },
         },
     }
+    if signature_arr is not None:
+        info["features"][path_signature_key] = {
+            "dtype": "float32",
+            "shape": [int(signature_arr.shape[1])],
+            "names": [f"path_sig_{index}" for index in range(int(signature_arr.shape[1]))],
+        }
+        info["path_signature"] = {
+            "key": path_signature_key,
+            "window_size": int(path_signature_window_size),
+            "window_mode": (
+                "full_prefix"
+                if int(path_signature_window_size) <= 0
+                else "sliding_window"
+            ),
+            "sig_depth": int(path_signature_depth),
+            "signature_dim": int(signature_arr.shape[1]),
+            "kind": (
+                "signature"
+                if resolved_signature_backend == "signatory"
+                else "simple_signature"
+            ),
+            "backend": resolved_signature_backend,
+        }
+    if delta_signature_arr is not None:
+        info["features"][delta_signature_key] = {
+            "dtype": "float32",
+            "shape": [int(delta_signature_arr.shape[1])],
+            "names": [f"delta_path_sig_{index}" for index in range(int(delta_signature_arr.shape[1]))],
+        }
+        info["delta_signature"] = {
+            "key": delta_signature_key,
+            "signature_key": path_signature_key,
+            "definition": "path_signature_t - path_signature_{t-1}",
+            "first_step_rule": "zeros",
+            "signature_dim": int(delta_signature_arr.shape[1]),
+        }
 
     stats = {
         "observation.state": build_stats(state_arr),
         "action": build_stats(action_arr),
         "next.reward": build_stats(np.asarray(records["next.reward"], dtype=np.float32)),
         "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
+        VIDEO_KEY: finalize_image_stats(image_stats_accumulator),
     }
+    if signature_arr is not None:
+        stats[path_signature_key] = build_stats(signature_arr)
+    if delta_signature_arr is not None:
+        stats[delta_signature_key] = build_stats(delta_signature_arr)
 
     with info_file.open("w", encoding="utf-8") as f:
         json.dump(info, f, indent=4, ensure_ascii=False)
@@ -860,32 +1069,50 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             help="Skip writing phase labels into the processed dataset.",
         )
         parser.add_argument(
-            "--disable-path-signature",
-            action="store_true",
-            help="Skip path-signature preprocessing.",
-        )
-        parser.add_argument(
-            "--path-signature-window-size",
-            type=int,
-            default=0,
-            help="0 means full-prefix signatures; positive values use sliding windows.",
-        )
-        parser.add_argument(
-            "--path-signature-depth",
-            type=int,
-            default=env_module.DEFAULT_SIGNATURE_DEPTH,
-        )
-        parser.add_argument(
-            "--signature-backend",
-            type=str,
-            default=env_module.DEFAULT_SIGNATURE_BACKEND,
-            choices=["auto", "signatory", "simple"],
-        )
-        parser.add_argument(
             "--skip-lerobot-export",
             action="store_true",
             help="Process demonstrations in memory but skip LeRobot dataset export.",
         )
+
+    parser.add_argument(
+        "--disable-path-signature",
+        action="store_true",
+        help="Skip path-signature preprocessing.",
+    )
+    delta_signature_group = parser.add_mutually_exclusive_group()
+    delta_signature_group.add_argument(
+        "--enable-delta-signature",
+        dest="enable_delta_signature",
+        action="store_true",
+        help=(
+            "Export observation.delta_signature defined as "
+            "path_signature_t - path_signature_{t-1} with a zero first step."
+        ),
+    )
+    delta_signature_group.add_argument(
+        "--disable-delta-signature",
+        dest="enable_delta_signature",
+        action="store_false",
+        help="Do not export observation.delta_signature.",
+    )
+    parser.set_defaults(enable_delta_signature=False)
+    parser.add_argument(
+        "--path-signature-window-size",
+        type=int,
+        default=getattr(env_module, "DEFAULT_SIGNATURE_WINDOW_SIZE", 0),
+        help="0 means full-prefix signatures; positive values use sliding windows.",
+    )
+    parser.add_argument(
+        "--path-signature-depth",
+        type=int,
+        default=getattr(env_module, "DEFAULT_SIGNATURE_DEPTH", DEFAULT_SIGNATURE_DEPTH),
+    )
+    parser.add_argument(
+        "--signature-backend",
+        type=str,
+        default=getattr(env_module, "DEFAULT_SIGNATURE_BACKEND", DEFAULT_SIGNATURE_BACKEND),
+        choices=["auto", "signatory", "simple"],
+    )
 
     return parser
 
@@ -902,6 +1129,11 @@ def main(argv: list[str] | None = None) -> None:
             "First-frame anchor dataset export is currently implemented only for `braidedhub`. "
             f"Got env={args.env!r}."
         )
+    if args.enable_delta_signature and args.disable_path_signature:
+        raise ValueError(
+            "`--enable-delta-signature` requires path signatures. "
+            "Remove `--disable-path-signature`."
+        )
     if args.env == "h_shape":
         output_path = generate_lerobot_v30_dataset(
             num_episodes=args.num_episodes,
@@ -909,6 +1141,13 @@ def main(argv: list[str] | None = None) -> None:
             seed=args.seed,
             fps=args.fps,
             image_size=args.image_size,
+            include_path_signatures=not args.disable_path_signature,
+            include_delta_signatures=bool(args.enable_delta_signature),
+            path_signature_key=DEFAULT_PATH_SIGNATURE_KEY,
+            delta_signature_key=DEFAULT_DELTA_SIGNATURE_KEY,
+            path_signature_window_size=args.path_signature_window_size,
+            path_signature_depth=args.path_signature_depth,
+            path_signature_backend=args.signature_backend,
         )
     else:
         env_module = get_env_module(args.env)

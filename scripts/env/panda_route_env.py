@@ -26,6 +26,8 @@ else:  # pragma: no cover - exercised only when mujoco is installed
 
 from eval_helpers import (
     build_eval_observation,
+    compute_delta_signature_sequence_np,
+    compute_delta_signature_step_np,
     compute_signatory_signature_np,
     compute_simple_signature_np,
     resolve_signature_backend,
@@ -50,6 +52,7 @@ DEFAULT_T_FIXED = 100
 DEFAULT_LAST_ACTION_MODE = "repeat_last"
 DEFAULT_INCLUDE_PATH_SIGNATURES = True
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 DEFAULT_SIGNATURE_WINDOW_SIZE = 0
 DEFAULT_SIGNATURE_DEPTH = 3
 DEFAULT_SIGNATURE_BACKEND = "auto"
@@ -3275,6 +3278,58 @@ def build_stats(values: np.ndarray | list[float]) -> dict[str, Any]:
     }
 
 
+def init_image_stats_accumulator(num_channels: int) -> dict[str, Any]:
+    if num_channels <= 0:
+        raise ValueError(f"`num_channels` must be positive, got {num_channels}.")
+    channel_shape = (num_channels, 1, 1)
+    return {
+        "sum": np.zeros(channel_shape, dtype=np.float64),
+        "sumsq": np.zeros(channel_shape, dtype=np.float64),
+        "min": np.full(channel_shape, np.inf, dtype=np.float64),
+        "max": np.full(channel_shape, -np.inf, dtype=np.float64),
+        "pixel_count": 0,
+        "frame_count": 0,
+    }
+
+
+def update_image_stats_accumulator(accumulator: dict[str, Any], frame_hwc_uint8: np.ndarray) -> None:
+    frame = np.asarray(frame_hwc_uint8, dtype=np.float32)
+    if frame.ndim != 3 or frame.shape[2] <= 0:
+        raise ValueError(
+            "Expected an HWC image array with a positive channel dimension. "
+            f"Got shape={tuple(frame.shape)}."
+        )
+    chw = np.transpose(frame / 255.0, (2, 0, 1))
+    channel_min = chw.min(axis=(1, 2), keepdims=True).astype(np.float64)
+    channel_max = chw.max(axis=(1, 2), keepdims=True).astype(np.float64)
+    accumulator["sum"] += chw.sum(axis=(1, 2), keepdims=True, dtype=np.float64)
+    accumulator["sumsq"] += np.square(chw, dtype=np.float64).sum(
+        axis=(1, 2), keepdims=True, dtype=np.float64
+    )
+    accumulator["min"] = np.minimum(accumulator["min"], channel_min)
+    accumulator["max"] = np.maximum(accumulator["max"], channel_max)
+    accumulator["pixel_count"] += int(chw.shape[1] * chw.shape[2])
+    accumulator["frame_count"] += 1
+
+
+def finalize_image_stats(accumulator: dict[str, Any]) -> dict[str, Any]:
+    pixel_count = int(accumulator["pixel_count"])
+    frame_count = int(accumulator["frame_count"])
+    if pixel_count <= 0 or frame_count <= 0:
+        raise ValueError("Image stats accumulator is empty.")
+    mean = accumulator["sum"] / pixel_count
+    variance = accumulator["sumsq"] / pixel_count - np.square(mean, dtype=np.float64)
+    variance = np.maximum(variance, 0.0)
+    std = np.sqrt(variance, dtype=np.float64)
+    return {
+        "min": accumulator["min"].tolist(),
+        "max": accumulator["max"].tolist(),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "count": [frame_count],
+    }
+
+
 def fixed_size_list_array(pa: Any, values: np.ndarray, width: int):
     flat = pa.array(values.reshape(-1), type=pa.float32())
     return pa.FixedSizeListArray.from_arrays(flat, width)
@@ -3295,6 +3350,19 @@ def build_episode_data_table(pa: Any, frame_records: dict[str, list[Any]]) -> An
             fixed_size_list_array(pa, signature_array, int(signature_array.shape[1]))
         )
         names.append(DEFAULT_PATH_SIGNATURE_KEY)
+    if DEFAULT_DELTA_SIGNATURE_KEY in frame_records:
+        delta_signature_array = np.asarray(
+            frame_records[DEFAULT_DELTA_SIGNATURE_KEY],
+            dtype=np.float32,
+        )
+        arrays.append(
+            fixed_size_list_array(
+                pa,
+                delta_signature_array,
+                int(delta_signature_array.shape[1]),
+            )
+        )
+        names.append(DEFAULT_DELTA_SIGNATURE_KEY)
     arrays.extend(
         [
             fixed_size_list_array(pa, action_array, int(action_array.shape[1])),
@@ -3410,6 +3478,7 @@ def generate_lerobot_v30_dataset(
     image_size: int = DEFAULT_VIDEO_IMAGE_SIZE,
     config: MapConfig | None = None,
     episodes_per_chunk: int = DEFAULT_LEROBOT_EPISODES_PER_CHUNK,
+    use_delta_signature: bool = False,
 ) -> Path:
     pa, pq = _require_lerobot_export_dependencies()
     if fps <= 0:
@@ -3460,12 +3529,19 @@ def generate_lerobot_v30_dataset(
     }
     if processed_dataset.path_signatures is not None:
         records[DEFAULT_PATH_SIGNATURE_KEY] = []
+    if use_delta_signature:
+        if processed_dataset.path_signatures is None:
+            raise ValueError(
+                "`use_delta_signature=True` requires processed_dataset.path_signatures."
+            )
+        records[DEFAULT_DELTA_SIGNATURE_KEY] = []
     episodes_meta: list[dict[str, Any]] = []
     global_index = 0
     video_frame_counts: dict[int, int] = {}
     data_files: list[Path] = []
     video_files: list[Path] = []
     first_video_info: dict[str, Any] | None = None
+    image_stats_accumulator = init_image_stats_accumulator(num_channels=3)
 
     try:
         for episode_idx, source_idx in enumerate(episode_order.tolist()):
@@ -3505,6 +3581,15 @@ def generate_lerobot_v30_dataset(
             }
             if processed_dataset.path_signatures is not None:
                 episode_records[DEFAULT_PATH_SIGNATURE_KEY] = []
+            if use_delta_signature:
+                episode_records[DEFAULT_DELTA_SIGNATURE_KEY] = []
+            episode_delta_signatures = (
+                None
+                if not use_delta_signature
+                else compute_delta_signature_sequence_np(
+                    processed_dataset.path_signatures[source_idx]
+                )
+            )
 
             env.reset(
                 task_id=task_id,
@@ -3518,6 +3603,11 @@ def generate_lerobot_v30_dataset(
                     None
                     if processed_dataset.path_signatures is None
                     else processed_dataset.path_signatures[source_idx, frame_idx]
+                )
+                delta_signature_xy = (
+                    None
+                    if episode_delta_signatures is None
+                    else episode_delta_signatures[frame_idx]
                 )
                 # Render directly from the processed trajectory so export stays aligned
                 # with the saved observations even if replay dynamics diverge slightly.
@@ -3555,7 +3645,12 @@ def generate_lerobot_v30_dataset(
                         target_records[DEFAULT_PATH_SIGNATURE_KEY].append(
                             signature_xy.astype(np.float32).tolist()
                         )
+                    if delta_signature_xy is not None:
+                        target_records[DEFAULT_DELTA_SIGNATURE_KEY].append(
+                            delta_signature_xy.astype(np.float32).tolist()
+                        )
                 frame = env.render_frame()
+                update_image_stats_accumulator(image_stats_accumulator, frame)
                 ffmpeg_proc.stdin.write(frame.astype(np.uint8).tobytes())
                 global_index += 1
 
@@ -3603,6 +3698,11 @@ def generate_lerobot_v30_dataset(
         None
         if processed_dataset.path_signatures is None
         else np.asarray(records[DEFAULT_PATH_SIGNATURE_KEY], dtype=np.float32)
+    )
+    delta_signature_array = (
+        None
+        if not use_delta_signature
+        else np.asarray(records[DEFAULT_DELTA_SIGNATURE_KEY], dtype=np.float32)
     )
 
     episodes_table = pa.Table.from_arrays(
@@ -3762,12 +3862,29 @@ def generate_lerobot_v30_dataset(
             ),
             "backend": processed_dataset.path_signature_backend,
         }
+    if delta_signature_array is not None:
+        info["features"][DEFAULT_DELTA_SIGNATURE_KEY] = {
+            "dtype": "float32",
+            "shape": [int(delta_signature_array.shape[1])],
+            "names": [
+                f"delta_path_sig_{index}"
+                for index in range(int(delta_signature_array.shape[1]))
+            ],
+        }
+        info["delta_signature"] = {
+            "key": DEFAULT_DELTA_SIGNATURE_KEY,
+            "signature_key": DEFAULT_PATH_SIGNATURE_KEY,
+            "definition": "path_signature_t - path_signature_{t-1}",
+            "first_step_rule": "zeros",
+            "signature_dim": int(delta_signature_array.shape[1]),
+        }
 
     stats = {
         "observation.state": build_stats(state_array),
         "action": build_stats(action_array),
         "next.reward": build_stats(np.asarray(records["next.reward"], dtype=np.float32)),
         "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
+        VIDEO_KEY: finalize_image_stats(image_stats_accumulator),
     }
     if (
         processed_dataset.path_signatures is not None
@@ -3775,6 +3892,8 @@ def generate_lerobot_v30_dataset(
         and signature_array is not None
     ):
         stats[processed_dataset.path_signature_key] = build_stats(signature_array)
+    if delta_signature_array is not None:
+        stats[DEFAULT_DELTA_SIGNATURE_KEY] = build_stats(delta_signature_array)
 
     with info_file.open("w", encoding="utf-8") as info_handle:
         json.dump(info, info_handle, indent=4, ensure_ascii=False)
@@ -3876,6 +3995,20 @@ def validate_training_dataset_root(dataset_root: Path) -> None:
                     f"Expected signature_dim={expected_sig_dim}, got {signature_dim}. "
                     "Please regenerate the dataset."
                 )
+    delta_signature_spec = features.get(DEFAULT_DELTA_SIGNATURE_KEY)
+    if delta_signature_spec is not None:
+        delta_shape = delta_signature_spec.get("shape")
+        if path_signature is None:
+            raise ValueError(
+                "panda_route dataset includes delta_signature without path_signature metadata. "
+                "Please regenerate the dataset."
+            )
+        expected_delta_shape = [int(path_signature.get("signature_dim", 0))]
+        if delta_shape != expected_delta_shape:
+            raise ValueError(
+                "panda_route dataset delta_signature metadata is inconsistent with "
+                f"path_signature. Expected shape={expected_delta_shape}, got {delta_shape}."
+            )
 
 
 def get_eval_defaults(policy_type: str) -> dict[str, Any]:
@@ -3937,6 +4070,7 @@ def collect_dataset(args) -> Path:
         image_size=args.image_size,
         config=map_config,
         episodes_per_chunk=args.episodes_per_chunk,
+        use_delta_signature=bool(getattr(args, "enable_delta_signature", False)),
     )
     return output_path
 
@@ -3988,13 +4122,28 @@ def evaluate_policy(
     policy_dir: Path,
 ) -> None:
     import torch
+    from eval_helpers import (
+        build_prefix_sequence_eval_inputs,
+        ensure_prefix_sequence_batch_dims,
+    )
+    from lerobot_policy_streaming_act.prefix_sequence import (
+        PREFIX_DELTA_SIGNATURE_KEY,
+        PREFIX_MASK_KEY,
+        PREFIX_PATH_SIGNATURE_KEY,
+        PREFIX_STATE_KEY,
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    if len(cfg.image_features) == 0:
+    visual_features = (
+        cfg.visual_observation_features
+        if hasattr(cfg, "visual_observation_features")
+        else cfg.image_features
+    )
+    if len(visual_features) == 0:
         raise RuntimeError("Policy has no image input feature; visual eval assumes image input.")
-    image_key = list(cfg.image_features.keys())[0]
-    image_shape = tuple(cfg.image_features[image_key].shape)
+    image_key = list(visual_features.keys())[0]
+    image_shape = tuple(visual_features[image_key].shape)
     image_hw = (int(image_shape[1]), int(image_shape[2]))
     if image_hw[0] != image_hw[1]:
         raise RuntimeError("panda_route evaluation expects square image inputs.")
@@ -4011,6 +4160,20 @@ def evaluate_policy(
     use_path_signature = bool(
         policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
     )
+    use_prefix_sequence_training = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_prefix_sequence_training", False)
+    )
+    use_visual_prefix_memory = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_visual_prefix_memory", False)
+    )
+    use_delta_signature = bool(
+        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
+    )
+    build_explicit_prefix_eval_inputs = (
+        use_prefix_sequence_training and not use_visual_prefix_memory
+    )
     signature_key = DEFAULT_PATH_SIGNATURE_KEY
     signature_backend = None
     if use_path_signature:
@@ -4026,6 +4189,23 @@ def evaluate_policy(
             "[info] online path-signature enabled: "
             f"backend={signature_backend}, history=full_prefix, "
             f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+    if use_delta_signature:
+        print(
+            "[info] online delta-signature enabled: "
+            f"key={DEFAULT_DELTA_SIGNATURE_KEY}, rule=g_t-g_(t-1), first_step=zeros"
+        )
+    if build_explicit_prefix_eval_inputs:
+        print(
+            "[info] online prefix-sequence enabled: "
+            f"max_steps={cfg.prefix_train_max_steps}, stride={cfg.prefix_frame_stride}, "
+            f"pad_value={cfg.prefix_pad_value}"
+        )
+    elif use_visual_prefix_memory:
+        print(
+            "[info] visual prefix memory online update enabled: "
+            "rollout uses fixed-size recurrent memory without rebuilding "
+            "explicit prefix-sequence tensors each step"
         )
 
     map_config = build_default_map_config()
@@ -4092,6 +4272,15 @@ def evaluate_policy(
 
             trajectory = [state_xy]
             joint_history = deque() if use_path_signature else None
+            prefix_state_history = [] if build_explicit_prefix_eval_inputs else None
+            prefix_signature_history = (
+                [] if build_explicit_prefix_eval_inputs and use_path_signature else None
+            )
+            prefix_delta_signature_history = (
+                [] if build_explicit_prefix_eval_inputs and use_delta_signature else None
+            )
+            prefix_image_history = [] if build_explicit_prefix_eval_inputs else None
+            previous_signature_vec = None
             last_info = {
                 **env.last_info,
                 "phase_name": env.get_phase_name(state_xy),
@@ -4131,6 +4320,37 @@ def evaluate_policy(
                     obs[signature_key] = torch.from_numpy(
                         signature_vec.astype(np.float32, copy=False)
                     )
+                    if use_delta_signature:
+                        delta_signature_vec = compute_delta_signature_step_np(
+                            signature_vec,
+                            previous_signature_vec,
+                        )
+                        obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
+                            delta_signature_vec.astype(np.float32, copy=False)
+                        )
+                        previous_signature_vec = signature_vec.astype(np.float32, copy=True)
+
+                if build_explicit_prefix_eval_inputs:
+                    assert prefix_state_history is not None
+                    assert prefix_image_history is not None
+                    if use_path_signature:
+                        assert prefix_signature_history is not None
+                    if use_delta_signature:
+                        assert prefix_delta_signature_history is not None
+                    build_prefix_sequence_eval_inputs(
+                        obs=obs,
+                        cfg=cfg,
+                        state_key=state_key,
+                        image_key=image_key,
+                        signature_key=signature_key if use_path_signature else None,
+                        delta_signature_key=(
+                            DEFAULT_DELTA_SIGNATURE_KEY if use_delta_signature else None
+                        ),
+                        prefix_state_history=prefix_state_history,
+                        prefix_signature_history=prefix_signature_history,
+                        prefix_delta_signature_history=prefix_delta_signature_history,
+                        prefix_image_history=prefix_image_history,
+                    )
 
                 obs = preprocessor(obs)
                 if use_path_signature:
@@ -4150,6 +4370,32 @@ def evaluate_policy(
                     obs[signature_key] = path_signature.to(
                         device=obs[state_key].device,
                         dtype=obs[state_key].dtype,
+                    )
+                if use_delta_signature:
+                    if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
+                        raise KeyError(
+                            f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessor; "
+                            "cannot run policy with use_delta_signature=True."
+                        )
+                    delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
+                    if delta_signature.ndim == 1:
+                        delta_signature = delta_signature.unsqueeze(0)
+                    elif delta_signature.ndim != 2:
+                        raise RuntimeError(
+                            f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                            f"got shape={tuple(delta_signature.shape)}"
+                        )
+                    obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
+                        device=obs[state_key].device,
+                        dtype=obs[state_key].dtype,
+                    )
+                if build_explicit_prefix_eval_inputs:
+                    ensure_prefix_sequence_batch_dims(
+                        obs=obs,
+                        state_key=state_key,
+                        image_key=image_key,
+                        use_path_signature=use_path_signature,
+                        use_delta_signature=use_delta_signature,
                     )
 
                 with torch.no_grad():

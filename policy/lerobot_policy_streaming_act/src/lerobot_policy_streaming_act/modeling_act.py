@@ -35,6 +35,9 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .configuration_act import ACTConfig, FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
 from .prefix_sequence import (
+    DELTA_SIGNATURE_KEY,
+    PATH_SIGNATURE_KEY,
+    PREFIX_DELTA_SIGNATURE_KEY,
     PREFIX_MASK_KEY,
     PREFIX_PATH_SIGNATURE_KEY,
     PREFIX_STATE_KEY,
@@ -163,6 +166,10 @@ class StreamingACTPolicy(PreTrainedPolicy):
             "enabled": bool(self.config.use_visual_prefix_memory),
             "initialized": state is not None,
             "num_slots": int(self.config.num_memory_slots),
+            "signature_conditioned": bool(
+                getattr(self.config, "use_signature_conditioned_visual_prefix_memory", False)
+            ),
+            "uses_delta_signature": bool(getattr(self.config, "use_delta_signature", False)),
             "update_count": int(self._visual_prefix_memory_update_count),
             "state_norm": float(self._visual_prefix_memory_last_state_norm),
         }
@@ -333,8 +340,13 @@ class StreamingACT(nn.Module):
         super().__init__()
         self.config = config
         self.use_path_signature = config.use_path_signature
+        self.use_delta_signature = config.use_delta_signature
         self.use_first_frame_anchor = config.use_first_frame_anchor
         self.use_visual_prefix_memory = config.use_visual_prefix_memory
+        self.use_signature_conditioned_visual_prefix_memory = (
+            config.use_signature_conditioned_visual_prefix_memory
+        )
+        self.use_memory_conditioned_encoder_film = config.use_memory_conditioned_encoder_film
 
         if self.use_path_signature:
             assert config.signature_dim > 0, (
@@ -349,6 +361,19 @@ class StreamingACT(nn.Module):
             )
         else:
             self.signature_proj = None
+        if self.use_delta_signature:
+            assert config.signature_dim > 0, (
+                "`signature_dim` must be > 0 when `use_delta_signature=True` so that "
+                "`self.delta_signature_proj` can be initialized."
+            )
+            self.delta_signature_proj = nn.Sequential(
+                nn.Linear(config.signature_dim, config.signature_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.signature_dropout),
+                nn.Linear(config.signature_hidden_dim, config.dim_model),
+            )
+        else:
+            self.delta_signature_proj = None
 
         if self.config.use_vae:
             self.vae_encoder = StreamingACTEncoder(config, is_vae_encoder=True)
@@ -411,17 +436,32 @@ class StreamingACT(nn.Module):
             self.anchor_token_proj = nn.Linear(config.dim_model, config.dim_model)
         if self.use_visual_prefix_memory:
             self.visual_prefix_memory_pool = nn.AdaptiveAvgPool2d((1, 1))
+            visual_prefix_memory_input_dim = config.dim_model * (
+                2 + int(self.use_signature_conditioned_visual_prefix_memory) + int(self.use_delta_signature)
+            )
             self.visual_prefix_memory_update = nn.GRUCell(
-                input_size=config.dim_model * 2,
+                input_size=visual_prefix_memory_input_dim,
                 hidden_size=config.dim_model,
             )
             self.visual_prefix_memory_extra_updates = nn.ModuleList(
                 nn.GRUCell(
-                    input_size=config.dim_model * 2,
+                    input_size=visual_prefix_memory_input_dim,
                     hidden_size=config.dim_model,
                 )
                 for _ in range(config.num_memory_slots - 1)
             )
+            if self.use_memory_conditioned_encoder_film:
+                self.visual_prefix_memory_encoder_film = nn.Sequential(
+                    nn.Linear(config.dim_model, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model * 2),
+                )
+                # Start from the identity transform so existing training dynamics stay unchanged
+                # until the model learns to use memory-conditioned modulation.
+                nn.init.zeros_(self.visual_prefix_memory_encoder_film[-1].weight)
+                nn.init.zeros_(self.visual_prefix_memory_encoder_film[-1].bias)
+            else:
+                self.visual_prefix_memory_encoder_film = None
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -527,6 +567,32 @@ class StreamingACT(nn.Module):
             assert prefix_signature.shape[2] == self.config.signature_dim, (
                 f"`{PREFIX_PATH_SIGNATURE_KEY}` signature dim must equal "
                 f"`signature_dim={self.config.signature_dim}`. Got {prefix_signature.shape[2]}."
+            )
+        if self.use_delta_signature:
+            prefix_delta_signature = batch.get(PREFIX_DELTA_SIGNATURE_KEY)
+            assert prefix_delta_signature is not None, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` is required when "
+                "`use_delta_signature=True` and `use_prefix_sequence_training=True`."
+            )
+            assert prefix_delta_signature.ndim == 3, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` must have shape "
+                f"(batch_size, T_prefix, signature_dim). "
+                f"Got ndim={prefix_delta_signature.ndim}, "
+                f"shape={tuple(prefix_delta_signature.shape)}."
+            )
+            assert prefix_delta_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{PREFIX_DELTA_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {prefix_delta_signature.shape[0]}."
+            )
+            assert prefix_delta_signature.shape[1] == prefix_mask.shape[1], (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got delta_time={prefix_delta_signature.shape[1]}, "
+                f"mask_time={prefix_mask.shape[1]}."
+            )
+            assert prefix_delta_signature.shape[2] == self.config.signature_dim, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` signature dim must equal "
+                f"`signature_dim={self.config.signature_dim}`. "
+                f"Got {prefix_delta_signature.shape[2]}."
             )
 
         for prefix_image_key, prefix_image_feature in self.config.prefix_image_features.items():
@@ -650,11 +716,123 @@ class StreamingACT(nn.Module):
         projected = self.encoder_robot_state_input_proj(flat_prefix_state)
         return projected.reshape(batch_size, time_steps, self.config.dim_model)
 
+    def _project_signature_tensor(
+        self,
+        signature: Tensor,
+        *,
+        context: str,
+    ) -> Tensor:
+        if self.signature_proj is None:
+            raise RuntimeError(f"{context} requires `self.signature_proj` to be initialized.")
+        if signature.ndim not in {2, 3}:
+            raise ValueError(
+                f"{context} must have shape (B, D_sig) or (B, T, D_sig). Got {tuple(signature.shape)}."
+            )
+        if signature.shape[-1] != self.config.signature_dim:
+            raise ValueError(
+                f"{context} trailing dim must equal signature_dim={self.config.signature_dim}. "
+                f"Got {signature.shape[-1]}."
+            )
+        dtype = self.signature_proj[0].weight.dtype
+        if signature.ndim == 2:
+            return self.signature_proj(signature.to(dtype=dtype))
+        batch_size, time_steps, signature_dim = signature.shape
+        flat_signature = signature.reshape(batch_size * time_steps, signature_dim)
+        projected = self.signature_proj(flat_signature.to(dtype=dtype))
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _project_delta_signature_tensor(
+        self,
+        delta_signature: Tensor,
+        *,
+        context: str,
+    ) -> Tensor:
+        if self.delta_signature_proj is None:
+            raise RuntimeError(
+                f"{context} requires `self.delta_signature_proj` to be initialized."
+            )
+        if delta_signature.ndim not in {2, 3}:
+            raise ValueError(
+                f"{context} must have shape (B, D_sig) or (B, T, D_sig). Got {tuple(delta_signature.shape)}."
+            )
+        if delta_signature.shape[-1] != self.config.signature_dim:
+            raise ValueError(
+                f"{context} trailing dim must equal signature_dim={self.config.signature_dim}. "
+                f"Got {delta_signature.shape[-1]}."
+            )
+        dtype = self.delta_signature_proj[0].weight.dtype
+        if delta_signature.ndim == 2:
+            return self.delta_signature_proj(delta_signature.to(dtype=dtype))
+        batch_size, time_steps, signature_dim = delta_signature.shape
+        flat_delta_signature = delta_signature.reshape(batch_size * time_steps, signature_dim)
+        projected = self.delta_signature_proj(flat_delta_signature.to(dtype=dtype))
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _build_visual_prefix_memory_step_input(
+        self,
+        *,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+    ) -> Tensor:
+        inputs = [visual_t, state_t]
+        if self.use_signature_conditioned_visual_prefix_memory:
+            if signature_t is None:
+                raise ValueError(
+                    "Signature-conditioned visual prefix memory update requires `signature_t`."
+                )
+            inputs.append(signature_t)
+            if self.use_delta_signature:
+                if delta_signature_t is None:
+                    raise ValueError(
+                        "Delta-signature-conditioned visual prefix memory update requires "
+                        "`delta_signature_t` when `use_delta_signature=True`."
+                    )
+                inputs.append(delta_signature_t)
+        return torch.cat(inputs, dim=-1)
+
+    def _update_visual_prefix_memory_step(
+        self,
+        *,
+        memory_prev: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        valid_t: Tensor | None,
+    ) -> Tensor:
+        batch_size = memory_prev.shape[0]
+        step_input = self._build_visual_prefix_memory_step_input(
+            visual_t=visual_t,
+            state_t=state_t,
+            signature_t=signature_t,
+            delta_signature_t=delta_signature_t,
+        )
+        updated_hidden = torch.stack(
+            [
+                slot_update(step_input, memory_prev[:, slot_idx, :])
+                for slot_idx, slot_update in enumerate(self._iter_visual_prefix_memory_updates())
+            ],
+            dim=1,
+        )
+        if valid_t is None:
+            return updated_hidden
+        valid_t = valid_t.to(dtype=torch.bool, device=memory_prev.device)
+        if valid_t.shape != (batch_size,):
+            raise ValueError(
+                "Visual prefix memory valid mask must have shape "
+                f"({batch_size},). Got {tuple(valid_t.shape)}."
+            )
+        return torch.where(valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev)
+
     def _scan_visual_prefix_memory(
         self,
         *,
         visual_embeddings: Tensor,
         state_embeddings: Tensor,
+        signature_embeddings: Tensor | None,
+        delta_signature_embeddings: Tensor | None,
         prefix_mask: Tensor,
         initial_state: Tensor | None = None,
     ) -> Tensor:
@@ -668,6 +846,18 @@ class StreamingACT(nn.Module):
             "Visual prefix memory mask must match the prefix sequence shape. "
             f"Got mask={tuple(prefix_mask.shape)} vs sequence={(batch_size, time_steps)}."
         )
+        if signature_embeddings is not None:
+            assert signature_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+                "Visual prefix memory signature embeddings must match visual embeddings. "
+                f"Got signature={tuple(signature_embeddings.shape)} vs "
+                f"visual={tuple(visual_embeddings.shape)}."
+            )
+        if delta_signature_embeddings is not None:
+            assert delta_signature_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+                "Visual prefix memory delta-signature embeddings must match visual embeddings. "
+                f"Got delta_signature={tuple(delta_signature_embeddings.shape)} vs "
+                f"visual={tuple(visual_embeddings.shape)}."
+            )
 
         if initial_state is None:
             hidden = self._build_zero_visual_prefix_memory_state(
@@ -685,22 +875,77 @@ class StreamingACT(nn.Module):
             )
 
         prefix_mask = prefix_mask.to(dtype=torch.bool, device=visual_embeddings.device)
-        slot_updates = self._iter_visual_prefix_memory_updates()
         for step_idx in range(time_steps):
-            step_input = torch.cat(
-                [visual_embeddings[:, step_idx], state_embeddings[:, step_idx]],
-                dim=-1,
+            hidden = self._update_visual_prefix_memory_step(
+                memory_prev=hidden,
+                visual_t=visual_embeddings[:, step_idx],
+                state_t=state_embeddings[:, step_idx],
+                signature_t=(
+                    None if signature_embeddings is None else signature_embeddings[:, step_idx]
+                ),
+                delta_signature_t=(
+                    None
+                    if delta_signature_embeddings is None
+                    else delta_signature_embeddings[:, step_idx]
+                ),
+                valid_t=prefix_mask[:, step_idx],
             )
-            updated_hidden = torch.stack(
-                [
-                    slot_update(step_input, hidden[:, slot_idx, :])
-                    for slot_idx, slot_update in enumerate(slot_updates)
-                ],
-                dim=1,
-            )
-            mask_t = prefix_mask[:, step_idx].view(batch_size, 1, 1)
-            hidden = torch.where(mask_t, updated_hidden, hidden)
         return hidden
+
+    def _pool_visual_prefix_memory_context(self, memory_state: Tensor) -> Tensor:
+        if memory_state.ndim != 3:
+            raise ValueError(
+                "Visual prefix memory state must have shape "
+                f"(batch_size, num_memory_slots, dim_model). Got {tuple(memory_state.shape)}."
+            )
+        return memory_state.mean(dim=1)
+
+    def _apply_visual_prefix_memory_encoder_film(
+        self,
+        encoder_tokens: Tensor,
+        *,
+        memory_context: Tensor,
+        exclude_prefix_tokens: int = 0,
+    ) -> Tensor:
+        if self.visual_prefix_memory_encoder_film is None:
+            raise RuntimeError(
+                "`_apply_visual_prefix_memory_encoder_film` requires "
+                "`self.visual_prefix_memory_encoder_film` to be initialized."
+            )
+        if encoder_tokens.ndim != 3:
+            raise ValueError(
+                "Encoder tokens must have shape (sequence, batch_size, dim_model). "
+                f"Got {tuple(encoder_tokens.shape)}."
+            )
+        if memory_context.ndim != 2:
+            raise ValueError(
+                "Memory context must have shape (batch_size, dim_model). "
+                f"Got {tuple(memory_context.shape)}."
+            )
+        seq_len, batch_size, dim_model = encoder_tokens.shape
+        if memory_context.shape != (batch_size, dim_model):
+            raise ValueError(
+                "Memory context shape mismatch. "
+                f"Expected {(batch_size, dim_model)}, got {tuple(memory_context.shape)}."
+            )
+        if exclude_prefix_tokens < 0 or exclude_prefix_tokens > seq_len:
+            raise ValueError(
+                "`exclude_prefix_tokens` must lie in [0, sequence_length]. "
+                f"Got {exclude_prefix_tokens} for sequence_length={seq_len}."
+            )
+        if exclude_prefix_tokens == seq_len:
+            return encoder_tokens
+
+        film_params = self.visual_prefix_memory_encoder_film(
+            memory_context.to(dtype=encoder_tokens.dtype)
+        )
+        gamma, beta = film_params.chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        target_tokens = encoder_tokens[exclude_prefix_tokens:]
+        conditioned = target_tokens * (1.0 + gamma.unsqueeze(0)) + beta.unsqueeze(0)
+        if exclude_prefix_tokens == 0:
+            return conditioned
+        return torch.cat([encoder_tokens[:exclude_prefix_tokens], conditioned], dim=0)
 
     def _compute_visual_prefix_memory_token_from_prefix_sequence(
         self,
@@ -718,9 +963,31 @@ class StreamingACT(nn.Module):
         ]
         visual_embeddings = self._reduce_camera_embeddings_for_visual_prefix_memory(camera_embeddings)
         state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
+        signature_embeddings = None
+        delta_signature_embeddings = None
+        if self.use_signature_conditioned_visual_prefix_memory:
+            assert PREFIX_PATH_SIGNATURE_KEY in batch, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required to reconstruct signature-conditioned "
+                "visual prefix memory during training."
+            )
+            signature_embeddings = self._project_signature_tensor(
+                batch[PREFIX_PATH_SIGNATURE_KEY],
+                context="Prefix path-signature sequence",
+            )
+            if self.use_delta_signature:
+                assert PREFIX_DELTA_SIGNATURE_KEY in batch, (
+                    f"`{PREFIX_DELTA_SIGNATURE_KEY}` is required to reconstruct "
+                    "delta-signature-conditioned visual prefix memory during training."
+                )
+                delta_signature_embeddings = self._project_delta_signature_tensor(
+                    batch[PREFIX_DELTA_SIGNATURE_KEY],
+                    context="Prefix delta-signature sequence",
+                )
         memory_state = self._scan_visual_prefix_memory(
             visual_embeddings=visual_embeddings,
             state_embeddings=state_embeddings,
+            signature_embeddings=signature_embeddings,
+            delta_signature_embeddings=delta_signature_embeddings,
             prefix_mask=batch[PREFIX_MASK_KEY],
         )
         return memory_state
@@ -762,14 +1029,37 @@ class StreamingACT(nn.Module):
                 dtype=visual_embedding.dtype,
                 context="Cached visual prefix memory state",
             )
-
-        step_input = torch.cat([visual_embedding, state_embedding], dim=-1)
-        next_state = torch.stack(
-            [
-                slot_update(step_input, hidden[:, slot_idx, :])
-                for slot_idx, slot_update in enumerate(self._iter_visual_prefix_memory_updates())
-            ],
-            dim=1,
+        signature_embedding = None
+        delta_signature_embedding = None
+        if self.use_signature_conditioned_visual_prefix_memory:
+            assert PATH_SIGNATURE_KEY in batch, (
+                "Online signature-conditioned visual prefix memory update requires "
+                f"`{PATH_SIGNATURE_KEY}` in the batch."
+            )
+            signature_embedding = self._project_signature_tensor(
+                batch[PATH_SIGNATURE_KEY],
+                context="Current path signature",
+            )
+            if self.use_delta_signature:
+                assert DELTA_SIGNATURE_KEY in batch, (
+                    "Online delta-signature-conditioned visual prefix memory update requires "
+                    f"`{DELTA_SIGNATURE_KEY}` in the batch."
+                )
+                delta_signature_embedding = self._project_delta_signature_tensor(
+                    batch[DELTA_SIGNATURE_KEY],
+                    context="Current delta signature",
+                )
+        next_state = self._update_visual_prefix_memory_step(
+            memory_prev=hidden,
+            visual_t=visual_embedding,
+            state_t=state_embedding,
+            signature_t=signature_embedding,
+            delta_signature_t=delta_signature_embedding,
+            valid_t=torch.ones(
+                (visual_embedding.shape[0],),
+                dtype=torch.bool,
+                device=visual_embedding.device,
+            ),
         )
         return next_state, next_state
 
@@ -788,8 +1078,11 @@ class StreamingACT(nn.Module):
 
             [image_features]: (B, n_cameras, C, H, W) batch of current-step images.
             [FIRST_FRAME_ANCHOR_KEY] (optional): (B, C, H, W) first-frame anchor image.
+            [PATH_SIGNATURE_KEY] (optional): (B, signature_dim) current path signature.
+            [DELTA_SIGNATURE_KEY] (optional): (B, signature_dim) current delta signature.
             [PREFIX_STATE_KEY] (optional): (B, T_prefix, state_dim) prefix state sequence.
             [PREFIX_PATH_SIGNATURE_KEY] (optional): (B, T_prefix, signature_dim) prefix signature sequence.
+            [PREFIX_DELTA_SIGNATURE_KEY] (optional): (B, T_prefix, signature_dim) prefix delta-signature sequence.
             [PREFIX_MASK_KEY] (optional): (B, T_prefix) prefix valid mask.
                 AND/OR
             [env_state_feature]: (B, env_dim) batch of environment states.
@@ -811,32 +1104,61 @@ class StreamingACT(nn.Module):
         if not skip_prefix_sequence_validation:
             self._validate_prefix_sequence_inputs(batch, batch_size)
 
+        signature_embed = None
         if self.use_path_signature:
-            path_signature_key = "observation.path_signature"
-            assert path_signature_key in batch, (
-                f"`{path_signature_key}` is required when `use_path_signature=True`."
+            assert PATH_SIGNATURE_KEY in batch, (
+                f"`{PATH_SIGNATURE_KEY}` is required when `use_path_signature=True`."
             )
-            path_signature = batch[path_signature_key]
+            path_signature = batch[PATH_SIGNATURE_KEY]
             assert path_signature.ndim == 2, (
-                f"`{path_signature_key}` must have shape (batch_size, signature_dim). "
+                f"`{PATH_SIGNATURE_KEY}` must have shape (batch_size, signature_dim). "
                 f"Got ndim={path_signature.ndim}, shape={tuple(path_signature.shape)}."
             )
             assert path_signature.shape[0] == batch_size, (
-                f"Batch mismatch for `{path_signature_key}`: expected {batch_size}, "
+                f"Batch mismatch for `{PATH_SIGNATURE_KEY}`: expected {batch_size}, "
                 f"got {path_signature.shape[0]}."
             )
             assert path_signature.shape[1] == self.config.signature_dim, (
-                f"`{path_signature_key}` second dim must be `signature_dim={self.config.signature_dim}`. "
+                f"`{PATH_SIGNATURE_KEY}` second dim must be `signature_dim={self.config.signature_dim}`. "
                 f"Got {path_signature.shape[1]}."
             )
-
-            path_signature = path_signature.to(dtype=self.signature_proj[0].weight.dtype)
-            signature_embed = self.signature_proj(path_signature)
+            signature_embed = self._project_signature_tensor(
+                path_signature,
+                context="Current path signature",
+            )
             assert signature_embed.shape == (batch_size, self.config.dim_model), (
                 f"`signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
                 f"Got {tuple(signature_embed.shape)}."
             )
             signature_embed = signature_embed.unsqueeze(1)  # (B, 1, D)
+        delta_signature_embed = None
+        if self.use_delta_signature:
+            assert DELTA_SIGNATURE_KEY in batch, (
+                f"`{DELTA_SIGNATURE_KEY}` is required when `use_delta_signature=True`."
+            )
+            delta_signature = batch[DELTA_SIGNATURE_KEY]
+            assert delta_signature.ndim == 2, (
+                f"`{DELTA_SIGNATURE_KEY}` must have shape (batch_size, signature_dim). "
+                f"Got ndim={delta_signature.ndim}, shape={tuple(delta_signature.shape)}."
+            )
+            assert delta_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{DELTA_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {delta_signature.shape[0]}."
+            )
+            assert delta_signature.shape[1] == self.config.signature_dim, (
+                f"`{DELTA_SIGNATURE_KEY}` second dim must be "
+                f"`signature_dim={self.config.signature_dim}`. "
+                f"Got {delta_signature.shape[1]}."
+            )
+            delta_signature_embed = self._project_delta_signature_tensor(
+                delta_signature,
+                context="Current delta signature",
+            )
+            assert delta_signature_embed.shape == (batch_size, self.config.dim_model), (
+                f"`delta_signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(delta_signature_embed.shape)}."
+            )
+            delta_signature_embed = delta_signature_embed.unsqueeze(1)  # (B, 1, D)
 
         if self.use_first_frame_anchor:
             assert FIRST_FRAME_ANCHOR_KEY in batch, (
@@ -974,11 +1296,27 @@ class StreamingACT(nn.Module):
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
 
+        if self.use_memory_conditioned_encoder_film:
+            assert visual_prefix_memory_embed is not None, (
+                "Memory-conditioned encoder FiLM requires `visual_prefix_memory_embed`."
+            )
+            memory_context = self._pool_visual_prefix_memory_context(visual_prefix_memory_embed)
+            # Keep the latent token untouched and modulate the current-step observation tokens.
+            encoder_in_tokens = self._apply_visual_prefix_memory_encoder_film(
+                encoder_in_tokens,
+                memory_context=memory_context,
+                exclude_prefix_tokens=1,
+            )
+
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
 
         extra_memory_tokens = []
         extra_memory_pos_embed = []
+        # Decoder cross-attention memory order:
+        # [anchor?, signature?, delta_signature?, prefix_memory_slots?, encoder_tokens...].
+        # These extra 1D tokens intentionally use zero positional embeddings; token type
+        # is conveyed by their dedicated projection path and fixed insertion order.
         if self.use_first_frame_anchor:
             anchor_token = anchor_embed.transpose(0, 1).to(
                 device=encoder_out.device, dtype=encoder_out.dtype
@@ -1001,6 +1339,19 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(signature_token)
             extra_memory_pos_embed.append(signature_pos_embed)
+        if self.use_delta_signature:
+            assert delta_signature_embed is not None
+            delta_signature_token = delta_signature_embed.transpose(0, 1).to(
+                device=encoder_out.device,
+                dtype=encoder_out.dtype,
+            )  # (1, B, D)
+            delta_signature_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            extra_memory_tokens.append(delta_signature_token)
+            extra_memory_pos_embed.append(delta_signature_pos_embed)
         if self.use_visual_prefix_memory:
             assert visual_prefix_memory_embed is not None
             visual_prefix_memory_token = visual_prefix_memory_embed.transpose(0, 1).to(

@@ -20,6 +20,12 @@ train:
   wandb_console: "off"
   wandb_service_wait: 10
   use_path_signature: true
+  use_prefix_sequence_training: false
+  prefix_train_max_steps: 32
+  prefix_frame_stride: 1
+  prefix_pad_value: 0.0
+  use_visual_prefix_memory: false
+  num_memory_slots: 1
   history_length: 0
   signature_dim: 0
   signature_depth: 3

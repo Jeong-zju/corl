@@ -1,8 +1,8 @@
 train:
   dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
-  output_root: "outputs/train/braidedhub_fourstart_streaming_act"
-  job_name: "streaming_act_braidedhub_fourstart"
+  output_root: "outputs/train/braidedhub_fourstart_streaming_act_sipm"
+  job_name: "streaming_act_braidedhub_fourstart_sipm"
   wandb_project: "lerobot-braidedhub"
   wandb_mode: "online"
   device: "cuda"
@@ -13,14 +13,23 @@ train:
   log_freq: 50
   save_freq: 10000
   eval_freq: -1
-  chunk_size: 5
-  n_action_steps: 5
-  use_first_frame_anchor: true
+  chunk_size: 50
+  n_action_steps: 50
+  use_first_frame_anchor: false
   use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10
   use_path_signature: true
+  use_delta_signature: true
+  use_prefix_sequence_training: true
+  prefix_train_max_steps: 16
+  prefix_frame_stride: 5
+  prefix_pad_value: 0.0
+  use_visual_prefix_memory: true
+  use_signature_conditioned_visual_prefix_memory: true
+  use_memory_conditioned_encoder_film: true
+  num_memory_slots: 1
   history_length: 0
   signature_dim: 0
   signature_depth: 3
@@ -28,8 +37,8 @@ train:
   signature_dropout: 0.1
 
 eval:
-  train_output_root: "outputs/train/braidedhub_fourstart_streaming_act"
-  output_dir: "outputs/eval/braidedhub_fourstart_streaming_act/{run_tag}"
+  train_output_root: "outputs/train/braidedhub_fourstart_streaming_act_sipm"
+  output_dir: "outputs/eval/braidedhub_fourstart_streaming_act_sipm/{run_tag}"
   num_rollouts: 50
   max_steps: 240
   fps: 20

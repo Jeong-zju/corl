@@ -212,6 +212,207 @@ def validate_first_frame_anchor_dataset(dataset_root: Path, use_first_frame_anch
         )
 
 
+def validate_prefix_sequence_support(
+    *,
+    env_name: str,
+    policy_name: str,
+    use_prefix_sequence_training: bool,
+    context: str,
+) -> None:
+    if not use_prefix_sequence_training:
+        return
+    if policy_name != "streaming_act":
+        raise NotImplementedError(
+            "Prefix-sequence training is currently implemented only for `streaming_act`. "
+            f"Got policy={policy_name!r} during {context}."
+        )
+
+
+def validate_prefix_sequence_dataset(
+    dataset_root: Path,
+    *,
+    use_prefix_sequence_training: bool,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+) -> None:
+    if not use_prefix_sequence_training:
+        return
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
+    features = info.get("features", {})
+
+    state_spec = features.get("observation.state")
+    if state_spec is None:
+        raise KeyError(
+            "Prefix-sequence mode requires dataset feature `observation.state`."
+        )
+
+    camera_keys = [
+        key
+        for key, spec in features.items()
+        if isinstance(spec, dict)
+        and spec.get("dtype") in {"image", "video"}
+        and key != FIRST_FRAME_ANCHOR_KEY
+    ]
+    if not camera_keys:
+        raise KeyError(
+            "Prefix-sequence mode requires at least one regular observation image feature."
+        )
+    missing_camera_stats = [key for key in camera_keys if key not in stats]
+    if missing_camera_stats:
+        raise KeyError(
+            "Prefix-sequence mode requires image stats for all regular observation cameras. "
+            f"Missing: {missing_camera_stats}."
+        )
+
+    if "observation.state" not in stats:
+        raise KeyError(
+            "Prefix-sequence mode requires `observation.state` stats in meta/stats.json."
+        )
+
+    if use_path_signature:
+        sig_key = "observation.path_signature"
+        if sig_key not in features:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset feature `{sig_key}`. "
+                "Regenerate the dataset with path-signature export enabled."
+            )
+        if sig_key not in stats:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset stats for `{sig_key}`."
+            )
+    if use_delta_signature:
+        delta_sig_key = "observation.delta_signature"
+        if delta_sig_key not in features:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset feature `{delta_sig_key}` "
+                "when delta signatures are enabled."
+            )
+        if delta_sig_key not in stats:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset stats for `{delta_sig_key}`."
+            )
+
+
+def validate_delta_signature_dataset(
+    dataset_root: Path,
+    *,
+    use_delta_signature: bool,
+) -> None:
+    if not use_delta_signature:
+        return
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
+    features = info.get("features", {})
+    delta_sig_key = "observation.delta_signature"
+    delta_sig_spec = features.get(delta_sig_key)
+    if delta_sig_spec is None:
+        raise KeyError(
+            f"Dataset feature `{delta_sig_key}` not found in {dataset_root / 'meta/info.json'}. "
+            "Regenerate the dataset with delta-signature export enabled."
+        )
+    shape = delta_sig_spec.get("shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) != 1 or int(shape[0]) <= 0:
+        raise ValueError(
+            f"Invalid shape for `{delta_sig_key}` in dataset info: {shape}. "
+            "Expected [signature_dim]."
+        )
+    if delta_sig_key not in stats:
+        raise KeyError(
+            f"Dataset stats for `{delta_sig_key}` are missing from {dataset_root / 'meta/stats.json'}."
+        )
+
+
+def validate_visual_prefix_memory_support(
+    *,
+    policy_name: str,
+    use_visual_prefix_memory: bool,
+    use_prefix_sequence_training: bool,
+) -> None:
+    if not use_visual_prefix_memory:
+        return
+    if policy_name != "streaming_act":
+        raise NotImplementedError(
+            "Visual prefix memory is currently implemented only for `streaming_act`. "
+            f"Got policy={policy_name!r}."
+        )
+    if not use_prefix_sequence_training:
+        raise ValueError(
+            "`--enable-visual-prefix-memory` requires "
+            "`--enable-prefix-sequence-training`."
+        )
+
+
+def build_policy_feature_overrides(
+    dataset_root: Path,
+    *,
+    use_prefix_sequence_training: bool,
+    prefix_train_max_steps: int,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+):
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+
+    from lerobot.datasets.utils import dataset_to_policy_features
+    from lerobot.configs.types import FeatureType
+    from lerobot_policy_streaming_act.prefix_sequence import (
+        build_prefix_sequence_input_features,
+    )
+
+    dataset_features = dataset_to_policy_features(info.get("features", {}))
+    output_features = {
+        key: feature
+        for key, feature in dataset_features.items()
+        if feature.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: feature
+        for key, feature in dataset_features.items()
+        if key not in output_features
+    }
+    if use_prefix_sequence_training:
+        input_features = build_prefix_sequence_input_features(
+            base_input_features=input_features,
+            prefix_train_max_steps=prefix_train_max_steps,
+            use_path_signature=use_path_signature,
+            use_delta_signature=use_delta_signature,
+        )
+    return input_features, output_features
+
+
+def install_prefix_sequence_dataset_patch() -> None:
+    import lerobot.datasets.factory as dataset_factory
+    import lerobot.scripts.lerobot_train as lerobot_train_module
+    from lerobot_policy_streaming_act.prefix_sequence import PrefixSequenceDataset
+
+    if getattr(lerobot_train_module, "_prefix_sequence_patch_installed", False):
+        return
+
+    original_make_dataset = dataset_factory.make_dataset
+
+    def make_dataset_with_prefix(cfg):
+        dataset = original_make_dataset(cfg)
+        policy_cfg = cfg.policy
+        if not bool(getattr(policy_cfg, "use_prefix_sequence_training", False)):
+            return dataset
+        if isinstance(dataset, PrefixSequenceDataset):
+            return dataset
+        return PrefixSequenceDataset(
+            dataset,
+            prefix_train_max_steps=int(policy_cfg.prefix_train_max_steps),
+            prefix_frame_stride=int(policy_cfg.prefix_frame_stride),
+            prefix_pad_value=float(policy_cfg.prefix_pad_value),
+            use_path_signature=bool(getattr(policy_cfg, "use_path_signature", False)),
+            use_delta_signature=bool(getattr(policy_cfg, "use_delta_signature", False)),
+        )
+
+    dataset_factory.make_dataset = make_dataset_with_prefix
+    lerobot_train_module.make_dataset = make_dataset_with_prefix
+    lerobot_train_module._prefix_sequence_patch_installed = True
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--env", choices=get_env_choices(), default="h_shape")
@@ -424,6 +625,138 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=float,
             default=defaults.get("signature_dropout", 0.1),
         )
+        delta_signature_group = parser.add_mutually_exclusive_group()
+        delta_signature_group.add_argument(
+            "--enable-delta-signature",
+            dest="use_delta_signature",
+            action="store_true",
+            help=(
+                "Enable observation.delta_signature and optional delta-signature "
+                "encoder-memory token support."
+            ),
+        )
+        delta_signature_group.add_argument(
+            "--disable-delta-signature",
+            dest="use_delta_signature",
+            action="store_false",
+            help="Disable delta-signature inputs and token injection.",
+        )
+        parser.set_defaults(
+            use_delta_signature=defaults.get("use_delta_signature", False),
+        )
+        prefix_group = parser.add_mutually_exclusive_group()
+        prefix_group.add_argument(
+            "--enable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_true",
+            help=(
+                "Enable prefix-sequence training inputs derived from the full episode "
+                "prefix up to the current step."
+            ),
+        )
+        prefix_group.add_argument(
+            "--disable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_false",
+            help="Disable prefix-sequence training inputs.",
+        )
+        parser.set_defaults(
+            use_prefix_sequence_training=defaults.get("use_prefix_sequence_training", False),
+        )
+        parser.add_argument(
+            "--prefix-train-max-steps",
+            type=int,
+            default=defaults.get("prefix_train_max_steps", 32),
+            help=(
+                "Maximum number of prefix elements kept per training sample. "
+                "Prefix tensors are right padded to this length."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-frame-stride",
+            type=int,
+            default=defaults.get("prefix_frame_stride", 1),
+            help=(
+                "Stride used when subsampling the episode prefix. "
+                "The current step is always kept as the last valid element."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-pad-value",
+            type=float,
+            default=defaults.get("prefix_pad_value", 0.0),
+            help="Padding value used for prefix state/signature tensors.",
+        )
+        visual_prefix_memory_group = parser.add_mutually_exclusive_group()
+        visual_prefix_memory_group.add_argument(
+            "--enable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_true",
+            help=(
+                "Enable GRU-style visual prefix memory tokens built from prefix "
+                "images and prefix states."
+            ),
+        )
+        visual_prefix_memory_group.add_argument(
+            "--disable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_false",
+            help="Disable the visual prefix memory token.",
+        )
+        parser.set_defaults(
+            use_visual_prefix_memory=defaults.get("use_visual_prefix_memory", False),
+        )
+        parser.add_argument(
+            "--num-memory-slots",
+            type=int,
+            default=defaults.get("num_memory_slots", 1),
+            help=(
+                "Number of visual prefix memory slots. Each slot keeps an "
+                "independent GRU-style memory state."
+            ),
+        )
+        signature_conditioned_memory_group = parser.add_mutually_exclusive_group()
+        signature_conditioned_memory_group.add_argument(
+            "--enable-signature-conditioned-visual-prefix-memory",
+            dest="use_signature_conditioned_visual_prefix_memory",
+            action="store_true",
+            help=(
+                "Condition visual prefix memory updates on path signatures and, "
+                "when enabled, delta signatures."
+            ),
+        )
+        signature_conditioned_memory_group.add_argument(
+            "--disable-signature-conditioned-visual-prefix-memory",
+            dest="use_signature_conditioned_visual_prefix_memory",
+            action="store_false",
+            help="Disable signature-conditioned visual prefix memory updates.",
+        )
+        parser.set_defaults(
+            use_signature_conditioned_visual_prefix_memory=defaults.get(
+                "use_signature_conditioned_visual_prefix_memory", False
+            ),
+        )
+        memory_conditioning_group = parser.add_mutually_exclusive_group()
+        memory_conditioning_group.add_argument(
+            "--enable-memory-conditioned-encoder-film",
+            dest="use_memory_conditioned_encoder_film",
+            action="store_true",
+            help=(
+                "Let the pooled visual prefix memory FiLM-modulate the current-step "
+                "ACT encoder tokens before the transformer encoder."
+            ),
+        )
+        memory_conditioning_group.add_argument(
+            "--disable-memory-conditioned-encoder-film",
+            dest="use_memory_conditioned_encoder_film",
+            action="store_false",
+            help="Disable memory-conditioned encoder FiLM modulation.",
+        )
+        parser.set_defaults(
+            use_memory_conditioned_encoder_film=defaults.get(
+                "use_memory_conditioned_encoder_film", False
+            ),
+        )
     return parser
 
 
@@ -488,6 +821,15 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
+        use_delta_signature = bool(args.use_delta_signature)
+        use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
+        use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
+        validate_prefix_sequence_support(
+            env_name=args.env,
+            policy_name=args.policy,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            context="training",
+        )
         resolved_history_length = resolve_history_length(
             dataset_root=dataset_root,
             history_length=args.history_length,
@@ -497,10 +839,42 @@ def main(argv: list[str] | None = None) -> None:
             use_path_signature=use_path_signature,
             signature_dim=args.signature_dim,
         )
+        validate_delta_signature_dataset(
+            dataset_root=dataset_root,
+            use_delta_signature=use_delta_signature,
+        )
+        validate_prefix_sequence_dataset(
+            dataset_root=dataset_root,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            use_path_signature=use_path_signature,
+            use_delta_signature=use_delta_signature,
+        )
+        validate_visual_prefix_memory_support(
+            policy_name=args.policy,
+            use_visual_prefix_memory=use_visual_prefix_memory,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+        )
     else:
         use_path_signature = False
+        use_delta_signature = False
+        use_prefix_sequence_training = False
+        use_visual_prefix_memory = False
         resolved_history_length = 0
         signature_dim = 0
+
+    if use_prefix_sequence_training:
+        install_prefix_sequence_dataset_patch()
+
+    input_features_override = None
+    output_features_override = None
+    if use_prefix_sequence_training:
+        input_features_override, output_features_override = build_policy_feature_overrides(
+            dataset_root=dataset_root,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            prefix_train_max_steps=int(args.prefix_train_max_steps),
+            use_path_signature=use_path_signature,
+            use_delta_signature=use_delta_signature,
+        )
 
     run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (args.output_root / run_stamp).resolve()
@@ -544,6 +918,27 @@ def main(argv: list[str] | None = None) -> None:
             signature_depth=args.signature_depth,
             signature_hidden_dim=args.signature_hidden_dim,
             signature_dropout=args.signature_dropout,
+            use_delta_signature=use_delta_signature,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            prefix_train_max_steps=(
+                int(args.prefix_train_max_steps) if use_prefix_sequence_training else 32
+            ),
+            prefix_frame_stride=(
+                int(args.prefix_frame_stride) if use_prefix_sequence_training else 1
+            ),
+            prefix_pad_value=(
+                float(args.prefix_pad_value) if use_prefix_sequence_training else 0.0
+            ),
+            use_visual_prefix_memory=use_visual_prefix_memory,
+            use_signature_conditioned_visual_prefix_memory=bool(
+                args.use_signature_conditioned_visual_prefix_memory
+            ),
+            use_memory_conditioned_encoder_film=bool(
+                args.use_memory_conditioned_encoder_film
+            ),
+            num_memory_slots=int(args.num_memory_slots),
+            input_features=input_features_override,
+            output_features=output_features_override,
         )
     else:
         policy_cfg = ACTConfig(
@@ -600,6 +995,23 @@ def main(argv: list[str] | None = None) -> None:
                 f"- signature: dim={signature_dim}, depth={args.signature_depth}, "
                 f"history={resolved_history_length}, hidden={args.signature_hidden_dim}, "
                 f"dropout={args.signature_dropout}"
+            )
+        print(f"- use_delta_signature: {use_delta_signature}")
+        print(f"- use_prefix_sequence_training: {use_prefix_sequence_training}")
+        if use_prefix_sequence_training:
+            print(
+                f"- prefix_sequence: max_steps={args.prefix_train_max_steps}, "
+                f"stride={args.prefix_frame_stride}, pad_value={args.prefix_pad_value}"
+            )
+        print(f"- use_visual_prefix_memory: {use_visual_prefix_memory}")
+        if use_visual_prefix_memory:
+            print(
+                "- visual_prefix_memory: "
+                f"num_memory_slots={args.num_memory_slots}, "
+                "signature_conditioned="
+                f"{bool(args.use_signature_conditioned_visual_prefix_memory)}, "
+                "encoder_film="
+                f"{bool(args.use_memory_conditioned_encoder_film)}"
             )
     print(
         f"- wandb: enable={wandb_enable}, project={args.wandb_project}, mode={args.wandb_mode}"
