@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # Example:
-#   bash main/bash/eval_policy.sh --env h_shape --policy act
 #   bash main/bash/eval_policy.sh --env braidedhub --policy streaming_act --policy-path <ckpt_dir>
+#   bash main/bash/eval_policy.sh --policy act --policy-path <ckpt_dir> --dataset zeno-ai/day3_5_Exp1
 
 python3 scripts/eval_policy.py "$@"

@@ -263,6 +263,17 @@ def _ensure_prefix_image_sequence(camera_key: str, tensor: Tensor) -> Tensor:
     return tensor
 
 
+def _ensure_prefix_vector_sequence(feature_key: str, tensor: Tensor) -> Tensor:
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"Prefix feature `{feature_key}` must have shape (T, D). "
+            f"Got shape={tuple(tensor.shape)}."
+        )
+    return tensor
+
+
 class PrefixSequenceDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -315,6 +326,51 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
     def __getattr__(self, name: str):
         return getattr(self.base_dataset, name)
 
+    def _load_current_item_without_videos(self, idx: int) -> dict[str, Tensor | Any]:
+        self.base_dataset._ensure_hf_dataset_loaded()
+        item = dict(self.base_dataset.hf_dataset[idx])
+
+        if self.base_dataset.image_transforms is not None:
+            for camera_key in self.camera_keys:
+                if (
+                    camera_key in item
+                    and camera_key not in self.base_dataset.meta.video_keys
+                ):
+                    item[camera_key] = self.base_dataset.image_transforms(item[camera_key])
+
+        task_idx = item["task_index"].item()
+        item["task"] = self.base_dataset.meta.tasks.iloc[task_idx].name
+
+        if (
+            "subtask_index" in self.base_dataset.features
+            and self.base_dataset.meta.subtasks is not None
+        ):
+            subtask_idx = item["subtask_index"].item()
+            item["subtask"] = self.base_dataset.meta.subtasks.iloc[subtask_idx].name
+
+        return item
+
+    def _prefetch_video_sequence(
+        self,
+        *,
+        abs_indices: list[int],
+        current_ts: float,
+        ep_idx: int,
+    ) -> dict[str, Tensor]:
+        video_query_indices = {
+            camera_key: abs_indices
+            for camera_key in self.camera_keys
+            if camera_key in self.base_dataset.meta.video_keys
+        }
+        if not video_query_indices:
+            return {}
+
+        query_timestamps = self.base_dataset._get_query_timestamps(
+            current_ts=current_ts,
+            query_indices=video_query_indices,
+        )
+        return self.base_dataset._query_videos(query_timestamps, ep_idx)
+
     def _build_prefix_indices(self, *, abs_idx: int, ep_idx: int) -> list[int]:
         episode_meta = self.base_dataset.meta.episodes[ep_idx]
         ep_start = int(episode_meta["dataset_from_index"])
@@ -344,24 +400,44 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         current_item: dict[str, Tensor | Any],
         abs_indices: list[int],
         ep_idx: int,
+        prefetched_video_result: dict[str, Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        query_indices: dict[str, list[int]] = {"observation.state": abs_indices}
+        history_abs_indices = abs_indices[:-1]
+        query_indices: dict[str, list[int]] = {}
+        if history_abs_indices:
+            query_indices["observation.state"] = history_abs_indices
         if self.use_path_signature:
-            query_indices[PATH_SIGNATURE_KEY] = abs_indices
+            if history_abs_indices:
+                query_indices[PATH_SIGNATURE_KEY] = history_abs_indices
         if self.use_delta_signature:
-            query_indices[DELTA_SIGNATURE_KEY] = abs_indices
-        for camera_key in self.camera_keys:
-            query_indices[camera_key] = abs_indices
+            if history_abs_indices:
+                query_indices[DELTA_SIGNATURE_KEY] = history_abs_indices
+        if history_abs_indices:
+            for camera_key in self.camera_keys:
+                query_indices[camera_key] = history_abs_indices
 
-        hf_result = self.base_dataset._query_hf_dataset(query_indices)
+        hf_result = (
+            self.base_dataset._query_hf_dataset(query_indices)
+            if query_indices
+            else {}
+        )
         prefix: dict[str, Tensor] = {}
 
-        state_tensor = hf_result["observation.state"]
-        if state_tensor.ndim != 2:
-            raise ValueError(
-                "`observation.state` prefix query must return shape (T, state_dim). "
-                f"Got shape={tuple(state_tensor.shape)}."
+        state_history = hf_result.get("observation.state")
+        current_state = _ensure_prefix_vector_sequence(
+            "observation.state",
+            torch.as_tensor(current_item["observation.state"]),
+        )
+        if state_history is not None:
+            state_tensor = torch.cat(
+                [
+                    _ensure_prefix_vector_sequence("observation.state", state_history),
+                    current_state,
+                ],
+                dim=0,
             )
+        else:
+            state_tensor = current_state
         prefix[PREFIX_STATE_KEY] = pad_prefix_tensor(
             state_tensor,
             target_length=self.prefix_train_max_steps,
@@ -369,31 +445,53 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         )
 
         if self.use_path_signature:
-            signature_tensor = hf_result[PATH_SIGNATURE_KEY]
-            if signature_tensor.ndim != 2:
-                raise ValueError(
-                    f"`{PATH_SIGNATURE_KEY}` prefix query must return shape "
-                    f"(T, signature_dim). Got shape={tuple(signature_tensor.shape)}."
+            signature_history = hf_result.get(PATH_SIGNATURE_KEY)
+            current_signature = _ensure_prefix_vector_sequence(
+                PATH_SIGNATURE_KEY,
+                torch.as_tensor(current_item[PATH_SIGNATURE_KEY]),
+            )
+            if signature_history is not None:
+                signature_tensor = torch.cat(
+                    [
+                        _ensure_prefix_vector_sequence(PATH_SIGNATURE_KEY, signature_history),
+                        current_signature,
+                    ],
+                    dim=0,
                 )
+            else:
+                signature_tensor = current_signature
             prefix[PREFIX_PATH_SIGNATURE_KEY] = pad_prefix_tensor(
                 signature_tensor,
                 target_length=self.prefix_train_max_steps,
                 pad_value=self.prefix_pad_value,
             )
         if self.use_delta_signature:
-            delta_signature_tensor = hf_result[DELTA_SIGNATURE_KEY]
-            if delta_signature_tensor.ndim != 2:
-                raise ValueError(
-                    f"`{DELTA_SIGNATURE_KEY}` prefix query must return shape "
-                    f"(T, signature_dim). Got shape={tuple(delta_signature_tensor.shape)}."
+            delta_signature_history = hf_result.get(DELTA_SIGNATURE_KEY)
+            current_delta_signature = _ensure_prefix_vector_sequence(
+                DELTA_SIGNATURE_KEY,
+                torch.as_tensor(current_item[DELTA_SIGNATURE_KEY]),
+            )
+            if delta_signature_history is not None:
+                delta_signature_tensor = torch.cat(
+                    [
+                        _ensure_prefix_vector_sequence(
+                            DELTA_SIGNATURE_KEY, delta_signature_history
+                        ),
+                        current_delta_signature,
+                    ],
+                    dim=0,
                 )
+            else:
+                delta_signature_tensor = current_delta_signature
             prefix[PREFIX_DELTA_SIGNATURE_KEY] = pad_prefix_tensor(
                 delta_signature_tensor,
                 target_length=self.prefix_train_max_steps,
                 pad_value=self.prefix_pad_value,
             )
 
-        if self.base_dataset.meta.video_keys:
+        if prefetched_video_result is not None:
+            video_result = prefetched_video_result
+        elif self.base_dataset.meta.video_keys and history_abs_indices:
             query_timestamps = self.base_dataset._get_query_timestamps(
                 current_ts=float(current_item["timestamp"].item()),
                 query_indices=query_indices,
@@ -404,15 +502,38 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
 
         for camera_key in self.camera_keys:
             if camera_key in self.base_dataset.meta.video_keys:
-                image_tensor = video_result[camera_key]
+                if prefetched_video_result is not None:
+                    full_image_tensor = video_result.get(camera_key)
+                    history_image_tensor = (
+                        None
+                        if full_image_tensor is None or int(full_image_tensor.shape[0]) <= 1
+                        else full_image_tensor[:-1]
+                    )
+                else:
+                    history_image_tensor = video_result.get(camera_key)
             else:
-                image_tensor = hf_result[camera_key]
-            image_tensor = _ensure_prefix_image_sequence(camera_key, image_tensor)
-            if self.base_dataset.image_transforms is not None:
-                image_tensor = torch.stack(
-                    [self.base_dataset.image_transforms(frame) for frame in image_tensor],
-                    dim=0,
+                history_image_tensor = hf_result.get(camera_key)
+
+            history_sequence = None
+            if history_image_tensor is not None:
+                history_sequence = _ensure_prefix_image_sequence(
+                    camera_key, history_image_tensor
                 )
+                if self.base_dataset.image_transforms is not None:
+                    history_sequence = torch.stack(
+                        [self.base_dataset.image_transforms(frame) for frame in history_sequence],
+                        dim=0,
+                    )
+
+            current_image_tensor = _ensure_prefix_image_sequence(
+                camera_key,
+                torch.as_tensor(current_item[camera_key]),
+            )
+            image_tensor = (
+                current_image_tensor
+                if history_sequence is None
+                else torch.cat([history_sequence, current_image_tensor], dim=0)
+            )
             prefix[prefix_image_key_from_camera_key(camera_key)] = pad_prefix_tensor(
                 image_tensor,
                 target_length=self.prefix_train_max_steps,
@@ -426,7 +547,15 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         return prefix
 
     def __getitem__(self, idx: int) -> dict[str, Tensor | Any]:
-        item = dict(self.base_dataset[idx])
+        can_prefetch_video_once = (
+            len(self.base_dataset.meta.video_keys) > 0
+            and getattr(self.base_dataset, "delta_indices", None) is None
+        )
+        item = (
+            self._load_current_item_without_videos(idx)
+            if can_prefetch_video_once
+            else dict(self.base_dataset[idx])
+        )
         if "episode_index" not in item or "index" not in item:
             raise KeyError(
                 "Base dataset item must include `episode_index` and `index` so prefix "
@@ -435,11 +564,26 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         ep_idx = int(item["episode_index"].item())
         abs_idx = int(item["index"].item())
         abs_indices = self._build_prefix_indices(abs_idx=abs_idx, ep_idx=ep_idx)
+        prefetched_video_result = None
+        if can_prefetch_video_once:
+            prefetched_video_result = self._prefetch_video_sequence(
+                abs_indices=abs_indices,
+                current_ts=float(item["timestamp"].item()),
+                ep_idx=ep_idx,
+            )
+            for camera_key in self.camera_keys:
+                if camera_key not in self.base_dataset.meta.video_keys:
+                    continue
+                current_frame = prefetched_video_result[camera_key][-1]
+                if self.base_dataset.image_transforms is not None:
+                    current_frame = self.base_dataset.image_transforms(current_frame)
+                item[camera_key] = current_frame
         item.update(
             self._query_prefix_tensors(
                 current_item=item,
                 abs_indices=abs_indices,
                 ep_idx=ep_idx,
+                prefetched_video_result=prefetched_video_result,
             )
         )
         return item

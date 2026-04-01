@@ -7,10 +7,134 @@ import yaml
 
 
 DEFAULTS_ROOT = Path(__file__).resolve().parents[1] / "bash" / "defaults"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MAIN_ROOT = REPO_ROOT / "main"
+DATA_ROOT = MAIN_ROOT / "data"
 
 
 def defaults_file_path(env_name: str, policy_name: str) -> Path:
     return DEFAULTS_ROOT / env_name / f"{policy_name}.yaml"
+
+
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected mapping at top level in defaults file: {path}")
+    return data
+
+
+def _normalize_dataset_selector_candidates(dataset_selector: str) -> list[str]:
+    raw = str(dataset_selector).strip().replace("\\", "/")
+    if not raw:
+        return []
+
+    candidates: list[str] = []
+
+    def add(value: str | Path | None) -> None:
+        if value is None:
+            return
+        text = str(value).strip().replace("\\", "/")
+        if not text:
+            return
+        if text.startswith("./"):
+            text = text[2:]
+        while "//" in text:
+            text = text.replace("//", "/")
+        if text and text not in candidates:
+            candidates.append(text)
+
+    raw_path = Path(raw).expanduser()
+    add(raw)
+    add(raw.replace("/", "_"))
+    add(raw_path.name)
+    if len(raw_path.parts) >= 2:
+        add("_".join(raw_path.parts[-2:]))
+
+    if raw.startswith("main/data/"):
+        stripped = raw[len("main/data/") :]
+        add(stripped)
+        add(stripped.replace("/", "_"))
+        add(Path(stripped).name)
+    if raw.startswith("data/"):
+        stripped = raw[len("data/") :]
+        add(stripped)
+        add(stripped.replace("/", "_"))
+        add(Path(stripped).name)
+
+    for root in (DATA_ROOT, MAIN_ROOT, REPO_ROOT):
+        try:
+            relative = raw_path.resolve(strict=False).relative_to(root.resolve())
+        except Exception:
+            continue
+        add(relative.as_posix())
+        add(relative.as_posix().replace("/", "_"))
+        add(relative.name)
+        if len(relative.parts) >= 2:
+            add("_".join(relative.parts[-2:]))
+
+    return candidates
+
+
+def resolve_dataset_defaults_path(
+    dataset_selector: str,
+    policy_name: str,
+) -> Path | None:
+    selector_candidates = _normalize_dataset_selector_candidates(dataset_selector)
+
+    for candidate in selector_candidates:
+        direct = DEFAULTS_ROOT / candidate / f"{policy_name}.yaml"
+        if direct.exists():
+            return direct
+
+    selector_candidate_set = set(selector_candidates)
+    if not selector_candidate_set:
+        return None
+
+    for yaml_path in sorted(DEFAULTS_ROOT.rglob(f"{policy_name}.yaml")):
+        try:
+            data = _load_yaml_mapping(yaml_path)
+        except Exception:
+            continue
+        train_cfg = data.get("train", {})
+        if not isinstance(train_cfg, dict):
+            continue
+
+        yaml_candidates: list[str] = []
+        dataset_root = train_cfg.get("dataset_root")
+        dataset_repo_id = train_cfg.get("dataset_repo_id")
+        if dataset_root:
+            yaml_candidates.extend(
+                _normalize_dataset_selector_candidates(str(dataset_root))
+            )
+        if dataset_repo_id:
+            yaml_candidates.extend(
+                _normalize_dataset_selector_candidates(str(dataset_repo_id))
+            )
+
+        if selector_candidate_set.intersection(yaml_candidates):
+            return yaml_path
+    return None
+
+
+def load_policy_mode_defaults_for_dataset(
+    mode: str,
+    dataset_selector: str,
+    policy_name: str,
+) -> tuple[dict[str, Any], Path | None]:
+    path = resolve_dataset_defaults_path(dataset_selector, policy_name)
+    if path is None:
+        return {}, None
+    data = _load_yaml_mapping(path)
+    mode_defaults = data.get(mode, {})
+    if mode_defaults is None:
+        mode_defaults = {}
+    if not isinstance(mode_defaults, dict):
+        raise TypeError(
+            f"Expected mapping for '{mode}' section in defaults file: {path}"
+        )
+    return mode_defaults, path
 
 
 def load_policy_mode_defaults(
@@ -28,12 +152,7 @@ def load_policy_mode_defaults(
             f"- path={path}"
         )
 
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise TypeError(f"Expected mapping at top level in defaults file: {path}")
-
+    data = _load_yaml_mapping(path)
     mode_defaults = data.get(mode, {})
     if mode_defaults is None:
         mode_defaults = {}

@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import collections
 import datetime as dt
+import hashlib
+import inspect
 import json
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import warnings
 
-from env import get_env_choices, get_env_module
-from policy_defaults import load_policy_mode_defaults
+from dataset_utils import (
+    DEFAULT_LOCAL_DATA_ROOT,
+    build_dataset_split,
+    infer_dataset_repo_id,
+    resolve_dataset_root,
+    save_dataset_split,
+    validate_dataset_root,
+)
+from policy_defaults import load_policy_mode_defaults_for_dataset
 
 warnings.filterwarnings(
     "ignore",
@@ -59,22 +72,695 @@ def teardown_wandb_safely(exit_code: int) -> None:
         print(f"[WARN] wandb teardown failed during shutdown: {exc}")
 
 
-def validate_dataset_root(dataset_root: Path) -> None:
-    required = [
-        dataset_root / "meta/info.json",
-        dataset_root / "meta/stats.json",
-        dataset_root / "meta/episodes/chunk-000/file-000.parquet",
-        dataset_root / "data/chunk-000/file-000.parquet",
-    ]
-    missing = [path for path in required if not path.exists()]
-    if missing:
-        missing_s = "\n".join(f"- {path}" for path in missing)
-        raise FileNotFoundError(
-            "Dataset path is missing required LeRobot v3.0 files:\n"
-            f"{missing_s}\n"
-            f"dataset_root={dataset_root}"
+def configure_torch_sharing_strategy(strategy: str | None) -> str | None:
+    resolved_strategy = strategy or "auto"
+    if resolved_strategy == "auto":
+        resolved_strategy = "file_system" if os.name == "posix" else None
+
+    if resolved_strategy is None:
+        return None
+
+    try:
+        import torch.multiprocessing as torch_mp
+    except Exception as exc:
+        print(
+            "[WARN] Failed to import torch.multiprocessing while configuring "
+            f"sharing strategy: {exc}"
+        )
+        return None
+
+    try:
+        current_strategy = torch_mp.get_sharing_strategy()
+    except Exception:
+        current_strategy = None
+
+    if current_strategy == resolved_strategy:
+        return current_strategy
+
+    try:
+        torch_mp.set_sharing_strategy(resolved_strategy)
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        print(
+            "[WARN] Failed to set torch multiprocessing sharing strategy to "
+            f"{resolved_strategy!r}: {exc}"
+        )
+        return current_strategy
+
+    return resolved_strategy
+
+
+def resolve_accelerator_mixed_precision(
+    *,
+    device: str,
+    use_amp: bool,
+    amp_dtype: str,
+) -> str:
+    if not use_amp:
+        return "no"
+
+    device_type = str(device).split(":", 1)[0]
+    if device_type == "cuda":
+        try:
+            import torch
+        except Exception as exc:
+            print(f"[WARN] Failed to import torch while resolving AMP mode: {exc}")
+            return "no"
+
+        if not torch.cuda.is_available():
+            print("[WARN] CUDA AMP requested but CUDA is not available. Falling back to fp32.")
+            return "no"
+
+        if amp_dtype == "auto":
+            if getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+                return "bf16"
+            return "fp16"
+
+        if amp_dtype == "bf16" and not getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+            print("[WARN] bf16 AMP requested but this CUDA device does not support bf16. Falling back to fp16.")
+            return "fp16"
+
+        return amp_dtype
+
+    if device_type == "xpu":
+        return "bf16" if amp_dtype == "auto" else amp_dtype
+
+    print(f"[WARN] AMP is not configured for device={device_type!r}. Falling back to fp32.")
+    return "no"
+
+
+def install_torch_dataloader_patch(
+    *,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+) -> None:
+    import torch.utils.data
+
+    original_dataloader_cls = getattr(
+        install_torch_dataloader_patch,
+        "_original_dataloader_cls",
+        None,
+    )
+    if original_dataloader_cls is None:
+        original_dataloader_cls = torch.utils.data.DataLoader
+        install_torch_dataloader_patch._original_dataloader_cls = (  # type: ignore[attr-defined]
+            original_dataloader_cls
         )
 
+    resolved_prefetch_factor = (
+        None if prefetch_factor is None else max(1, int(prefetch_factor))
+    )
+    patch_signature = (
+        bool(persistent_workers),
+        resolved_prefetch_factor,
+    )
+    current_dataloader_cls = torch.utils.data.DataLoader
+    if getattr(current_dataloader_cls, "_corl_patch_signature", None) == patch_signature:
+        return
+
+    class PatchedDataLoader(original_dataloader_cls):
+        _corl_patch_signature = patch_signature
+
+        def __init__(self, *args, **kwargs):
+            try:
+                bound = inspect.signature(original_dataloader_cls.__init__).bind_partial(
+                    self, *args, **kwargs
+                )
+                num_workers = int(bound.arguments.get("num_workers", 0))
+            except Exception:
+                num_workers = int(kwargs.get("num_workers", 0) or 0)
+
+            if num_workers > 0:
+                kwargs.setdefault("persistent_workers", bool(persistent_workers))
+                if resolved_prefetch_factor is not None:
+                    kwargs.setdefault("prefetch_factor", resolved_prefetch_factor)
+
+            super().__init__(*args, **kwargs)
+
+    PatchedDataLoader.__name__ = original_dataloader_cls.__name__
+    PatchedDataLoader.__qualname__ = original_dataloader_cls.__qualname__
+    PatchedDataLoader.__module__ = original_dataloader_cls.__module__
+    torch.utils.data.DataLoader = PatchedDataLoader
+
+
+def install_torchcodec_decoder_cache_patch(max_cached_decoders: int) -> None:
+    import fsspec
+    import importlib
+    from threading import Lock
+
+    import lerobot.datasets.video_utils as video_utils
+    import torch
+
+    resolved_max_cached_decoders = max(1, int(max_cached_decoders))
+
+    class BoundedVideoDecoderCache:
+        def __init__(self, max_size: int):
+            self._max_size = max(1, int(max_size))
+            self._cache: collections.OrderedDict[str, tuple[object, object]] = (
+                collections.OrderedDict()
+            )
+            self._lock = Lock()
+
+        def get_decoder(self, video_path: str):
+            if importlib.util.find_spec("torchcodec"):
+                from torchcodec.decoders import VideoDecoder
+            else:
+                raise ImportError("torchcodec is required but not available.")
+
+            video_path = str(video_path)
+
+            with self._lock:
+                if video_path in self._cache:
+                    decoder, file_handle = self._cache.pop(video_path)
+                    self._cache[video_path] = (decoder, file_handle)
+                    return decoder
+
+                while len(self._cache) >= self._max_size:
+                    _, (_, evicted_file_handle) = self._cache.popitem(last=False)
+                    evicted_file_handle.close()
+
+                file_handle = fsspec.open(video_path).__enter__()
+                decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                self._cache[video_path] = (decoder, file_handle)
+                return decoder
+
+        def clear(self):
+            with self._lock:
+                for _, file_handle in self._cache.values():
+                    file_handle.close()
+                self._cache.clear()
+
+        def size(self) -> int:
+            with self._lock:
+                return len(self._cache)
+
+    existing_cache = getattr(video_utils, "_default_decoder_cache", None)
+    if existing_cache is not None and hasattr(existing_cache, "clear"):
+        try:
+            existing_cache.clear()
+        except Exception:
+            pass
+
+    video_utils.VideoDecoderCache = BoundedVideoDecoderCache
+    video_utils._default_decoder_cache = BoundedVideoDecoderCache(
+        max_size=resolved_max_cached_decoders
+    )
+
+    def decode_video_frames_torchcodec_fast(
+        video_path: Path | str,
+        timestamps: list[float],
+        tolerance_s: float,
+        log_loaded_timestamps: bool = False,
+        decoder_cache: BoundedVideoDecoderCache | None = None,
+    ) -> torch.Tensor:
+        if decoder_cache is None:
+            decoder_cache = video_utils._default_decoder_cache
+
+        decoder = decoder_cache.get_decoder(str(video_path))
+        average_fps = decoder.metadata.average_fps
+        frame_indices = [round(ts * average_fps) for ts in timestamps]
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+
+        loaded_ts = frames_batch.pts_seconds
+        if not isinstance(loaded_ts, torch.Tensor):
+            loaded_ts = torch.tensor(loaded_ts, dtype=torch.float32)
+        else:
+            loaded_ts = loaded_ts.to(dtype=torch.float32)
+
+        query_ts = torch.tensor(timestamps, dtype=torch.float32)
+        if len(query_ts) != len(loaded_ts):
+            raise video_utils.FrameTimestampError(
+                f"Number of retrieved timestamps ({len(loaded_ts)}) does not match "
+                f"number of queried timestamps ({len(query_ts)})"
+            )
+
+        min_ = torch.abs(query_ts - loaded_ts)
+        is_within_tol = min_ < tolerance_s
+        if not is_within_tol.all():
+            raise video_utils.FrameTimestampError(
+                f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+                " It means that the closest frame that can be loaded from the video is too far away in time."
+                " This might be due to synchronization issues with timestamps during data collection."
+                " To be safe, we advise to ignore this item during training."
+                f"\nqueried timestamps: {query_ts}"
+                f"\nloaded timestamps: {loaded_ts}"
+                f"\nvideo: {video_path}"
+            )
+
+        closest_frames = frames_batch.data
+        if not isinstance(closest_frames, torch.Tensor):
+            closest_frames = torch.stack(list(closest_frames), dim=0)
+        closest_frames = closest_frames.to(dtype=torch.float32) / 255.0
+
+        if log_loaded_timestamps:
+            print(f"[INFO] torchcodec.loaded_timestamps: {loaded_ts.tolist()}")
+
+        return closest_frames
+
+    video_utils.decode_video_frames_torchcodec = decode_video_frames_torchcodec_fast
+
+
+def resolve_filtered_hf_cache_root(
+    dataset_root: Path,
+    filtered_hf_cache_root: Path | None,
+) -> Path:
+    if filtered_hf_cache_root is None:
+        return dataset_root / ".cache" / "hf_datasets"
+    if filtered_hf_cache_root.is_absolute():
+        return filtered_hf_cache_root
+    return dataset_root / filtered_hf_cache_root
+
+
+def compute_dataset_metadata_fingerprint(dataset_root: Path) -> str:
+    meta_root = dataset_root / "meta"
+    digest = hashlib.sha256()
+    candidate_paths = [
+        meta_root / "info.json",
+        meta_root / "stats.json",
+        *sorted((meta_root / "episodes").rglob("*.parquet")),
+    ]
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        stat = path.stat()
+        rel_path = path.relative_to(dataset_root)
+        digest.update(str(rel_path).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def build_filtered_hf_cache_dir(
+    *,
+    filtered_hf_cache_root: Path,
+    dataset_root: Path,
+    dataset_repo_id: str,
+    episodes: list[int],
+) -> Path:
+    metadata_fingerprint = compute_dataset_metadata_fingerprint(dataset_root)
+    selection_payload = {
+        "dataset_repo_id": dataset_repo_id,
+        "dataset_root": str(dataset_root.resolve()),
+        "episodes": [int(ep) for ep in episodes],
+    }
+    selection_fingerprint = hashlib.sha256(
+        json.dumps(selection_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    sanitized_repo_id = dataset_repo_id.replace("/", "__")
+    return (
+        filtered_hf_cache_root
+        / sanitized_repo_id
+        / f"meta-{metadata_fingerprint}"
+        / f"episodes-{selection_fingerprint}"
+    )
+
+
+def install_lerobot_dataset_load_patch(
+    *,
+    dataset_root: Path,
+    filtered_hf_cache_root: Path,
+    enable_filtered_hf_cache: bool,
+    refresh_filtered_hf_cache: bool,
+) -> None:
+    import datasets
+    import torch
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset_module
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.datasets.utils import (
+        get_hf_features_from_features,
+        hf_transform_to_torch,
+        load_nested_dataset,
+    )
+
+    patch_config = {
+        "dataset_root": dataset_root.resolve(),
+        "filtered_hf_cache_root": filtered_hf_cache_root.resolve(),
+        "enable_filtered_hf_cache": bool(enable_filtered_hf_cache),
+        "refresh_filtered_hf_cache": bool(refresh_filtered_hf_cache),
+    }
+
+    if getattr(LeRobotDataset, "_custom_dataset_load_patch_installed", False):
+        LeRobotDataset._custom_dataset_load_patch_config = patch_config
+        return
+
+    original_load_metadata = LeRobotDatasetMetadata.load_metadata
+    original_cache_check = LeRobotDataset._check_cached_episodes_sufficient
+
+    def _install_compact_relative_index_layout(self):
+        layout_start_s = time.perf_counter()
+        self._absolute_to_relative_idx = None
+        self._compact_relative_index_abs_starts = None
+        self._compact_relative_index_abs_ends = None
+        self._compact_relative_index_rel_starts = None
+        self._compact_relative_index_episode_ids = None
+
+        if self.episodes is None:
+            return
+
+        selected_episode_ids = sorted(int(ep) for ep in self.episodes)
+        abs_starts: list[int] = []
+        abs_ends: list[int] = []
+        rel_starts: list[int] = []
+        rel_offset = 0
+        for ep_idx in selected_episode_ids:
+            episode_meta = self.meta.episodes[ep_idx]
+            abs_start = int(episode_meta["dataset_from_index"])
+            abs_end = int(episode_meta["dataset_to_index"])
+            abs_starts.append(abs_start)
+            abs_ends.append(abs_end)
+            rel_starts.append(rel_offset)
+            rel_offset += abs_end - abs_start
+
+        hf_num_rows = len(self.hf_dataset) if self.hf_dataset is not None else rel_offset
+        if rel_offset != hf_num_rows:
+            raise RuntimeError(
+                "Compact relative-index layout mismatch: expected "
+                f"{hf_num_rows} rows from filtered HF dataset, but selected episode spans "
+                f"cover {rel_offset} rows."
+            )
+
+        self._compact_relative_index_episode_ids = tuple(selected_episode_ids)
+        self._compact_relative_index_abs_starts = tuple(abs_starts)
+        self._compact_relative_index_abs_ends = tuple(abs_ends)
+        self._compact_relative_index_rel_starts = tuple(rel_starts)
+        layout_elapsed_s = time.perf_counter() - layout_start_s
+        print(
+            "[INFO] dataset.relative_index_layout: "
+            f"{layout_elapsed_s:.1f}s [episode_offsets] "
+            f"(episodes={len(selected_episode_ids)}, rows={hf_num_rows})"
+        )
+
+    def _map_absolute_index_to_relative(self, abs_idx: int) -> int:
+        compact_abs_starts = getattr(self, "_compact_relative_index_abs_starts", None)
+        if not compact_abs_starts:
+            return abs_idx
+
+        compact_abs_ends = self._compact_relative_index_abs_ends
+        compact_rel_starts = self._compact_relative_index_rel_starts
+        position = bisect.bisect_right(compact_abs_starts, int(abs_idx)) - 1
+        if position < 0 or int(abs_idx) >= compact_abs_ends[position]:
+            raise KeyError(
+                f"Absolute frame index {abs_idx} is not covered by the selected episode layout."
+            )
+        return compact_rel_starts[position] + (int(abs_idx) - compact_abs_starts[position])
+
+    def _map_absolute_indices_to_relative(self, absolute_indices: list[int]) -> list[int]:
+        explicit_mapping = getattr(self, "_absolute_to_relative_idx", None)
+        if explicit_mapping is not None:
+            return [
+                explicit_mapping[idx.item() if isinstance(idx, torch.Tensor) else idx]
+                for idx in absolute_indices
+            ]
+
+        compact_abs_starts = getattr(self, "_compact_relative_index_abs_starts", None)
+        if not compact_abs_starts:
+            return [
+                idx.item() if isinstance(idx, torch.Tensor) else int(idx)
+                for idx in absolute_indices
+            ]
+
+        return [
+            _map_absolute_index_to_relative(
+                self,
+                idx.item() if isinstance(idx, torch.Tensor) else int(idx),
+            )
+            for idx in absolute_indices
+        ]
+
+    def init_with_compact_relative_index_layout(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        episodes: list[int] | None = None,
+        image_transforms=None,
+        delta_timestamps: dict[str, list[float]] | None = None,
+        tolerance_s: float = 1e-4,
+        revision: str | None = None,
+        force_cache_sync: bool = False,
+        download_videos: bool = True,
+        video_backend: str | None = None,
+        batch_encoding_size: int = 1,
+        vcodec: str = "libsvtav1",
+        streaming_encoding: bool = False,
+        encoder_queue_maxsize: int = 30,
+        encoder_threads: int | None = None,
+    ):
+        torch.utils.data.Dataset.__init__(self)
+        self.repo_id = repo_id
+        self.root = (
+            Path(root) if root else lerobot_dataset_module.HF_LEROBOT_HOME / repo_id
+        )
+        self.image_transforms = image_transforms
+        self.delta_timestamps = delta_timestamps
+        self.episodes = episodes
+        self.tolerance_s = tolerance_s
+        self.revision = revision if revision else lerobot_dataset_module.CODEBASE_VERSION
+        self.video_backend = (
+            video_backend if video_backend else lerobot_dataset_module.get_safe_default_codec()
+        )
+        self.delta_indices = None
+        self.batch_encoding_size = batch_encoding_size
+        self.episodes_since_last_encoding = 0
+        self.vcodec = lerobot_dataset_module.resolve_vcodec(vcodec)
+        self._encoder_threads = encoder_threads
+
+        self.image_writer = None
+        self.episode_buffer = None
+        self.writer = None
+        self.latest_episode = None
+        self._current_file_start_frame = None
+        self._streaming_encoder = None
+
+        self.root.mkdir(exist_ok=True, parents=True)
+
+        self.meta = LeRobotDatasetMetadata(
+            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+        )
+
+        self._lazy_loading = False
+        self._recorded_frames = self.meta.total_frames
+        self._writer_closed_for_reading = False
+
+        try:
+            if force_cache_sync:
+                raise FileNotFoundError
+            self.hf_dataset = self.load_hf_dataset()
+            if not self._check_cached_episodes_sufficient():
+                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+        except (FileNotFoundError, NotADirectoryError):
+            if lerobot_dataset_module.is_valid_version(self.revision):
+                self.revision = lerobot_dataset_module.get_safe_version(
+                    self.repo_id, self.revision
+                )
+            self.download(download_videos)
+            self.hf_dataset = self.load_hf_dataset()
+
+        _install_compact_relative_index_layout(self)
+
+        if self.delta_timestamps is not None:
+            lerobot_dataset_module.check_delta_timestamps(
+                self.delta_timestamps, self.fps, self.tolerance_s
+            )
+            self.delta_indices = lerobot_dataset_module.get_delta_indices(
+                self.delta_timestamps, self.fps
+            )
+
+        if streaming_encoding and len(self.meta.video_keys) > 0:
+            self._streaming_encoder = lerobot_dataset_module.StreamingVideoEncoder(
+                fps=self.meta.fps,
+                vcodec=self.vcodec,
+                pix_fmt="yuv420p",
+                g=2,
+                crf=30,
+                preset=None,
+                queue_maxsize=encoder_queue_maxsize,
+                encoder_threads=encoder_threads,
+            )
+
+    def load_metadata_with_timing(self):
+        start_s = time.perf_counter()
+        original_load_metadata(self)
+        elapsed_s = time.perf_counter() - start_s
+        print(
+            f"[INFO] dataset.load_metadata: {elapsed_s:.1f}s "
+            f"(root={self.root / 'meta'})"
+        )
+
+    def load_hf_dataset_with_timing(self):
+        patch_cfg = LeRobotDataset._custom_dataset_load_patch_config
+        resolved_root = self.root.resolve()
+        cache_info = {
+            "status": "disabled",
+            "path": None,
+        }
+        can_use_filtered_cache = (
+            patch_cfg["enable_filtered_hf_cache"]
+            and resolved_root == patch_cfg["dataset_root"]
+            and self.episodes is not None
+            and len(self.episodes) > 0
+        )
+        load_start_s = time.perf_counter()
+
+        if can_use_filtered_cache:
+            cache_dir = build_filtered_hf_cache_dir(
+                filtered_hf_cache_root=patch_cfg["filtered_hf_cache_root"],
+                dataset_root=resolved_root,
+                dataset_repo_id=self.repo_id,
+                episodes=self.episodes,
+            )
+            cache_info["path"] = str(cache_dir)
+            if patch_cfg["refresh_filtered_hf_cache"] and cache_dir.exists():
+                shutil.rmtree(cache_dir)
+
+            if cache_dir.exists():
+                try:
+                    hf_dataset = datasets.load_from_disk(str(cache_dir))
+                    hf_dataset.set_transform(hf_transform_to_torch)
+                    load_elapsed_s = time.perf_counter() - load_start_s
+                    cache_info["status"] = "filtered_cache_hit"
+                    self._custom_hf_dataset_cache_info = cache_info
+                    print(
+                        "[INFO] dataset.load_hf_dataset: "
+                        f"{load_elapsed_s:.1f}s [{cache_info['status']}] "
+                        f"(rows={len(hf_dataset)}, cache_dir={cache_dir})"
+                    )
+                    return hf_dataset
+                except Exception as exc:
+                    print(
+                        "[WARN] Failed to load filtered HF dataset cache from "
+                        f"{cache_dir}: {exc}. Rebuilding it."
+                    )
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+
+            features = get_hf_features_from_features(self.features)
+            hf_dataset = load_nested_dataset(
+                self.root / "data",
+                features=features,
+                episodes=self.episodes,
+            )
+            load_elapsed_s = time.perf_counter() - load_start_s
+
+            persist_start_s = time.perf_counter()
+            temp_cache_dir = cache_dir.with_name(f"{cache_dir.name}.tmp")
+            shutil.rmtree(temp_cache_dir, ignore_errors=True)
+            temp_cache_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                hf_dataset.save_to_disk(str(temp_cache_dir))
+                cache_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                temp_cache_dir.rename(cache_dir)
+                cache_info["status"] = "filtered_cache_miss_saved"
+                persist_elapsed_s = time.perf_counter() - persist_start_s
+                cache_meta = {
+                    "dataset_repo_id": self.repo_id,
+                    "dataset_root": str(resolved_root),
+                    "episodes": [int(ep) for ep in self.episodes],
+                    "num_rows": len(hf_dataset),
+                    "created_at": dt.datetime.now().isoformat(),
+                }
+                (cache_dir / "cache_meta.json").write_text(
+                    json.dumps(cache_meta, indent=2, ensure_ascii=True),
+                    encoding="utf-8",
+                )
+                print(
+                    "[INFO] dataset.load_hf_dataset: "
+                    f"{load_elapsed_s:.1f}s [filtered_cache_miss] "
+                    f"(rows={len(hf_dataset)}, cache_dir={cache_dir})"
+                )
+                print(
+                    "[INFO] dataset.persist_filtered_hf_cache: "
+                    f"{persist_elapsed_s:.1f}s (cache_dir={cache_dir})"
+                )
+            except Exception as exc:
+                cache_info["status"] = "filtered_cache_miss_unsaved"
+                shutil.rmtree(temp_cache_dir, ignore_errors=True)
+                print(
+                    "[WARN] Failed to persist filtered HF dataset cache at "
+                    f"{cache_dir}: {exc}"
+                )
+
+            hf_dataset.set_transform(hf_transform_to_torch)
+            self._custom_hf_dataset_cache_info = cache_info
+            return hf_dataset
+
+        hf_dataset = load_nested_dataset(
+            self.root / "data",
+            features=get_hf_features_from_features(self.features),
+            episodes=self.episodes,
+        )
+        hf_dataset.set_transform(hf_transform_to_torch)
+        load_elapsed_s = time.perf_counter() - load_start_s
+        cache_reason = "full_dataset_or_disabled"
+        if not patch_cfg["enable_filtered_hf_cache"]:
+            cache_reason = "cache_disabled"
+        elif resolved_root != patch_cfg["dataset_root"]:
+            cache_reason = "different_dataset_root"
+        elif self.episodes is None:
+            cache_reason = "all_episodes_requested"
+        cache_info["status"] = cache_reason
+        self._custom_hf_dataset_cache_info = cache_info
+        print(
+            "[INFO] dataset.load_hf_dataset: "
+            f"{load_elapsed_s:.1f}s [{cache_reason}] "
+            f"(rows={len(hf_dataset)})"
+        )
+        return hf_dataset
+
+    def cache_check_with_timing(self):
+        start_s = time.perf_counter()
+        is_sufficient = original_cache_check(self)
+        elapsed_s = time.perf_counter() - start_s
+        cache_info = getattr(self, "_custom_hf_dataset_cache_info", None) or {}
+        cache_status = cache_info.get("status", "unknown")
+        print(
+            "[INFO] dataset.cache_check: "
+            f"{elapsed_s:.1f}s (ok={is_sufficient}, hf_cache={cache_status})"
+        )
+        return is_sufficient
+
+    def get_query_timestamps_with_compact_relative_index(
+        self,
+        current_ts: float,
+        query_indices: dict[str, list[int]] | None = None,
+    ) -> dict[str, list[float]]:
+        query_timestamps = {}
+        shared_timestamp_cache: dict[tuple[int, ...], list[float]] = {}
+        for key in self.meta.video_keys:
+            if query_indices is not None and key in query_indices:
+                absolute_indices = tuple(int(idx) for idx in query_indices[key])
+                timestamps = shared_timestamp_cache.get(absolute_indices)
+                if timestamps is None:
+                    relative_indices = _map_absolute_indices_to_relative(
+                        self, list(absolute_indices)
+                    )
+                    timestamps = torch.stack(
+                        self.hf_dataset[relative_indices]["timestamp"]
+                    ).tolist()
+                    shared_timestamp_cache[absolute_indices] = timestamps
+                query_timestamps[key] = timestamps
+            else:
+                query_timestamps[key] = [current_ts]
+        return query_timestamps
+
+    def query_hf_dataset_with_compact_relative_index(self, query_indices: dict[str, list[int]]) -> dict:
+        result: dict = {}
+        for key, q_idx in query_indices.items():
+            if key in self.meta.video_keys:
+                continue
+            relative_indices = _map_absolute_indices_to_relative(self, q_idx)
+            try:
+                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+            except (KeyError, TypeError, IndexError):
+                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+        return result
+
+    LeRobotDataset.__init__ = init_with_compact_relative_index_layout
+    LeRobotDatasetMetadata.load_metadata = load_metadata_with_timing
+    LeRobotDataset.load_hf_dataset = load_hf_dataset_with_timing
+    LeRobotDataset._check_cached_episodes_sufficient = cache_check_with_timing
+    LeRobotDataset._get_query_timestamps = get_query_timestamps_with_compact_relative_index
+    LeRobotDataset._query_hf_dataset = query_hf_dataset_with_compact_relative_index
+    LeRobotDataset._custom_dataset_load_patch_installed = True
+    LeRobotDataset._custom_dataset_load_patch_config = patch_config
 
 def resolve_use_imagenet_stats(
     dataset_root: Path,
@@ -172,21 +858,6 @@ def resolve_history_length(dataset_root: Path, history_length: int) -> int:
     )
 
 
-def validate_first_frame_anchor_support(
-    *,
-    env_name: str,
-    use_first_frame_anchor: bool,
-    context: str,
-) -> None:
-    if not use_first_frame_anchor:
-        return
-    if env_name != "braidedhub":
-        raise NotImplementedError(
-            "First-frame anchor support is currently implemented only for `braidedhub` "
-            f"during {context}. Got env={env_name!r}."
-        )
-
-
 def validate_first_frame_anchor_dataset(dataset_root: Path, use_first_frame_anchor: bool) -> None:
     if not use_first_frame_anchor:
         return
@@ -214,7 +885,6 @@ def validate_first_frame_anchor_dataset(dataset_root: Path, use_first_frame_anch
 
 def validate_prefix_sequence_support(
     *,
-    env_name: str,
     policy_name: str,
     use_prefix_sequence_training: bool,
     context: str,
@@ -393,7 +1063,18 @@ def install_prefix_sequence_dataset_patch() -> None:
     original_make_dataset = dataset_factory.make_dataset
 
     def make_dataset_with_prefix(cfg):
+        dataset_load_start_s = time.perf_counter()
+        print(
+            "[INFO] Building local dataset view. Large parquet/video datasets "
+            "can take several minutes before training starts."
+        )
         dataset = original_make_dataset(cfg)
+        dataset_load_elapsed_s = time.perf_counter() - dataset_load_start_s
+        print(
+            "[INFO] Dataset ready in "
+            f"{dataset_load_elapsed_s:.1f}s "
+            f"({dataset.num_episodes} episodes, {dataset.num_frames} frames)."
+        )
         policy_cfg = cfg.policy
         if not bool(getattr(policy_cfg, "use_prefix_sequence_training", False)):
             return dataset
@@ -413,45 +1094,99 @@ def install_prefix_sequence_dataset_patch() -> None:
     lerobot_train_module._prefix_sequence_patch_installed = True
 
 
+def default_train_output_root(policy_name: str) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / "main" / "outputs" / "train" / policy_name
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
-    bootstrap.add_argument("--env", choices=get_env_choices(), default="h_shape")
+    bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
         choices=["act", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
-    defaults = load_policy_mode_defaults("train", known_args.env, known_args.policy)
+    defaults, defaults_path = ({}, None)
+    if known_args.dataset:
+        defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+            mode="train",
+            dataset_selector=known_args.dataset,
+            policy_name=known_args.policy,
+        )
 
     parser = argparse.ArgumentParser(
-        description="Train LeRobot ACT or Streaming ACT on a selected environment dataset."
+        description="Train LeRobot ACT or Streaming ACT on a local LeRobot dataset."
     )
-    parser.add_argument("--env", choices=get_env_choices(), default=known_args.env)
     parser.add_argument(
         "--policy",
         choices=["act", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=defaults.get("dataset_root"),
-        help="Path to local LeRobotDataset v3.0 directory.",
+        "--dataset",
+        type=str,
+        required=True,
+        default=known_args.dataset,
+        help=(
+            "Dataset ID or path under main/data. This value is also used to resolve "
+            "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
+            "Examples: zeno-ai/day3_5_Exp1_processed, ./main/data/zeno-ai/day3_5_Exp1."
+        ),
     )
     parser.add_argument(
         "--dataset-repo-id",
         type=str,
         default=defaults.get("dataset_repo_id"),
-        help="Logical dataset repo_id used by LeRobot metadata APIs.",
+        help=(
+            "Optional logical repo_id override used by LeRobot metadata APIs. "
+            "Defaults to the dataset path relative to main/data."
+        ),
     )
+    parser.add_argument(
+        "--local-data-root",
+        type=Path,
+        default=defaults.get("local_data_root", DEFAULT_LOCAL_DATA_ROOT),
+        help="Root directory used to resolve --dataset when a relative dataset ID is provided.",
+    )
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=defaults.get("test_ratio", 0.2),
+        help="Held-out test-set ratio computed over episodes.",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=defaults.get("split_seed", 42),
+        help="Random seed used when sampling train/test episodes.",
+    )
+    split_shuffle_group = parser.add_mutually_exclusive_group()
+    split_shuffle_group.add_argument(
+        "--shuffle-split-episodes",
+        dest="split_shuffle",
+        action="store_true",
+        help="Shuffle episode IDs before applying the train/test split ratio.",
+    )
+    split_shuffle_group.add_argument(
+        "--preserve-split-order",
+        dest="split_shuffle",
+        action="store_false",
+        help="Split train/test episodes by original episode order without shuffling.",
+    )
+    parser.set_defaults(split_shuffle=defaults.get("split_shuffle", True))
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=defaults.get("output_root"),
+        default=defaults.get("output_root", default_train_output_root(known_args.policy)),
         help="Root folder for training outputs.",
     )
-    parser.add_argument("--job-name", type=str, default=defaults.get("job_name"))
+    parser.add_argument(
+        "--job-name",
+        type=str,
+        default=defaults.get("job_name", f"{known_args.policy}_train"),
+    )
     parser.add_argument(
         "--wandb-run-name",
         type=str,
@@ -468,22 +1203,137 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-workers", type=int, default=defaults.get("num_workers", 4)
     )
+    dataloader_persistent_workers_group = parser.add_mutually_exclusive_group()
+    dataloader_persistent_workers_group.add_argument(
+        "--enable-persistent-workers",
+        dest="dataloader_persistent_workers",
+        action="store_true",
+        help=(
+            "Keep DataLoader workers alive across epochs so video decoders and "
+            "worker startup cost are reused."
+        ),
+    )
+    dataloader_persistent_workers_group.add_argument(
+        "--disable-persistent-workers",
+        dest="dataloader_persistent_workers",
+        action="store_false",
+        help="Disable persistent DataLoader workers.",
+    )
+    parser.set_defaults(
+        dataloader_persistent_workers=defaults.get(
+            "dataloader_persistent_workers", True
+        ),
+    )
+    parser.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=defaults.get("dataloader_prefetch_factor", 4),
+        help=(
+            "Number of prefetched batches kept per worker. Larger values help "
+            "video-heavy pipelines hide decode latency."
+        ),
+    )
+    parser.add_argument(
+        "--video-backend",
+        type=str,
+        default=defaults.get("video_backend"),
+        help=(
+            "Optional LeRobot video decoder backend override. "
+            "Examples: torchcodec, pyav, video_reader."
+        ),
+    )
+    parser.add_argument(
+        "--torch-sharing-strategy",
+        choices=["auto", "file_system", "file_descriptor"],
+        default=defaults.get("torch_sharing_strategy", "auto"),
+        help=(
+            "Torch multiprocessing sharing strategy used by DataLoader workers. "
+            "`file_system` is more robust for large video datasets on Linux."
+        ),
+    )
+    parser.add_argument(
+        "--torchcodec-decoder-cache-size",
+        type=int,
+        default=defaults.get("torchcodec_decoder_cache_size", 32),
+        help=(
+            "Maximum number of torchcodec video decoders kept open per process. "
+            "Lower values reduce open-file pressure."
+        ),
+    )
+    filtered_hf_cache_group = parser.add_mutually_exclusive_group()
+    filtered_hf_cache_group.add_argument(
+        "--enable-filtered-hf-cache",
+        dest="use_filtered_hf_cache",
+        action="store_true",
+        help=(
+            "Persist the episode-filtered HF dataset view to disk and reuse it "
+            "on later runs with the same split."
+        ),
+    )
+    filtered_hf_cache_group.add_argument(
+        "--disable-filtered-hf-cache",
+        dest="use_filtered_hf_cache",
+        action="store_false",
+        help="Disable the persisted filtered HF dataset cache.",
+    )
+    parser.set_defaults(
+        use_filtered_hf_cache=defaults.get("enable_filtered_hf_cache", False),
+    )
+    parser.add_argument(
+        "--filtered-hf-cache-root",
+        type=Path,
+        default=defaults.get("filtered_hf_cache_root"),
+        help=(
+            "Optional cache root for filtered HF datasets. Relative paths are "
+            "resolved under the dataset root."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-filtered-hf-cache",
+        action="store_true",
+        default=defaults.get("refresh_filtered_hf_cache", False),
+        help="Rebuild the filtered HF dataset cache even if a matching cache exists.",
+    )
     parser.add_argument("--seed", type=int, default=defaults.get("seed", 42))
     parser.add_argument("--log-freq", type=int, default=defaults.get("log_freq", 50))
-    parser.add_argument(
-        "--save-freq", type=int, default=defaults.get("save_freq", 1000)
-    )
+    parser.add_argument("--save-freq", type=int, default=defaults.get("save_freq", 1000))
     parser.add_argument(
         "--eval-freq",
         type=int,
         default=defaults.get("eval_freq", -1),
-        help="Set -1 to disable eval.",
+        help=(
+            "In-training simulator eval is disabled in dataset-only mode. "
+            "Use -1 (recommended) and run eval_policy.py on the held-out split."
+        ),
     )
     parser.add_argument(
         "--device",
         type=str,
         default=defaults.get("device", "cuda"),
         help="cuda / cpu / mps",
+    )
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument(
+        "--enable-amp",
+        dest="use_amp",
+        action="store_true",
+        help="Enable mixed-precision training through Accelerate.",
+    )
+    amp_group.add_argument(
+        "--disable-amp",
+        dest="use_amp",
+        action="store_false",
+        help="Disable mixed-precision training and keep fp32 updates.",
+    )
+    parser.set_defaults(use_amp=defaults.get("use_amp", False))
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["auto", "bf16", "fp16"],
+        default=defaults.get("amp_dtype", "auto"),
+        help=(
+            "Preferred AMP dtype when --enable-amp is active. "
+            "`auto` selects bf16 on supported CUDA GPUs and otherwise falls back to fp16."
+        ),
     )
     parser.add_argument(
         "--chunk-size",
@@ -539,7 +1389,11 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=str,
         default=defaults.get("wandb_project"),
     )
-    parser.add_argument("--wandb-entity", type=str, default=defaults.get("wandb_entity"))
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=defaults.get("wandb_entity"),
+    )
     parser.add_argument(
         "--wandb-mode",
         type=str,
@@ -757,16 +1611,26 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "use_memory_conditioned_encoder_film", False
             ),
         )
+    parser.set_defaults(
+        _policy_defaults_path=(
+            None if defaults_path is None else str(defaults_path)
+        ),
+        _policy_defaults_dataset_root=defaults.get("dataset_root"),
+    )
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser(argv)
     args = parser.parse_args(argv)
-    if not isinstance(args.dataset_root, Path):
-        args.dataset_root = Path(args.dataset_root)
+    if not isinstance(args.local_data_root, Path):
+        args.local_data_root = Path(args.local_data_root)
     if not isinstance(args.output_root, Path):
         args.output_root = Path(args.output_root)
+    if args.filtered_hf_cache_root is not None and not isinstance(
+        args.filtered_hf_cache_root, Path
+    ):
+        args.filtered_hf_cache_root = Path(args.filtered_hf_cache_root)
     return args
 
 
@@ -790,17 +1654,37 @@ def main(argv: list[str] | None = None) -> None:
             "your platform."
         ) from exc
 
-    dataset_root = args.dataset_root.resolve()
+    defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
+    try:
+        dataset_root = resolve_dataset_root(
+            args.dataset,
+            local_data_root=args.local_data_root.resolve(),
+        )
+    except FileNotFoundError:
+        if not defaults_dataset_root:
+            raise
+        dataset_root = resolve_dataset_root(
+            defaults_dataset_root,
+            local_data_root=args.local_data_root.resolve(),
+        )
     validate_dataset_root(dataset_root)
-    env_module = get_env_module(args.env)
-    if hasattr(env_module, "validate_training_dataset_root"):
-        env_module.validate_training_dataset_root(dataset_root)
-    use_first_frame_anchor = bool(args.use_first_frame_anchor)
-    validate_first_frame_anchor_support(
-        env_name=args.env,
-        use_first_frame_anchor=use_first_frame_anchor,
-        context="training",
+    dataset_repo_id = (
+        str(args.dataset_repo_id)
+        if args.dataset_repo_id
+        else infer_dataset_repo_id(
+            dataset_root,
+            local_data_root=args.local_data_root.resolve(),
+        )
     )
+    split_spec = build_dataset_split(
+        dataset_arg=args.dataset,
+        dataset_root=dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        test_ratio=float(args.test_ratio),
+        split_seed=int(args.split_seed),
+        split_shuffle=bool(args.split_shuffle),
+    )
+    use_first_frame_anchor = bool(args.use_first_frame_anchor)
     validate_first_frame_anchor_dataset(
         dataset_root=dataset_root,
         use_first_frame_anchor=use_first_frame_anchor,
@@ -818,6 +1702,23 @@ def main(argv: list[str] | None = None) -> None:
         act_config_cls=ACTConfig,
         streaming_policy_cls=StreamingACTPolicy,
     )
+    install_torch_dataloader_patch(
+        persistent_workers=bool(args.dataloader_persistent_workers),
+        prefetch_factor=int(args.dataloader_prefetch_factor),
+    )
+    install_torchcodec_decoder_cache_patch(
+        max_cached_decoders=int(args.torchcodec_decoder_cache_size)
+    )
+    filtered_hf_cache_root = resolve_filtered_hf_cache_root(
+        dataset_root=dataset_root,
+        filtered_hf_cache_root=args.filtered_hf_cache_root,
+    )
+    install_lerobot_dataset_load_patch(
+        dataset_root=dataset_root,
+        filtered_hf_cache_root=filtered_hf_cache_root,
+        enable_filtered_hf_cache=bool(args.use_filtered_hf_cache),
+        refresh_filtered_hf_cache=bool(args.refresh_filtered_hf_cache),
+    )
 
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
@@ -825,7 +1726,6 @@ def main(argv: list[str] | None = None) -> None:
         use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
         use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
         validate_prefix_sequence_support(
-            env_name=args.env,
             policy_name=args.policy,
             use_prefix_sequence_training=use_prefix_sequence_training,
             context="training",
@@ -878,6 +1778,7 @@ def main(argv: list[str] | None = None) -> None:
 
     run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (args.output_root / run_stamp).resolve()
+    split_path = output_dir / "dataset_split.json"
 
     wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
     resolved_job_name = args.job_name
@@ -899,14 +1800,17 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     dataset_cfg = DatasetConfig(
-        repo_id=args.dataset_repo_id,
+        repo_id=dataset_repo_id,
         root=str(dataset_root),
+        episodes=split_spec.train_episode_indices,
         use_imagenet_stats=use_imagenet_stats,
+        video_backend=args.video_backend,
     )
 
     if args.policy == "streaming_act":
         policy_cfg = StreamingACTConfig(
             device=args.device,
+            use_amp=bool(args.use_amp),
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
@@ -943,6 +1847,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         policy_cfg = ACTConfig(
             device=args.device,
+            use_amp=bool(args.use_amp),
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
@@ -956,6 +1861,19 @@ def main(argv: list[str] | None = None) -> None:
         entity=args.wandb_entity,
         mode=args.wandb_mode,
     )
+    resolved_mixed_precision = resolve_accelerator_mixed_precision(
+        device=str(policy_cfg.device),
+        use_amp=bool(getattr(policy_cfg, "use_amp", False)),
+        amp_dtype=str(args.amp_dtype),
+    )
+
+    effective_eval_freq = -1
+    if int(args.eval_freq) > 0:
+        print(
+            "[WARN] `--eval-freq` is ignored in dataset-only mode because no simulator "
+            "environment is configured. Use `main/scripts/eval_policy.py` on the saved "
+            "held-out test split instead."
+        )
 
     cfg = TrainPipelineConfig(
         dataset=dataset_cfg,
@@ -966,22 +1884,53 @@ def main(argv: list[str] | None = None) -> None:
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         steps=args.steps,
-        eval_freq=args.eval_freq,
+        eval_freq=effective_eval_freq,
         log_freq=args.log_freq,
         save_freq=args.save_freq,
         wandb=wandb_cfg,
     )
 
     print("Starting LeRobot imitation training with config:")
-    print(f"- env: {args.env}")
+    if getattr(args, "_policy_defaults_path", None):
+        print(f"- defaults_file: {args._policy_defaults_path}")
     print(f"- policy: {args.policy}")
+    print(f"- dataset: {args.dataset}")
     print(f"- dataset_root: {dataset_root}")
-    print(f"- dataset_repo_id: {args.dataset_repo_id}")
+    print(f"- dataset_repo_id: {dataset_repo_id}")
+    print(
+        f"- train_test_split: train={split_spec.train_count}, "
+        f"test={split_spec.test_count}, "
+        f"test_ratio={split_spec.test_ratio:.3f}, "
+        f"shuffle={split_spec.split_shuffle}, seed={split_spec.split_seed}"
+    )
+    print(f"- train_episode_indices_path: {split_path}")
     print(f"- output_dir: {output_dir}")
     print(f"- device: {args.device}")
+    print(
+        "- amp: "
+        f"enable={bool(args.use_amp)}, dtype={args.amp_dtype}, "
+        f"mixed_precision={resolved_mixed_precision}"
+    )
     print(f"- job_name: {resolved_job_name}")
     print(f"- steps: {args.steps}")
     print(f"- batch_size: {args.batch_size}")
+    print(f"- num_workers: {args.num_workers}")
+    print(
+        "- dataloader: "
+        f"persistent_workers={bool(args.dataloader_persistent_workers)}, "
+        f"prefetch_factor={int(args.dataloader_prefetch_factor)}"
+    )
+    print(f"- video_backend: {args.video_backend or 'lerobot-default'}")
+    print(
+        "- torchcodec_decoder_cache_size: "
+        f"{int(args.torchcodec_decoder_cache_size)}"
+    )
+    print(
+        "- filtered_hf_cache: "
+        f"enable={bool(args.use_filtered_hf_cache)}, "
+        f"root={filtered_hf_cache_root}, "
+        f"refresh={bool(args.refresh_filtered_hf_cache)}"
+    )
     print(
         f"- action_execution: chunk_size={args.chunk_size}, "
         f"n_action_steps={args.n_action_steps}"
@@ -1017,8 +1966,30 @@ def main(argv: list[str] | None = None) -> None:
         f"- wandb: enable={wandb_enable}, project={args.wandb_project}, mode={args.wandb_mode}"
     )
 
+    resolved_torch_sharing_strategy = configure_torch_sharing_strategy(
+        args.torch_sharing_strategy
+    )
+    print(
+        "- torch_sharing_strategy: "
+        f"{resolved_torch_sharing_strategy or 'default'}"
+    )
+
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    force_cpu = str(policy_cfg.device).split(":", 1)[0] == "cpu"
+    accelerator = Accelerator(
+        step_scheduler_with_optimizer=False,
+        kwargs_handlers=[ddp_kwargs],
+        cpu=force_cpu,
+        mixed_precision=resolved_mixed_precision,
+    )
+
     try:
-        train(cfg)
+        train(cfg, accelerator=accelerator)
+        saved_split_path = save_dataset_split(output_dir, split_spec)
+        print(f"Saved dataset split: {saved_split_path}")
     except KeyboardInterrupt:
         print("\n[WARN] Training interrupted by user. Cleaning up wandb before exit.")
         teardown_wandb_safely(exit_code=130)

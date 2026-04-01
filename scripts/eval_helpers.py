@@ -184,13 +184,15 @@ def build_prefix_sequence_eval_inputs(
     obs: dict[str, object],
     cfg,
     state_key: str,
-    image_key: str,
+    image_key: str | None = None,
+    image_keys: list[str] | tuple[str, ...] | None = None,
     signature_key: str | None,
     delta_signature_key: str | None,
     prefix_state_history: list,
     prefix_signature_history: list | None,
     prefix_delta_signature_history: list | None,
-    prefix_image_history: list,
+    prefix_image_history: list | None = None,
+    prefix_image_histories: dict[str, list] | None = None,
 ) -> None:
     import torch
 
@@ -203,8 +205,48 @@ def build_prefix_sequence_eval_inputs(
         prefix_image_key_from_camera_key,
     )
 
+    if image_keys is None:
+        if image_key is None:
+            raise ValueError("Either `image_key` or `image_keys` must be provided.")
+        resolved_image_keys = [image_key]
+    else:
+        resolved_image_keys = list(image_keys)
+    if not resolved_image_keys:
+        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+
+    if prefix_image_histories is None:
+        if prefix_image_history is None:
+            raise ValueError(
+                "Either `prefix_image_history` or `prefix_image_histories` must be provided."
+            )
+        if len(resolved_image_keys) != 1:
+            raise ValueError(
+                "A single `prefix_image_history` list can only be used with one image key."
+            )
+        resolved_prefix_image_histories = {
+            resolved_image_keys[0]: prefix_image_history,
+        }
+    else:
+        resolved_prefix_image_histories = prefix_image_histories
+        missing_histories = [
+            key for key in resolved_image_keys if key not in resolved_prefix_image_histories
+        ]
+        if missing_histories:
+            raise KeyError(
+                "Missing prefix image histories for observation keys: "
+                f"{missing_histories}."
+            )
+
     prefix_state_history.append(obs[state_key].detach().clone())
-    prefix_image_history.append(obs[image_key].detach().clone())
+    for current_image_key in resolved_image_keys:
+        if current_image_key not in obs:
+            raise KeyError(
+                f"`{current_image_key}` must be present in the current observation before "
+                "building prefix-sequence eval inputs."
+            )
+        resolved_prefix_image_histories[current_image_key].append(
+            obs[current_image_key].detach().clone()
+        )
     if signature_key is not None:
         if signature_key not in obs:
             raise KeyError(
@@ -234,12 +276,6 @@ def build_prefix_sequence_eval_inputs(
         prefix_frame_stride=int(cfg.prefix_frame_stride),
         pad_value=float(cfg.prefix_pad_value),
     )
-    prefix_images, prefix_image_mask = build_padded_prefix_from_history(
-        prefix_image_history,
-        prefix_train_max_steps=int(cfg.prefix_train_max_steps),
-        prefix_frame_stride=int(cfg.prefix_frame_stride),
-        pad_value=0.0,
-    )
     if signature_key is not None:
         assert prefix_signature_history is not None
         prefix_signature, prefix_signature_mask = build_padded_prefix_from_history(
@@ -262,12 +298,20 @@ def build_prefix_sequence_eval_inputs(
             raise RuntimeError(
                 "Prefix state/delta-signature masks diverged during online eval."
             )
-    if not torch.equal(prefix_mask, prefix_image_mask):
-        raise RuntimeError("Prefix state/image masks diverged during online eval.")
+
+    for current_image_key in resolved_image_keys:
+        prefix_images, prefix_image_mask = build_padded_prefix_from_history(
+            resolved_prefix_image_histories[current_image_key],
+            prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+            prefix_frame_stride=int(cfg.prefix_frame_stride),
+            pad_value=0.0,
+        )
+        if not torch.equal(prefix_mask, prefix_image_mask):
+            raise RuntimeError("Prefix state/image masks diverged during online eval.")
+        obs[prefix_image_key_from_camera_key(current_image_key)] = prefix_images
 
     obs[PREFIX_STATE_KEY] = prefix_state
     obs[PREFIX_MASK_KEY] = prefix_mask
-    obs[prefix_image_key_from_camera_key(image_key)] = prefix_images
     if signature_key is not None:
         obs[PREFIX_PATH_SIGNATURE_KEY] = prefix_signature
     if delta_signature_key is not None:
@@ -278,7 +322,8 @@ def ensure_prefix_sequence_batch_dims(
     *,
     obs: dict[str, object],
     state_key: str,
-    image_key: str,
+    image_key: str | None = None,
+    image_keys: list[str] | tuple[str, ...] | None = None,
     use_path_signature: bool,
     use_delta_signature: bool,
 ) -> None:
@@ -290,11 +335,23 @@ def ensure_prefix_sequence_batch_dims(
         prefix_image_key_from_camera_key,
     )
 
-    prefix_image_key = prefix_image_key_from_camera_key(image_key)
+    if image_keys is None:
+        if image_key is None:
+            raise ValueError("Either `image_key` or `image_keys` must be provided.")
+        resolved_image_keys = [image_key]
+    else:
+        resolved_image_keys = list(image_keys)
+    if not resolved_image_keys:
+        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+
+    prefix_image_keys = [
+        prefix_image_key_from_camera_key(current_image_key)
+        for current_image_key in resolved_image_keys
+    ]
     required_prefix_keys = [
         PREFIX_STATE_KEY,
         PREFIX_MASK_KEY,
-        prefix_image_key,
+        *prefix_image_keys,
     ]
     if use_path_signature:
         required_prefix_keys.append(PREFIX_PATH_SIGNATURE_KEY)
@@ -328,7 +385,7 @@ def ensure_prefix_sequence_batch_dims(
             raise RuntimeError(
                 f"`{PREFIX_PATH_SIGNATURE_KEY}` must be 2D/3D after preprocessing, "
                 f"got shape={tuple(prefix_signature.shape)}"
-        )
+            )
         obs[PREFIX_PATH_SIGNATURE_KEY] = prefix_signature.to(device=device, dtype=dtype)
     if use_delta_signature:
         prefix_delta_signature = obs[PREFIX_DELTA_SIGNATURE_KEY]
@@ -354,15 +411,16 @@ def ensure_prefix_sequence_batch_dims(
         )
     obs[PREFIX_MASK_KEY] = prefix_mask.to(device=device)
 
-    prefix_images = obs[prefix_image_key]
-    if prefix_images.ndim == 4:
-        prefix_images = prefix_images.unsqueeze(0)
-    elif prefix_images.ndim != 5:
-        raise RuntimeError(
-            f"`{prefix_image_key}` must be 4D/5D after preprocessing, "
-            f"got shape={tuple(prefix_images.shape)}"
-        )
-    obs[prefix_image_key] = prefix_images.to(device=device, dtype=dtype)
+    for prefix_image_key in prefix_image_keys:
+        prefix_images = obs[prefix_image_key]
+        if prefix_images.ndim == 4:
+            prefix_images = prefix_images.unsqueeze(0)
+        elif prefix_images.ndim != 5:
+            raise RuntimeError(
+                f"`{prefix_image_key}` must be 4D/5D after preprocessing, "
+                f"got shape={tuple(prefix_images.shape)}"
+            )
+        obs[prefix_image_key] = prefix_images.to(device=device, dtype=dtype)
 
 
 def compute_signatory_signature_np(window: np.ndarray, sig_depth: int) -> np.ndarray:
