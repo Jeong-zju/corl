@@ -3,7 +3,7 @@
 * 数据下载
 
 ```bash
-
+python data/download_dataset.py lerobot/metaworld_mt50 --output-dir data
 ```
 
 * 数据采集

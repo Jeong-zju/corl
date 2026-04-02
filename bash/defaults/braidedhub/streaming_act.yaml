@@ -1,9 +1,9 @@
 train:
   dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
-  output_root: "outputs/train/braidedhub_fourstart_streaming_act_sipm"
-  job_name: "streaming_act_braidedhub_fourstart_sipm"
-  wandb_project: "lerobot-braidedhub"
+  output_root: "outputs/train/braidedhub/streaming-act-sipm"
+  job_name: "streaming-act-sipm"
+  wandb_project: "braidedhub"
   wandb_mode: "online"
   device: "cuda"
   steps: 50000
@@ -37,8 +37,8 @@ train:
   signature_dropout: 0.1
 
 eval:
-  train_output_root: "outputs/train/braidedhub_fourstart_streaming_act_sipm"
-  output_dir: "outputs/eval/braidedhub_fourstart_streaming_act_sipm/{run_tag}"
+  train_output_root: "outputs/train/braidedhub/streaming-act-sipm"
+  output_dir: "outputs/eval/braidedhub/streaming-act-sipm/{run_tag}"
   num_rollouts: 50
   max_steps: 240
   fps: 20

@@ -1,9 +1,9 @@
 train:
   dataset_root: "data/zeno-ai/panda_route_onebit_cue_v30"
   dataset_repo_id: "zeno-ai/panda_route_onebit_cue_v30"
-  output_root: "outputs/train/panda_route_act"
-  job_name: "act_panda_route"
-  wandb_project: "lerobot-panda-route-act"
+  output_root: "outputs/train/panda_route/act"
+  job_name: "act"
+  wandb_project: "panda_route"
   wandb_mode: "online"
   device: "cuda"
   steps: 50000
@@ -21,8 +21,8 @@ train:
   wandb_service_wait: 10
 
 eval:
-  train_output_root: "outputs/train/panda_route_act"
-  output_dir: "outputs/eval/panda_route_act/{run_tag}"
+  train_output_root: "outputs/train/panda_route/act"
+  output_dir: "outputs/eval/panda_route/act/{run_tag}"
   num_rollouts: 50
   max_steps: 500
   fps: 20

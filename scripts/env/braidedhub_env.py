@@ -108,16 +108,16 @@ BRANCH1_PHASES = frozenset(BRANCH1_PHASE_BY_BIT.values())
 BRANCH2_PHASES = frozenset(BRANCH2_PHASE_BY_BIT.values())
 _TRAIN_DEFAULTS = {
     "act": {
-        "output_root": Path("outputs/train/braidedhub_fourstart_act"),
-        "job_name": "act_braidedhub_fourstart",
-        "wandb_project": "lerobot-braidedhub-act",
-        "eval_output_dir": Path("outputs/eval/braidedhub_fourstart_act"),
+        "output_root": Path("outputs/train/braidedhub/act-baseline"),
+        "job_name": "act-baseline",
+        "wandb_project": "braidedhub",
+        "eval_output_dir": Path("outputs/eval/braidedhub/act-baseline"),
     },
     "streaming_act": {
-        "output_root": Path("outputs/train/braidedhub_fourstart_streaming_act"),
-        "job_name": "streaming_act_braidedhub_fourstart",
-        "wandb_project": "lerobot-braidedhub-streaming-act",
-        "eval_output_dir": Path("outputs/eval/braidedhub_fourstart_streaming_act"),
+        "output_root": Path("outputs/train/braidedhub/streaming-act-sipm"),
+        "job_name": "streaming-act-sipm",
+        "wandb_project": "braidedhub",
+        "eval_output_dir": Path("outputs/eval/braidedhub/streaming-act-sipm"),
     },
 }
 DEFAULT_T_FIXED = 100

@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -1096,7 +1097,73 @@ def install_prefix_sequence_dataset_patch() -> None:
 
 def default_train_output_root(policy_name: str) -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "main" / "outputs" / "train" / policy_name
+    return repo_root / "main" / "outputs" / "train" / default_policy_series_name(
+        policy_name
+    )
+
+
+def default_policy_series_name(policy_name: str) -> str:
+    return str(policy_name).replace("_", "-")
+
+
+def normalize_output_path_part(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "item"
+
+
+def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
+    if not dataset_selector:
+        return None
+
+    raw = str(dataset_selector).strip().replace("\\", "/")
+    if not raw:
+        return None
+    if raw.startswith("./"):
+        raw = raw[2:]
+    for prefix in ("main/data/", "data/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    marker = "/main/data/"
+    if marker in raw:
+        raw = raw.split(marker, 1)[1]
+
+    parts = [
+        normalize_output_path_part(part)
+        for part in raw.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if not parts:
+        return None
+    return Path(*parts)
+
+
+def resolve_default_train_output_root(
+    *,
+    policy_name: str,
+    dataset_selector: str | None,
+) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    base = repo_root / "main" / "outputs" / "train"
+    dataset_subdir = default_dataset_output_subdir(dataset_selector)
+    if dataset_subdir is not None:
+        return base / dataset_subdir / default_policy_series_name(policy_name)
+    return default_train_output_root(policy_name)
+
+
+def default_wandb_project_name(
+    dataset_repo_id: str | None,
+    dataset_root: Path,
+) -> str:
+    candidate = str(dataset_repo_id or "").strip()
+    if candidate:
+        candidate = candidate.replace("\\", "/").rstrip("/")
+        if "/" in candidate:
+            candidate = candidate.rsplit("/", 1)[-1]
+    if not candidate:
+        candidate = dataset_root.name
+    return candidate or "dataset"
 
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
@@ -1179,13 +1246,19 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=defaults.get("output_root", default_train_output_root(known_args.policy)),
+        default=defaults.get(
+            "output_root",
+            resolve_default_train_output_root(
+                policy_name=known_args.policy,
+                dataset_selector=known_args.dataset,
+            ),
+        ),
         help="Root folder for training outputs.",
     )
     parser.add_argument(
         "--job-name",
         type=str,
-        default=defaults.get("job_name", f"{known_args.policy}_train"),
+        default=defaults.get("job_name", default_policy_series_name(known_args.policy)),
     )
     parser.add_argument(
         "--wandb-run-name",
@@ -1193,7 +1266,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default=defaults.get("wandb_run_name"),
         help=(
             "Optional explicit Weights & Biases run name. "
-            "Defaults to '<job-name>_s<seed>_<timestamp>'."
+            "Defaults to '<job-name>-s<seed>-<timestamp>'."
         ),
     )
     parser.add_argument("--steps", type=int, default=defaults.get("steps", 10000))
@@ -1781,12 +1854,20 @@ def main(argv: list[str] | None = None) -> None:
     split_path = output_dir / "dataset_split.json"
 
     wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
+    resolved_wandb_project = (
+        str(args.wandb_project)
+        if args.wandb_project
+        else default_wandb_project_name(
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+    )
     resolved_job_name = args.job_name
     if wandb_enable:
         resolved_job_name = (
             args.wandb_run_name
             if args.wandb_run_name
-            else f"{args.job_name}_s{args.seed}_{run_stamp}"
+            else f"{args.job_name}-s{args.seed}-{run_stamp}"
         )
 
     if (
@@ -1857,7 +1938,7 @@ def main(argv: list[str] | None = None) -> None:
 
     wandb_cfg = WandBConfig(
         enable=wandb_enable,
-        project=args.wandb_project,
+        project=resolved_wandb_project,
         entity=args.wandb_entity,
         mode=args.wandb_mode,
     )
@@ -1963,7 +2044,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"{bool(args.use_memory_conditioned_encoder_film)}"
             )
     print(
-        f"- wandb: enable={wandb_enable}, project={args.wandb_project}, mode={args.wandb_mode}"
+        f"- wandb: enable={wandb_enable}, project={resolved_wandb_project}, mode={args.wandb_mode}"
     )
 
     resolved_torch_sharing_strategy = configure_torch_sharing_strategy(

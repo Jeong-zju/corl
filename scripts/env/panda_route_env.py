@@ -150,16 +150,16 @@ SCHEMATIC_CURSOR_INNER = (240, 70, 70)
 
 _TRAIN_DEFAULTS = {
     "act": {
-        "output_root": Path("outputs/train/panda_route_act"),
-        "job_name": "act_panda_route",
-        "wandb_project": "lerobot-panda-route-act",
-        "eval_output_dir": Path("outputs/eval/panda_route_act"),
+        "output_root": Path("outputs/train/panda_route/act"),
+        "job_name": "act",
+        "wandb_project": "panda_route",
+        "eval_output_dir": Path("outputs/eval/panda_route/act"),
     },
     "streaming_act": {
-        "output_root": Path("outputs/train/panda_route_streaming_act"),
-        "job_name": "streaming_act_panda_route",
-        "wandb_project": "lerobot-panda-route-streaming-act",
-        "eval_output_dir": Path("outputs/eval/panda_route_streaming_act"),
+        "output_root": Path("outputs/train/panda_route/streaming-act"),
+        "job_name": "streaming-act",
+        "wandb_project": "panda_route",
+        "eval_output_dir": Path("outputs/eval/panda_route/streaming-act"),
     },
 }
 

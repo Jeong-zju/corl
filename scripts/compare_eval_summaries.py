@@ -4,8 +4,8 @@
 Examples:
     python scripts/compare_eval_summaries.py --dataset zeno-ai/day3_5_Exp1_processed
     python scripts/compare_eval_summaries.py \
-        --summary outputs/eval/day3_5_Exp1_processed_act/20260401_112614/summary.json \
-        --summary outputs/eval/day3_5_Exp1_processed_streaming_act/20260401_114643/summary.json
+        --summary outputs/eval/zeno-ai/day3_5_Exp1_processed/act/20260401_112614/summary.json \
+        --summary outputs/eval/zeno-ai/day3_5_Exp1_processed/streaming-act-sipm/20260401_114643/summary.json
 """
 
 from __future__ import annotations
@@ -231,7 +231,7 @@ def infer_series_name(summary_path: Path, eval_root: Path) -> str:
     except Exception:
         relative = summary_path
     if len(relative.parts) >= 3:
-        return relative.parts[0]
+        return relative.parts[-3]
     if len(summary_path.parents) >= 2:
         return summary_path.parents[1].name
     return summary_path.parent.name
@@ -288,7 +288,13 @@ def discover_latest_summaries(dataset_selector: str, eval_root: Path) -> list[Pa
 
     latest_by_series: dict[str, tuple[tuple[int, str], Path]] = {}
     matched = 0
-    for summary_path in sorted(eval_root.glob("*/*/summary.json")):
+    for summary_path in sorted(eval_root.rglob("summary.json")):
+        try:
+            relative = summary_path.resolve().relative_to(eval_root.resolve())
+        except Exception:
+            continue
+        if len(relative.parts) < 3:
+            continue
         try:
             data = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

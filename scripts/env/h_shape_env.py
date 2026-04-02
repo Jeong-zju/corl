@@ -51,16 +51,16 @@ TASK_ID_TO_DESCRIPTION = {
 
 _TRAIN_DEFAULTS = {
     "act": {
-        "output_root": Path("outputs/train/h_shape_act"),
-        "job_name": "act_h_shape",
-        "wandb_project": "lerobot-rrt-act",
-        "eval_output_dir": Path("outputs/eval/h_shape_act"),
+        "output_root": Path("outputs/train/h_shape/act"),
+        "job_name": "act",
+        "wandb_project": "h_shape",
+        "eval_output_dir": Path("outputs/eval/h_shape/act"),
     },
     "streaming_act": {
-        "output_root": Path("outputs/train/h_shape_streaming_act"),
-        "job_name": "streaming_act_h_shape",
-        "wandb_project": "lerobot-rrt-streaming-act",
-        "eval_output_dir": Path("outputs/eval/h_shape_streaming_act"),
+        "output_root": Path("outputs/train/h_shape/streaming-act"),
+        "job_name": "streaming-act",
+        "wandb_project": "h_shape",
+        "eval_output_dir": Path("outputs/eval/h_shape/streaming-act"),
     },
 }
 

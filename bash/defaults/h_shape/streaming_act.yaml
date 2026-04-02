@@ -1,9 +1,9 @@
 train:
   dataset_root: "data/zeno-ai/rrt_connect_h_v30"
   dataset_repo_id: "zeno-ai/rrt_connect_h_v30"
-  output_root: "outputs/train/h_shape_streaming_act"
-  job_name: "streaming_act_h_shape"
-  wandb_project: "lerobot-rrt-streaming-act"
+  output_root: "outputs/train/h_shape/streaming-act"
+  job_name: "streaming-act"
+  wandb_project: "h_shape"
   wandb_mode: "online"
   device: "cuda"
   steps: 10000
@@ -33,8 +33,8 @@ train:
   signature_dropout: 0.1
 
 eval:
-  train_output_root: "outputs/train/h_shape_streaming_act"
-  output_dir: "outputs/eval/h_shape_streaming_act/{run_tag}"
+  train_output_root: "outputs/train/h_shape/streaming-act"
+  output_dir: "outputs/eval/h_shape/streaming-act/{run_tag}"
   num_rollouts: 20
   max_steps: 120
   fps: 20

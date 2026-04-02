@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import re
 import sys
 import time
 from collections import deque
@@ -128,14 +129,67 @@ def validate_delta_signature_support(
         )
 
 
-def default_train_output_root(policy_name: str) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "main" / "outputs" / "train" / policy_name
+def default_policy_series_name(policy_name: str) -> str:
+    return str(policy_name).replace("_", "-")
 
 
-def default_eval_output_dir(policy_name: str) -> str:
+def normalize_output_path_part(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "item"
+
+
+def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
+    if not dataset_selector:
+        return None
+
+    raw = str(dataset_selector).strip().replace("\\", "/")
+    if not raw:
+        return None
+    if raw.startswith("./"):
+        raw = raw[2:]
+    for prefix in ("main/data/", "data/"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    marker = "/main/data/"
+    if marker in raw:
+        raw = raw.split(marker, 1)[1]
+
+    parts = [
+        normalize_output_path_part(part)
+        for part in raw.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if not parts:
+        return None
+    return Path(*parts)
+
+
+def default_train_output_root(
+    policy_name: str,
+    dataset_selector: str | None = None,
+) -> Path:
     repo_root = Path(__file__).resolve().parents[2]
-    return str(repo_root / "main" / "outputs" / "eval" / policy_name / "{run_tag}")
+    base = repo_root / "main" / "outputs" / "train"
+    dataset_subdir = default_dataset_output_subdir(dataset_selector)
+    if dataset_subdir is not None:
+        return base / dataset_subdir / default_policy_series_name(policy_name)
+    return base / default_policy_series_name(policy_name)
+
+
+def default_eval_output_dir(
+    policy_name: str,
+    dataset_selector: str | None = None,
+) -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    base = repo_root / "main" / "outputs" / "eval"
+    dataset_subdir = default_dataset_output_subdir(dataset_selector)
+    if dataset_subdir is not None:
+        return str(
+            base / dataset_subdir / default_policy_series_name(policy_name) / "{run_tag}"
+        )
+    return str(base / default_policy_series_name(policy_name) / "{run_tag}")
 
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
@@ -218,7 +272,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=Path,
         default=defaults.get(
             "train_output_root",
-            default_train_output_root(known_args.policy),
+            default_train_output_root(known_args.policy, known_args.dataset),
         ),
         help="Training output root used to infer the latest run.",
     )
@@ -236,7 +290,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=str,
         default=defaults.get(
             "output_dir",
-            default_eval_output_dir(known_args.policy),
+            default_eval_output_dir(known_args.policy, known_args.dataset),
         ),
         help="Directory where evaluation artifacts are saved.",
     )
