@@ -4,9 +4,64 @@
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
-from huggingface_hub import snapshot_download
+
+try:
+    import resource
+except ImportError:  # pragma: no cover
+    resource = None
+
+
+AUTO_MAX_WORKERS = "auto"
+MIN_AUTO_MAX_WORKERS = 8
+MAX_AUTO_MAX_WORKERS = 64
+
+
+def get_available_cpu_count() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def resolve_max_workers(max_workers: int | str | None) -> int:
+    if isinstance(max_workers, int):
+        if max_workers <= 0:
+            raise ValueError(f"`max_workers` must be positive. Got {max_workers}.")
+        return max_workers
+
+    text = AUTO_MAX_WORKERS if max_workers is None else str(max_workers).strip().lower()
+    if text != AUTO_MAX_WORKERS:
+        resolved = int(text)
+        if resolved <= 0:
+            raise ValueError(f"`max_workers` must be positive. Got {max_workers}.")
+        return resolved
+
+    cpu_count = get_available_cpu_count()
+    # snapshot_download is mostly network-bound, so scale above CPU count,
+    # but clamp against a reasonable upper bound and file descriptor limits.
+    cpu_based_limit = max(MIN_AUTO_MAX_WORKERS, cpu_count * 4)
+    fd_based_limit = MAX_AUTO_MAX_WORKERS
+    if resource is not None:
+        try:
+            soft_nofile, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (OSError, ValueError):
+            soft_nofile = -1
+        if soft_nofile and soft_nofile > 0:
+            fd_based_limit = max(MIN_AUTO_MAX_WORKERS, soft_nofile // 8)
+
+    return max(
+        1,
+        min(
+            MAX_AUTO_MAX_WORKERS,
+            cpu_based_limit,
+            fd_based_limit,
+        ),
+    )
 
 
 def download_dataset(
@@ -16,6 +71,7 @@ def download_dataset(
     cache_dir: str = "./.cache",
     max_retries: int = 10,
     retry_delay: int = 30,
+    max_workers: int | str = AUTO_MAX_WORKERS,
 ):
     """
     从Hugging Face下载数据集，支持断点续传和自动重试
@@ -27,22 +83,32 @@ def download_dataset(
         cache_dir: 缓存目录
         max_retries: 最大重试次数
         retry_delay: 重试延迟（秒）
+        max_workers: 下载并发数，支持正整数或 "auto"
     """
-    output_path = Path(output_dir)
+    output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    cache_path = Path(cache_dir)
+    cache_path = Path(cache_dir).expanduser()
     cache_path.mkdir(parents=True, exist_ok=True)
 
     local_dir = output_path / dataset_name.replace("/", "_")
+    resolved_max_workers = resolve_max_workers(max_workers)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 `huggingface_hub`，请先安装后再下载数据集，例如 `pip install huggingface_hub`。"
+        ) from exc
 
     print(f"正在下载数据集: {dataset_name}")
     print(f"输出目录: {local_dir}")
     print(f"最大重试次数: {max_retries}")
+    print(f"下载并发数: {resolved_max_workers}")
 
     for attempt in range(max_retries):
         try:
-            print(f"\n尝试 {attempt + 1}/{max_retries}")
+            print(f"\n尝试 {attempt + 1}/{max_retries}，缓存到 {cache_path}")
 
             snapshot_download(
                 repo_id=dataset_name,
@@ -50,7 +116,7 @@ def download_dataset(
                 local_dir=str(local_dir),
                 cache_dir=str(cache_path),
                 resume_download=True,
-                max_workers=4,
+                max_workers=resolved_max_workers,
             )
 
             print(f"\n✓ 数据集下载完成: {local_dir}")
@@ -74,9 +140,15 @@ if __name__ == "__main__":
     parser.add_argument("dataset_name", type=str, help="数据集名称")
     parser.add_argument("--output-dir", type=str, default="./", help="输出目录")
     parser.add_argument("--repo-type", type=str, default="dataset", help="仓库类型")
-    parser.add_argument("--cache-dir", type=str, default="./.cache", help="缓存目录")
+    parser.add_argument("--cache-dir", type=str, default="~/.cache", help="缓存目录")
     parser.add_argument("--max-retries", type=int, default=1000, help="最大重试次数")
     parser.add_argument("--retry-delay", type=int, default=30, help="重试延迟（秒）")
+    parser.add_argument(
+        "--max-workers",
+        type=str,
+        default=AUTO_MAX_WORKERS,
+        help='下载并发数，传正整数或 "auto"（默认）',
+    )
 
     args = parser.parse_args()
 
@@ -87,4 +159,5 @@ if __name__ == "__main__":
         cache_dir=args.cache_dir,
         max_retries=args.max_retries,
         retry_delay=args.retry_delay,
+        max_workers=args.max_workers,
     )
