@@ -176,7 +176,7 @@
                 <strong>{{ run.timestamp }}</strong>
               </div>
               <div class="run-stats">
-                <p class="run-count">{{ run.video_count }} 个视频</p>
+                <p class="run-count">{{ run.video_count }} 个视频 · {{ run.task_count }} 个 task</p>
                 {% if run.has_eval_metrics %}
                 <p class="run-success" title="统计来源: {{ run.metrics_source }}">成功率 {{ run.success_rate_label }} · {{ run.success_count }}/{{ run.total_episodes }}</p>
                 {% else %}
@@ -185,55 +185,48 @@
               </div>
             </header>
 
+            {% if run.task_groups %}
+            <div
+              class="run-toolbar"
+              data-run-column
+              data-videos-per-page="{{ videos_per_page }}"
+            >
+              <div
+                class="task-tabs"
+                data-task-tabs
+                role="tablist"
+                aria-label="{{ run.env }} / {{ run.algorithm }} task tabs"
+              ></div>
+
+              <div class="video-filter-row">
+                <div class="status-filter" role="group" aria-label="按结果筛选">
+                  <button type="button" class="filter-chip is-active" data-status-filter="all">全部</button>
+                  <button type="button" class="filter-chip" data-status-filter="success">成功</button>
+                  <button type="button" class="filter-chip" data-status-filter="failure">失败</button>
+                </div>
+                <p class="page-hint">每页 {{ videos_per_page }} 个视频</p>
+              </div>
+
+              <div class="task-summary" data-task-summary></div>
+              <div class="run-video-list" data-video-list></div>
+              <div class="pagination" data-pagination></div>
+
+              <script type="application/json" data-run-payload>
+                {{ {
+                  "env": run.env,
+                  "algorithm": run.algorithm,
+                  "timestamp": run.timestamp,
+                  "taskGroups": run.task_groups
+                } | tojson }}
+              </script>
+            </div>
+            {% else %}
             <div class="run-video-list">
-              {% if run.videos %}
-                {% for video in run.videos %}
-                <section class="video-card">
-                  <div class="video-card-header">
-                    <h3 title="{{ video.name }}">{{ video.name }}</h3>
-                  </div>
-
-                  {% if video.is_gif %}
-                  <img
-                    src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
-                    alt="{{ video.name }}"
-                    class="media-preview"
-                    loading="lazy"
-                    data-open-media="image"
-                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
-                    data-title="{{ run.algorithm }} / {{ video.name }}"
-                  />
-                  {% else %}
-                  <video
-                    class="media-preview"
-                    controls
-                    preload="metadata"
-                    playsinline
-                    data-open-media="video"
-                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
-                    data-title="{{ run.algorithm }} / {{ video.name }}"
-                  >
-                    <source src="{{ request.url_for('video_file', file_path=video.relative_path) }}" />
-                  </video>
-                  {% endif %}
-
-                  <button
-                    type="button"
-                    class="ghost-button"
-                    data-open-media="{{ 'image' if video.is_gif else 'video' }}"
-                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
-                    data-title="{{ run.env }} / {{ run.algorithm }} / {{ video.name }}"
-                  >
-                    放大查看
-                  </button>
-                </section>
-                {% endfor %}
-              {% else %}
               <div class="empty-run">
                 <p>这个 run 下没有识别到支持的视频文件。</p>
               </div>
-              {% endif %}
             </div>
+            {% endif %}
           </article>
           {% endfor %}
         </div>
