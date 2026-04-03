@@ -9,6 +9,18 @@
   --primary-hover: #1e40af;
   --danger-bg: #fff1f2;
   --danger-border: #fecdd3;
+  --frost-surface: rgba(255, 255, 255, 0.88);
+  --frost-border: rgba(214, 220, 232, 0.9);
+  --frost-blur: blur(10px);
+  --topbar-height: 110px;
+  --page-pad-top: 1rem;
+  --page-pad-x: 1.25rem;
+  --page-pad-bottom: 1.25rem;
+  --page-gap: 1rem;
+  --sidebar-column: 300px;
+  --sidebar-left: 1.25rem;
+  --sidebar-width: 300px;
+  --sidebar-height: auto;
   --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
   --radius: 16px;
 }
@@ -28,6 +40,7 @@ body {
 
 body {
   min-height: 100vh;
+  padding-top: var(--topbar-height);
 }
 
 code {
@@ -44,11 +57,14 @@ code {
   gap: 1rem;
   align-items: flex-start;
   padding: 1.5rem 1.75rem;
-  border-bottom: 1px solid rgba(214, 220, 232, 0.9);
-  background: rgba(255, 255, 255, 0.88);
-  backdrop-filter: blur(10px);
-  position: sticky;
+  border-bottom: 1px solid var(--frost-border);
+  background: var(--frost-surface);
+  -webkit-backdrop-filter: var(--frost-blur);
+  backdrop-filter: var(--frost-blur);
+  position: fixed;
   top: 0;
+  left: 0;
+  right: 0;
   z-index: 10;
 }
 
@@ -77,15 +93,21 @@ code {
 
 .page-layout {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
-  gap: 1rem;
-  padding: 1rem 1.25rem 1.25rem;
-  min-height: calc(100vh - 110px);
+  grid-template-columns: var(--sidebar-column) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--page-gap);
+  padding: var(--page-pad-top) var(--page-pad-x) var(--page-pad-bottom);
+  min-height: calc(100vh - var(--topbar-height));
 }
 
 .sidebar,
 .content-area {
   min-height: 0;
+}
+
+.sidebar {
+  align-self: start;
+  min-height: var(--sidebar-height);
 }
 
 .panel,
@@ -100,8 +122,16 @@ code {
 
 .panel {
   padding: 1rem;
-  position: sticky;
-  top: 7.2rem;
+  background: var(--frost-surface);
+  -webkit-backdrop-filter: var(--frost-blur);
+  backdrop-filter: var(--frost-blur);
+  position: fixed;
+  top: calc(var(--topbar-height) + var(--page-pad-top));
+  left: var(--sidebar-left);
+  width: var(--sidebar-width);
+  max-height: calc(100vh - var(--topbar-height) - var(--page-pad-top) - var(--page-pad-bottom));
+  overflow-y: auto;
+  z-index: 9;
 }
 
 .panel-header {
@@ -704,10 +734,6 @@ body.is-loading .loading-overlay {
 @media (max-width: 960px) {
   .page-layout {
     grid-template-columns: 1fr;
-  }
-
-  .panel {
-    position: static;
   }
 
   .summary-header {

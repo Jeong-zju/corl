@@ -1,10 +1,32 @@
 document.addEventListener("DOMContentLoaded", () => {
+  const root = document.documentElement;
   const body = document.body;
   const dialog = document.getElementById("media-dialog");
   const dialogTitle = document.getElementById("media-dialog-title");
   const dialogVideo = document.getElementById("dialog-video");
   const dialogImage = document.getElementById("dialog-image");
   const loadingText = document.querySelector("[data-loading-text]");
+  const topbar = document.querySelector(".topbar");
+  const sidebar = document.querySelector(".sidebar");
+  const filterPanel = document.querySelector(".panel");
+
+  function syncFixedChromeLayout() {
+    if (topbar) {
+      root.style.setProperty("--topbar-height", `${Math.ceil(topbar.getBoundingClientRect().height)}px`);
+    }
+
+    if (!sidebar || !filterPanel) {
+      root.style.removeProperty("--sidebar-left");
+      root.style.removeProperty("--sidebar-width");
+      root.style.removeProperty("--sidebar-height");
+      return;
+    }
+
+    const sidebarRect = sidebar.getBoundingClientRect();
+    root.style.setProperty("--sidebar-left", `${Math.round(sidebarRect.left)}px`);
+    root.style.setProperty("--sidebar-width", `${Math.round(sidebarRect.width)}px`);
+    root.style.setProperty("--sidebar-height", `${Math.ceil(filterPanel.getBoundingClientRect().height)}px`);
+  }
 
   function cleanupDialog() {
     if (!dialogVideo || !dialogImage) {
@@ -388,4 +410,20 @@ document.addEventListener("DOMContentLoaded", () => {
       body.classList.add("is-loading");
     });
   });
+
+  syncFixedChromeLayout();
+  window.addEventListener("resize", syncFixedChromeLayout);
+  window.addEventListener("load", syncFixedChromeLayout);
+
+  if (typeof ResizeObserver === "function") {
+    const layoutObserver = new ResizeObserver(() => {
+      syncFixedChromeLayout();
+    });
+
+    [topbar, sidebar, filterPanel].forEach((element) => {
+      if (element) {
+        layoutObserver.observe(element);
+      }
+    });
+  }
 });
