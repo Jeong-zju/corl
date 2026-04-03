@@ -24,7 +24,7 @@
         </p>
       </div>
 
-      <form action="/rescan" method="post" class="inline-form">
+      <form action="/rescan{% if rescan_query_string %}?{{ rescan_query_string }}{% endif %}" method="post" class="inline-form">
         <button type="submit" class="primary-button" data-loading-text="正在重新扫描...">重新扫描</button>
       </form>
     </header>

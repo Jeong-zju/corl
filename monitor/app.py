@@ -6,6 +6,7 @@ import re
 from numbers import Real
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
@@ -777,6 +778,19 @@ def filter_runs(
     return filtered
 
 
+def build_filter_query_items(
+    selected_env: str,
+    selected_algorithms: list[str],
+    selected_timestamps: list[str],
+) -> list[tuple[str, str]]:
+    query_items: list[tuple[str, str]] = []
+    if selected_env:
+        query_items.append(("env", selected_env))
+    query_items.extend(("algorithm", value) for value in selected_algorithms if value)
+    query_items.extend(("timestamp", value) for value in selected_timestamps if value)
+    return query_items
+
+
 @app.on_event("startup")
 def startup_refresh() -> None:
     refresh_scan_cache()
@@ -801,6 +815,12 @@ async def index(request: Request) -> Any:
     filtered_runs = filter_runs(
         runs, selected_env, selected_algorithms, selected_timestamps
     )
+    rescan_query_string = urlencode(
+        build_filter_query_items(
+            selected_env, selected_algorithms, selected_timestamps
+        ),
+        doseq=True,
+    )
     algorithm_success_bars, success_metrics_missing_count = (
         build_algorithm_success_summary(filtered_runs)
     )
@@ -820,6 +840,7 @@ async def index(request: Request) -> Any:
             "selected_env": selected_env,
             "selected_algorithms": set(selected_algorithms),
             "selected_timestamps": set(selected_timestamps),
+            "rescan_query_string": rescan_query_string,
             "runs": filtered_runs,
             "algorithm_success_bars": algorithm_success_bars,
             "success_metrics_missing_count": success_metrics_missing_count,
@@ -831,9 +852,26 @@ async def index(request: Request) -> Any:
 
 
 @app.post("/rescan")
-async def rescan() -> RedirectResponse:
+async def rescan(request: Request) -> RedirectResponse:
+    selected_env = request.query_params.get("env", "").strip()
+    selected_algorithms = [
+        value for value in request.query_params.getlist("algorithm") if value
+    ]
+    selected_timestamps = [
+        value for value in request.query_params.getlist("timestamp") if value
+    ]
+
     refresh_scan_cache()
-    return RedirectResponse(url="/", status_code=303)
+
+    query_items = build_filter_query_items(
+        selected_env, selected_algorithms, selected_timestamps
+    )
+
+    redirect_url = "/"
+    if query_items:
+        redirect_url = f"/?{urlencode(query_items, doseq=True)}"
+
+    return RedirectResponse(url=redirect_url, status_code=303)
 
 
 @app.get("/video/{file_path:path}", name="video_file")

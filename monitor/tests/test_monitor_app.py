@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import tempfile
 import unittest
+from unittest import mock
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
+
+from starlette.datastructures import QueryParams
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -119,6 +124,41 @@ class BuildRunVideoGroupsTests(unittest.TestCase):
             self.assertEqual(failure_video["episode_index"], 10)
             self.assertEqual(failure_video["status_key"], "failure")
             self.assertEqual(failure_video["failure_reason"], "H1 阶段走错分支")
+
+
+class RescanRouteTests(unittest.TestCase):
+    def test_rescan_redirect_preserves_filter_query_params(self) -> None:
+        class FakeRequest:
+            def __init__(self, query_params: QueryParams) -> None:
+                self.query_params = query_params
+
+        request = FakeRequest(
+            QueryParams(
+                [
+                    ("env", "metaworld_mt50"),
+                    ("algorithm", "act"),
+                    ("algorithm", "streaming-act"),
+                    ("timestamp", "20260403_144650"),
+                    ("timestamp", "20260403_140651"),
+                ]
+            )
+        )
+
+        with mock.patch.object(MONITOR_APP, "refresh_scan_cache", return_value={}):
+            response = asyncio.run(MONITOR_APP.rescan(request))
+
+        self.assertEqual(response.status_code, 303)
+        location = response.headers["location"]
+        parsed = urlparse(location)
+        self.assertEqual(parsed.path, "/")
+        self.assertEqual(
+            parse_qs(parsed.query),
+            {
+                "env": ["metaworld_mt50"],
+                "algorithm": ["act", "streaming-act"],
+                "timestamp": ["20260403_144650", "20260403_140651"],
+            },
+        )
 
 
 if __name__ == "__main__":
