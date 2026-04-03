@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Eval Comparison Viewer</title>
+    <link rel="stylesheet" href="{{ request.url_for('static', path='style.css') }}" />
+    <script src="{{ request.url_for('static', path='app.js') }}" defer></script>
+  </head>
+  <body>
+    <div class="loading-overlay" data-loading-overlay aria-hidden="true">
+      <div class="loading-card">
+        <div class="loading-spinner"></div>
+        <p data-loading-text>加载中...</p>
+      </div>
+    </div>
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">FastAPI + Jinja2</p>
+        <h1>本地 Eval 结果简单对比可视化工具</h1>
+        <p class="scan-root" title="{{ scan_root_path }}">
+          当前扫描根目录: <code>{{ scan_root_label }}</code>
+        </p>
+      </div>
+
+      <form action="/rescan" method="post" class="inline-form">
+        <button type="submit" class="primary-button" data-loading-text="正在重新扫描...">重新扫描</button>
+      </form>
+    </header>
+
+    <main class="page-layout">
+      <aside class="sidebar">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>筛选</h2>
+            <p>{{ filtered_runs_count }} / {{ total_runs }} 个 run</p>
+          </div>
+
+          <form action="/" method="get" class="filter-form">
+            <label class="field-label" for="env-select">Env / Dataset</label>
+            <select id="env-select" name="env" class="select-field">
+              <option value="">全部</option>
+              {% for env in env_options %}
+              <option value="{{ env }}" {% if selected_env == env %}selected{% endif %}>{{ env }}</option>
+              {% endfor %}
+            </select>
+
+            <div class="field-group">
+              <div class="field-title-row">
+                <label class="field-label">Algorithm</label>
+                <span>{{ algorithm_options|length }}</span>
+              </div>
+              <div class="checkbox-list">
+                {% if algorithm_options %}
+                  {% for algorithm in algorithm_options %}
+                  <label class="checkbox-item">
+                    <input
+                      type="checkbox"
+                      name="algorithm"
+                      value="{{ algorithm }}"
+                      {% if algorithm in selected_algorithms %}checked{% endif %}
+                    />
+                    <span>{{ algorithm }}</span>
+                  </label>
+                  {% endfor %}
+                {% else %}
+                <p class="hint-text">当前筛选下没有 algorithm。</p>
+                {% endif %}
+              </div>
+            </div>
+
+            <div class="field-group">
+              <div class="field-title-row">
+                <label class="field-label">Time Stamp</label>
+                <span>{{ timestamp_options|length }}</span>
+              </div>
+              <div class="checkbox-list">
+                {% if timestamp_options %}
+                  {% for timestamp in timestamp_options %}
+                  <label class="checkbox-item">
+                    <input
+                      type="checkbox"
+                      name="timestamp"
+                      value="{{ timestamp }}"
+                      {% if timestamp in selected_timestamps %}checked{% endif %}
+                    />
+                    <span>{{ timestamp }}</span>
+                  </label>
+                  {% endfor %}
+                {% else %}
+                <p class="hint-text">当前筛选下没有 time stamp。</p>
+                {% endif %}
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="primary-button" data-loading-text="正在应用筛选...">应用筛选</button>
+              <a href="/" class="secondary-button">重置</a>
+            </div>
+          </form>
+        </section>
+      </aside>
+
+      <section class="content-area">
+        {% if error_message %}
+        <div class="status-card error-card">
+          <strong>扫描出错</strong>
+          <p>{{ error_message }}</p>
+        </div>
+        {% endif %}
+
+        {% if not has_eval_root %}
+        <div class="status-card">
+          <strong>目录不存在</strong>
+          <p>没有找到可扫描的 eval 目录。请检查 <code>{{ scan_root_label }}</code> 是否存在。</p>
+        </div>
+        {% elif total_runs == 0 %}
+        <div class="status-card">
+          <strong>没有发现 run</strong>
+          <p>目录结构存在，但当前没有识别到任何 <code>{env}/{algorithm}/{timestamp}</code> run。</p>
+        </div>
+        {% elif filtered_runs_count == 0 %}
+        <div class="status-card">
+          <strong>没有匹配结果</strong>
+          <p>当前筛选条件下没有可展示的 run，请调整左侧筛选条件。</p>
+        </div>
+        {% else %}
+        <section class="summary-card">
+          <div class="summary-header">
+            <div>
+              <h2>算法成功率对比</h2>
+              <p>基于当前筛选结果，对带有 <code>eval_info.json</code> 或 <code>summary.json</code> 的 run 按算法聚合。</p>
+            </div>
+            {% if success_metrics_missing_count > 0 %}
+            <p class="summary-note">{{ success_metrics_missing_count }} 个 run 没有成功率数据，未计入条形图。</p>
+            {% endif %}
+          </div>
+
+          {% if algorithm_success_bars %}
+          <div class="bar-chart">
+            {% for item in algorithm_success_bars %}
+            <div class="bar-row">
+              <div class="bar-row-header">
+                <strong>{{ item.algorithm }}</strong>
+                <span>{{ item.success_rate_label }}</span>
+              </div>
+              <div class="bar-track" aria-label="{{ item.algorithm }} success rate {{ item.success_rate_label }}">
+                <div class="bar-fill" style="width: {{ '%.2f'|format(item.bar_width) }}%"></div>
+              </div>
+              <p class="bar-meta">{{ item.run_count }} 个 run / {{ item.total_episodes }} 个 episode</p>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div class="empty-summary">
+            <p>当前筛选结果里没有可用的成功率统计。</p>
+          </div>
+          {% endif %}
+        </section>
+
+        <div class="runs-strip">
+          {% for run in runs %}
+          <article class="run-column">
+            <header class="run-header">
+              <div class="run-meta">
+                <span class="meta-label">Env</span>
+                <strong>{{ run.env }}</strong>
+              </div>
+              <div class="run-meta">
+                <span class="meta-label">Algorithm</span>
+                <strong>{{ run.algorithm }}</strong>
+              </div>
+              <div class="run-meta">
+                <span class="meta-label">Time</span>
+                <strong>{{ run.timestamp }}</strong>
+              </div>
+              <div class="run-stats">
+                <p class="run-count">{{ run.video_count }} 个视频</p>
+                {% if run.has_eval_metrics %}
+                <p class="run-success" title="统计来源: {{ run.metrics_source }}">成功率 {{ run.success_rate_label }} · {{ run.success_count }}/{{ run.total_episodes }}</p>
+                {% else %}
+                <p class="run-success muted">成功率 N/A</p>
+                {% endif %}
+              </div>
+            </header>
+
+            <div class="run-video-list">
+              {% if run.videos %}
+                {% for video in run.videos %}
+                <section class="video-card">
+                  <div class="video-card-header">
+                    <h3 title="{{ video.name }}">{{ video.name }}</h3>
+                  </div>
+
+                  {% if video.is_gif %}
+                  <img
+                    src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
+                    alt="{{ video.name }}"
+                    class="media-preview"
+                    loading="lazy"
+                    data-open-media="image"
+                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
+                    data-title="{{ run.algorithm }} / {{ video.name }}"
+                  />
+                  {% else %}
+                  <video
+                    class="media-preview"
+                    controls
+                    preload="metadata"
+                    playsinline
+                    data-open-media="video"
+                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
+                    data-title="{{ run.algorithm }} / {{ video.name }}"
+                  >
+                    <source src="{{ request.url_for('video_file', file_path=video.relative_path) }}" />
+                  </video>
+                  {% endif %}
+
+                  <button
+                    type="button"
+                    class="ghost-button"
+                    data-open-media="{{ 'image' if video.is_gif else 'video' }}"
+                    data-src="{{ request.url_for('video_file', file_path=video.relative_path) }}"
+                    data-title="{{ run.env }} / {{ run.algorithm }} / {{ video.name }}"
+                  >
+                    放大查看
+                  </button>
+                </section>
+                {% endfor %}
+              {% else %}
+              <div class="empty-run">
+                <p>这个 run 下没有识别到支持的视频文件。</p>
+              </div>
+              {% endif %}
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </section>
+    </main>
+
+    <dialog id="media-dialog" class="media-dialog">
+      <div class="dialog-header">
+        <h2 id="media-dialog-title">预览</h2>
+        <button type="button" class="icon-button" data-close-dialog aria-label="关闭">×</button>
+      </div>
+
+      <div class="dialog-body">
+        <video id="dialog-video" controls preload="metadata" playsinline class="dialog-media" hidden></video>
+        <img id="dialog-image" alt="" class="dialog-media" hidden />
+      </div>
+    </dialog>
+  </body>
+</html>
