@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from .configuration_act import ACTConfig
+from .configuration_streaming_act import StreamingACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -31,20 +31,20 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_act_pre_post_processors(
-    config: ACTConfig,
+def make_streaming_act_pre_post_processors(
+    config: StreamingACTConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Creates the pre- and post-processing pipelines for the ACT policy.
+    """Creates the pre- and post-processing pipelines for the Streaming ACT policy.
 
     The pre-processing pipeline handles normalization, batching, and device placement for the model inputs.
     The post-processing pipeline handles unnormalization and moves the model outputs back to the CPU.
 
     Args:
-        config (ACTConfig): The ACT policy configuration object.
+        config (StreamingACTConfig): The Streaming ACT policy configuration object.
         dataset_stats (dict[str, dict[str, torch.Tensor]] | None): A dictionary containing dataset
             statistics (e.g., mean and std) used for normalization. Defaults to None.
 

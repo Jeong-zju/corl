@@ -186,9 +186,9 @@ def clone_prefix_stats(
 
     for camera_key in camera_keys:
         if camera_key not in stats:
-            raise KeyError(
-                f"Camera stats for `{camera_key}` are missing; cannot derive prefix image stats."
-            )
+            # LeRobot's normalizer already treats missing stats as identity for that key.
+            # Preserve that behavior for prefix images instead of hard-failing here.
+            continue
         stats[prefix_image_key_from_camera_key(camera_key)] = deepcopy(stats[camera_key])
     return stats
 

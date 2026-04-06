@@ -31,7 +31,10 @@ from eval_helpers import (
     resolve_signature_backend,
     write_summary,
 )
-from policy_defaults import load_policy_mode_defaults_for_dataset
+from policy_defaults import (
+    load_policy_mode_defaults,
+    load_policy_mode_defaults_for_dataset,
+)
 
 
 FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
@@ -65,12 +68,6 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
             f"Streaming ACT package source not found: {streaming_act_src}"
         )
     sys.path.insert(0, str(streaming_act_src))
-
-
-def patch_lerobot_processor_factory(act_config_cls) -> None:
-    import lerobot.policies.factory as policy_factory
-
-    policy_factory.ACTConfig = act_config_cls
 
 
 def validate_first_frame_anchor_support(
@@ -196,18 +193,40 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
+        "--env",
+        choices=get_env_choices(),
+        default=None,
+    )
+    bootstrap.add_argument(
         "--policy",
         choices=["act", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults = {}
+    dataset_train_defaults = {}
+    defaults_path = None
     if known_args.dataset:
-        defaults, _ = load_policy_mode_defaults_for_dataset(
+        defaults, defaults_path = load_policy_mode_defaults_for_dataset(
             mode="eval",
             dataset_selector=known_args.dataset,
             policy_name=known_args.policy,
         )
+        dataset_train_defaults, _ = load_policy_mode_defaults_for_dataset(
+            mode="train",
+            dataset_selector=known_args.dataset,
+            policy_name=known_args.policy,
+        )
+    if known_args.env:
+        try:
+            env_defaults = load_policy_mode_defaults(
+                mode="eval",
+                env_name=known_args.env,
+                policy_name=known_args.policy,
+            )
+        except FileNotFoundError:
+            env_defaults = {}
+        defaults.update(env_defaults)
 
     parser = argparse.ArgumentParser(
         description=(
@@ -243,7 +262,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-repo-id",
         type=str,
-        default=defaults.get("dataset_repo_id"),
+        default=defaults.get(
+            "dataset_repo_id",
+            dataset_train_defaults.get("dataset_repo_id"),
+        ),
         help="Optional logical repo_id override used when loading the local LeRobot dataset.",
     )
     parser.add_argument(
@@ -368,37 +390,62 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-rollouts",
         type=int,
-        default=20,
+        default=defaults.get("num_rollouts", 20),
         help="Number of evaluation rollouts in env mode.",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=120,
+        default=defaults.get("max_steps", 120),
         help="Maximum rollout length in env mode.",
     )
     parser.add_argument(
         "--fps",
         type=int,
-        default=20,
+        default=defaults.get("fps", 20),
         help="Video fps in env rollout mode.",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=defaults.get("task", defaults.get("cil")),
+        help=(
+            "Optional Meta-World task subset for env mode. Use a comma-separated "
+            "task list such as `assembly-v3,dial-turn-v3,handle-press-side-v3`."
+        ),
+    )
+    parser.add_argument(
+        "--cil",
+        dest="task",
+        type=str,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--max-episodes-rendered",
+        type=int,
+        default=defaults.get("max_episodes_rendered"),
+        help=(
+            "Maximum number of rollout videos to save per task in env mode when "
+            "supported by the environment evaluator."
+        ),
     )
     parser.add_argument(
         "--success-threshold",
         type=float,
-        default=0.0,
+        default=defaults.get("success_threshold", 0.0),
         help="Only used by h_shape env evaluation.",
     )
     parser.add_argument(
         "--max-action-step",
         type=float,
-        default=1.0,
+        default=defaults.get("max_action_step", 1.0),
         help="Clamp action magnitude during env rollout evaluation.",
     )
     parser.add_argument(
         "--collision-mode",
         type=str,
-        default="reject",
+        default=defaults.get("collision_mode", "reject"),
         choices=["reject", "detect"],
         help=(
             "Only used by braidedhub env evaluation. "
@@ -418,19 +465,25 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         action="store_false",
         help="Disable randomized reset start states during env evaluation.",
     )
-    parser.set_defaults(enable_randomize=False)
+    parser.set_defaults(enable_randomize=bool(defaults.get("enable_randomize", False)))
 
     if known_args.policy == "streaming_act":
         parser.add_argument(
             "--signature-backend",
             type=str,
-            default="auto",
+            default=defaults.get("signature_backend", "auto"),
             choices=["auto", "signatory", "simple"],
             help=(
                 "Backend for online path-signature computation during env evaluation "
                 "and for dataset evaluation when the dataset lacks signature features."
             ),
         )
+    parser.set_defaults(
+        _policy_defaults_path=(
+            None if defaults_path is None else str(defaults_path)
+        ),
+        _policy_defaults_dataset_root=dataset_train_defaults.get("dataset_root"),
+    )
     return parser
 
 
@@ -470,6 +523,17 @@ def resolve_state_key(cfg) -> str:
             if key.endswith(".state"):
                 return str(key)
     return "observation.state"
+
+
+def resolve_env_state_key(cfg) -> str | None:
+    input_features = getattr(cfg, "input_features", None)
+    if isinstance(input_features, dict):
+        if "observation.environment_state" in input_features:
+            return "observation.environment_state"
+        for key in input_features:
+            if key.endswith(".environment_state"):
+                return str(key)
+    return None
 
 
 def resolve_action_key(cfg) -> str:
@@ -537,10 +601,19 @@ def resolve_dataset_selection(
     )
 
     if args.dataset is not None:
-        dataset_root = resolve_dataset_root(
-            args.dataset,
-            local_data_root=args.local_data_root.resolve(),
-        )
+        defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
+        try:
+            dataset_root = resolve_dataset_root(
+                args.dataset,
+                local_data_root=args.local_data_root.resolve(),
+            )
+        except FileNotFoundError:
+            if not defaults_dataset_root:
+                raise
+            dataset_root = resolve_dataset_root(
+                defaults_dataset_root,
+                local_data_root=args.local_data_root.resolve(),
+            )
         dataset_repo_id = (
             str(args.dataset_repo_id)
             if args.dataset_repo_id
@@ -710,6 +783,7 @@ def run_dataset_evaluation(
 
     visual_keys = select_visual_observation_keys(cfg)
     state_key = resolve_state_key(cfg)
+    env_state_key = resolve_env_state_key(cfg)
     action_key = resolve_action_key(cfg)
 
     use_path_signature = bool(
@@ -828,6 +902,11 @@ def run_dataset_evaluation(
                 raise KeyError(
                     f"Dataset item is missing required state key `{state_key}`."
                 )
+            if env_state_key is not None and env_state_key not in item:
+                raise KeyError(
+                    "Dataset item is missing required environment-state key "
+                    f"`{env_state_key}`."
+                )
             if action_key not in item:
                 raise KeyError(
                     f"Dataset item is missing required action key `{action_key}`."
@@ -840,6 +919,8 @@ def run_dataset_evaluation(
                 )
 
             obs = {state_key: as_tensor_copy(item[state_key])}
+            if env_state_key is not None:
+                obs[env_state_key] = as_tensor_copy(item[env_state_key])
             for visual_key in visual_keys:
                 obs[visual_key] = as_tensor_copy(item[visual_key])
 
@@ -1125,7 +1206,8 @@ def main(argv: list[str] | None = None) -> None:
     import torch
 
     repo_root = Path(__file__).resolve().parents[2]
-    ensure_streaming_act_importable(repo_root)
+    if args.policy == "streaming_act":
+        ensure_streaming_act_importable(repo_root)
 
     try:
         from lerobot.configs.policies import PreTrainedConfig
@@ -1137,11 +1219,20 @@ def main(argv: list[str] | None = None) -> None:
             "your platform."
         ) from exc
 
-    from lerobot_policy_streaming_act.configuration_act import ACTConfig
-    from lerobot_policy_streaming_act.modeling_act import ACTPolicy, StreamingACTPolicy
+    if args.policy == "streaming_act":
+        from lerobot_policy_streaming_act.configuration_streaming_act import (
+            StreamingACTConfig,
+        )
+        from lerobot_policy_streaming_act.modeling_streaming_act import (
+            StreamingACTPolicy,
+        )
 
-    patch_lerobot_processor_factory(act_config_cls=ACTConfig)
-    policy_cls = StreamingACTPolicy if args.policy == "streaming_act" else ACTPolicy
+        policy_cls = StreamingACTPolicy
+    else:
+        from lerobot.policies.act.configuration_act import ACTConfig
+        from lerobot.policies.act.modeling_act import ACTPolicy
+
+        policy_cls = ACTPolicy
 
     policy_dir = resolve_eval_policy_path(
         policy_path=args.policy_path,

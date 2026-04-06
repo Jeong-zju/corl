@@ -33,7 +33,7 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from .configuration_act import ACTConfig, FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
+from .configuration_streaming_act import FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
 from .prefix_sequence import (
     DELTA_SIGNATURE_KEY,
     PATH_SIGNATURE_KEY,
@@ -224,11 +224,6 @@ class StreamingACTPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
 
-class ACTPolicy(StreamingACTPolicy):
-    config_class = ACTConfig
-    name = "act"
-
-
 class StreamingACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
         """Temporal ensembling as described in Algorithm 2 of https://huggingface.co/papers/2304.13705.
@@ -355,7 +350,7 @@ class StreamingACT(nn.Module):
                                 └───────────────────────┘
     """
 
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: StreamingACTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
@@ -1506,7 +1501,7 @@ class StreamingACT(nn.Module):
 class StreamingACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
-    def __init__(self, config: ACTConfig, is_vae_encoder: bool = False):
+    def __init__(self, config: StreamingACTConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
         num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
@@ -1523,7 +1518,7 @@ class StreamingACTEncoder(nn.Module):
 
 
 class StreamingACTEncoderLayer(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: StreamingACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
@@ -1562,7 +1557,7 @@ class StreamingACTEncoderLayer(nn.Module):
 
 
 class StreamingACTDecoder(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: StreamingACTConfig):
         """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
         self.layers = nn.ModuleList([StreamingACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
@@ -1585,7 +1580,7 @@ class StreamingACTDecoder(nn.Module):
 
 
 class StreamingACTDecoderLayer(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: StreamingACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)

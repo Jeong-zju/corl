@@ -32,14 +32,10 @@ from .prefix_sequence import (
 
 FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 
-existing_act_config = PreTrainedConfig.get_known_choices().get("act")
-if existing_act_config is not None and existing_act_config.__module__.startswith("lerobot."):
-    PreTrainedConfig.get_known_choices().pop("act")
 
-
-@PreTrainedConfig.register_subclass("act")
+@PreTrainedConfig.register_subclass("streaming_act")
 @dataclass
-class ACTConfig(PreTrainedConfig):
+class StreamingACTConfig(PreTrainedConfig):
     """Configuration class for the Action Chunking Transformers policy.
 
     Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
@@ -537,9 +533,4 @@ class ACTConfig(PreTrainedConfig):
         return {
             key: ft for key, ft in self.image_features.items() if is_prefix_image_key(key)
         }
-
-
-@PreTrainedConfig.register_subclass("streaming_act")
-@dataclass
-class StreamingACTConfig(ACTConfig):
     use_path_signature: bool = True

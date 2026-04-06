@@ -7,6 +7,7 @@ _ENV_MODULES = {
     "h_shape": "env.h_shape_env",
     "braidedhub": "env.braidedhub_env",
     "panda_route": "env.panda_route_env",
+    "metaworld": "env.metaworld_env",
 }
 
 

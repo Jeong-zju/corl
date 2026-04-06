@@ -45,22 +45,6 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def patch_lerobot_act_factory(act_policy_cls, act_config_cls, streaming_policy_cls) -> None:
-    import lerobot.policies.factory as policy_factory
-
-    original_get_policy_class = policy_factory.get_policy_class
-
-    def get_policy_class_with_local_act(name: str):
-        if name == "act":
-            return act_policy_cls
-        if name == "streaming_act":
-            return streaming_policy_cls
-        return original_get_policy_class(name)
-
-    policy_factory.get_policy_class = get_policy_class_with_local_act
-    policy_factory.ACTConfig = act_config_cls
-
-
 def teardown_wandb_safely(exit_code: int) -> None:
     try:
         import wandb
@@ -903,6 +887,7 @@ def validate_prefix_sequence_dataset(
     dataset_root: Path,
     *,
     use_prefix_sequence_training: bool,
+    use_imagenet_stats: bool,
     use_path_signature: bool,
     use_delta_signature: bool,
 ) -> None:
@@ -932,9 +917,17 @@ def validate_prefix_sequence_dataset(
         )
     missing_camera_stats = [key for key in camera_keys if key not in stats]
     if missing_camera_stats:
-        raise KeyError(
-            "Prefix-sequence mode requires image stats for all regular observation cameras. "
-            f"Missing: {missing_camera_stats}."
+        if use_imagenet_stats:
+            raise KeyError(
+                "Prefix-sequence mode could not apply ImageNet camera stats because "
+                f"meta/stats.json is missing {missing_camera_stats}."
+            )
+        print(
+            "[WARN] Prefix-sequence mode found observation cameras without stats in "
+            f"{dataset_root / 'meta/stats.json'}:\n"
+            + "\n".join(f"  - {key}" for key in missing_camera_stats)
+            + "\n[WARN] Current and prefix image features will use identity "
+            "normalization for those keys."
         )
 
     if "observation.state" not in stats:
@@ -1210,6 +1203,23 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Optional logical repo_id override used by LeRobot metadata APIs. "
             "Defaults to the dataset path relative to main/data."
         ),
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default=defaults.get("task", defaults.get("cil")),
+        help=(
+            "Optional Meta-World task subset recorded in the training config. "
+            "Use a comma-separated task list such as "
+            "`assembly-v3,dial-turn-v3,handle-press-side-v3`."
+        ),
+    )
+    parser.add_argument(
+        "--cil",
+        dest="task",
+        type=str,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--local-data-root",
@@ -1711,7 +1721,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
-    ensure_streaming_act_importable(repo_root)
+    if args.policy == "streaming_act":
+        ensure_streaming_act_importable(repo_root)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
@@ -1762,29 +1773,32 @@ def main(argv: list[str] | None = None) -> None:
         dataset_root=dataset_root,
         use_first_frame_anchor=use_first_frame_anchor,
     )
+    if args.policy != "streaming_act" and use_first_frame_anchor:
+        raise NotImplementedError(
+            "`--enable-first-frame-anchor` is only supported by the local "
+            "`streaming_act` implementation. Official `act` should be run without it."
+        )
     use_imagenet_stats = resolve_use_imagenet_stats(
         dataset_root=dataset_root,
         use_imagenet_stats=args.use_imagenet_stats,
     )
-
-    from lerobot_policy_streaming_act.configuration_act import ACTConfig, StreamingACTConfig
-    from lerobot_policy_streaming_act.modeling_act import ACTPolicy, StreamingACTPolicy
-
-    patch_lerobot_act_factory(
-        act_policy_cls=ACTPolicy,
-        act_config_cls=ACTConfig,
-        streaming_policy_cls=StreamingACTPolicy,
+    filtered_hf_cache_root = resolve_filtered_hf_cache_root(
+        dataset_root=dataset_root,
+        filtered_hf_cache_root=args.filtered_hf_cache_root,
     )
+
+    from lerobot.policies.act.configuration_act import ACTConfig
+
+    if args.policy == "streaming_act":
+        from lerobot_policy_streaming_act.configuration_streaming_act import (
+            StreamingACTConfig,
+        )
     install_torch_dataloader_patch(
         persistent_workers=bool(args.dataloader_persistent_workers),
         prefetch_factor=int(args.dataloader_prefetch_factor),
     )
     install_torchcodec_decoder_cache_patch(
         max_cached_decoders=int(args.torchcodec_decoder_cache_size)
-    )
-    filtered_hf_cache_root = resolve_filtered_hf_cache_root(
-        dataset_root=dataset_root,
-        filtered_hf_cache_root=args.filtered_hf_cache_root,
     )
     install_lerobot_dataset_load_patch(
         dataset_root=dataset_root,
@@ -1819,6 +1833,7 @@ def main(argv: list[str] | None = None) -> None:
         validate_prefix_sequence_dataset(
             dataset_root=dataset_root,
             use_prefix_sequence_training=use_prefix_sequence_training,
+            use_imagenet_stats=use_imagenet_stats,
             use_path_signature=use_path_signature,
             use_delta_signature=use_delta_signature,
         )
@@ -1933,8 +1948,13 @@ def main(argv: list[str] | None = None) -> None:
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
             n_action_steps=args.n_action_steps,
-            use_first_frame_anchor=use_first_frame_anchor,
         )
+
+    env_cfg = None
+    if args.task:
+        from lerobot.envs.configs import MetaworldEnv as MetaworldEnvConfig
+
+        env_cfg = MetaworldEnvConfig(task=str(args.task))
 
     wandb_cfg = WandBConfig(
         enable=wandb_enable,
@@ -1958,6 +1978,7 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = TrainPipelineConfig(
         dataset=dataset_cfg,
+        env=env_cfg,
         policy=policy_cfg,
         output_dir=output_dir,
         job_name=resolved_job_name,
@@ -1978,6 +1999,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"- dataset: {args.dataset}")
     print(f"- dataset_root: {dataset_root}")
     print(f"- dataset_repo_id: {dataset_repo_id}")
+    if args.task:
+        print(f"- task: {args.task}")
     print(
         f"- train_test_split: train={split_spec.train_count}, "
         f"test={split_spec.test_count}, "

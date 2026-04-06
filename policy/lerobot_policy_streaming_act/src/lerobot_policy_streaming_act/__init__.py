@@ -7,26 +7,21 @@ except ImportError as exc:
         "lerobot is not installed. Please install lerobot to use lerobot_policy_streaming_act."
     ) from exc
 
-from .configuration_act import ACTConfig, FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
-from .modeling_act import ACTPolicy, StreamingACTPolicy
+from .configuration_streaming_act import FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
+from .modeling_streaming_act import StreamingACTPolicy
 from .prefix_sequence import (
     PREFIX_MASK_KEY,
     PREFIX_PATH_SIGNATURE_KEY,
     PREFIX_STATE_KEY,
 )
-from .processor_act import make_act_pre_post_processors
-
-make_streaming_act_pre_post_processors = make_act_pre_post_processors
+from .processor_streaming_act import make_streaming_act_pre_post_processors
 
 __all__ = [
-    "ACTConfig",
-    "ACTPolicy",
     "FIRST_FRAME_ANCHOR_KEY",
     "PREFIX_MASK_KEY",
     "PREFIX_PATH_SIGNATURE_KEY",
     "PREFIX_STATE_KEY",
     "StreamingACTConfig",
     "StreamingACTPolicy",
-    "make_act_pre_post_processors",
     "make_streaming_act_pre_post_processors",
 ]

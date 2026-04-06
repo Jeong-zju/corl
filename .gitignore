@@ -6,3 +6,4 @@ data/*
 *.npz
 .cache
 **/.hf_home
+**/*.egg-info/
