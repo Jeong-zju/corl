@@ -1,7 +1,6 @@
 outputs/
 data/*
-!data/process_dataset.py
-!data/download_dataset.py
+!data/*.py
 **/__pycache__/
 *.npz
 .cache
