@@ -31,8 +31,6 @@ class OdomTopicConfig:
 class ArmCommandConfig:
     topic: str
     joint_names: tuple[str, ...]
-    message_type: str = "joint_trajectory"
-    duration_s: float = 0.2
 
 
 @dataclass(slots=True)
@@ -103,14 +101,10 @@ class Ros1AdapterConfig:
             left_arm_command=ArmCommandConfig(
                 topic=str(left_cmd_raw["topic"]),
                 joint_names=tuple(str(name) for name in left_cmd_raw["joint_names"]),
-                message_type=str(left_cmd_raw.get("message_type", "joint_trajectory")),
-                duration_s=float(left_cmd_raw.get("duration_s", 0.2)),
             ),
             right_arm_command=ArmCommandConfig(
                 topic=str(right_cmd_raw["topic"]),
                 joint_names=tuple(str(name) for name in right_cmd_raw["joint_names"]),
-                message_type=str(right_cmd_raw.get("message_type", "joint_trajectory")),
-                duration_s=float(right_cmd_raw.get("duration_s", 0.2)),
             ),
             base_command=BaseCommandConfig(
                 topic=str(base_cmd_raw.get("topic", "/cmd_vel")),

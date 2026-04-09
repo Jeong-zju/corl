@@ -74,9 +74,7 @@ ros1:
     stream: "odom"
     topic: "/ranger_base_node/odom"
   left_arm_command:
-    topic: "/bridge/left_arm_joint_trajectory"
-    message_type: "joint_state"
-    duration_s: 0.2
+    topic: "/bridge/left_arm_joint_states"
     joint_names:
       - "joint1"
       - "joint2"
@@ -86,9 +84,7 @@ ros1:
       - "joint6"
       - "gripper"
   right_arm_command:
-    topic: "/bridge/right_arm_joint_trajectory"
-    message_type: "joint_state"
-    duration_s: 0.2
+    topic: "/bridge/right_arm_joint_states"
     joint_names:
       - "joint1"
       - "joint2"

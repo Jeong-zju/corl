@@ -30,6 +30,9 @@ class LatestSensorCache:
         self._max_skew_ns = int(max_skew_ms) * 1_000_000
         self._samples: dict[str, BufferedSample] = {}
 
+    def clear(self) -> None:
+        self._samples.clear()
+
     def update(self, packet: SensorPacket, *, received_mono_ns: int | None = None) -> None:
         self._samples[packet.stream] = BufferedSample(
             packet=packet,
@@ -75,4 +78,3 @@ class LatestSensorCache:
                 return None, f"skew:{requirement.stream}"
 
         return SyncSnapshot(stamp_ns=latest_stamp_ns, samples=selected), None
-

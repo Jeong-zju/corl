@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from deploy.bridge.bridge_core import BridgeConfig, BridgeRuntime  # noqa: E402
 from deploy.bridge.protocol import SensorPacket  # noqa: E402
+from deploy.bridge.sync import StreamRequirement  # noqa: E402
 
 
 def _make_config(policy_type: str) -> BridgeConfig:
@@ -99,6 +100,58 @@ class BridgeRuntimeObservationTest(unittest.TestCase):
         assert observation.delta_signature is not None
         self.assertEqual(observation.path_signature.shape[0], 51)
         self.assertEqual(observation.delta_signature.shape[0], 51)
+
+    def test_snapshot_fingerprint_changes_only_when_seq_or_stamp_changes(self) -> None:
+        runtime = BridgeRuntime(config=_make_config("act"))
+        samples = _make_samples()
+        fingerprint = runtime._snapshot_fingerprint(samples)
+        repeated_fingerprint = runtime._snapshot_fingerprint(_make_samples())
+        self.assertEqual(fingerprint, repeated_fingerprint)
+
+        advanced_samples = _make_samples()
+        advanced_samples["odom"] = SensorPacket(
+            stream="odom",
+            seq=99,
+            stamp_ns=456,
+            payload_type="base_velocity",
+            array=np.asarray([0.1, 0.2, 0.3], dtype=np.float32),
+        )
+        advanced_fingerprint = runtime._snapshot_fingerprint(advanced_samples)
+        self.assertNotEqual(fingerprint, advanced_fingerprint)
+
+    def test_time_rewind_triggers_automatic_reset_and_cache_clear(self) -> None:
+        runtime = BridgeRuntime(config=_make_config("streaming_act"))
+        runtime._pending_reset = False
+        runtime._last_snapshot_fingerprint = (("odom", 1, 123),)
+        runtime._sensor_cache.update(
+            SensorPacket(
+                stream="odom",
+                seq=5,
+                stamp_ns=500,
+                payload_type="base_velocity",
+                array=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            )
+        )
+        runtime._last_sensor_stamp_by_stream["odom"] = 500
+        runtime._last_sensor_seq_by_stream["odom"] = 5
+
+        runtime._handle_sensor_packet(
+            SensorPacket(
+                stream="odom",
+                seq=1,
+                stamp_ns=100,
+                payload_type="base_velocity",
+                array=np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
+            )
+        )
+
+        self.assertTrue(runtime._pending_reset)
+        self.assertIsNone(runtime._last_snapshot_fingerprint)
+        self.assertEqual(runtime._auto_reset_count, 1)
+        snapshot, failure = runtime._sensor_cache.snapshot([StreamRequirement("odom", max_age_ms=50)])
+        self.assertIsNone(failure)
+        assert snapshot is not None
+        self.assertEqual(int(snapshot.samples["odom"].stamp_ns), 100)
 
 
 if __name__ == "__main__":

@@ -145,6 +145,10 @@ class BridgeRuntime:
         self._pending_reset = True
         self._running = True
         self._last_obs_seq = -1
+        self._last_snapshot_fingerprint: tuple[tuple[str, int, int], ...] | None = None
+        self._last_sensor_stamp_by_stream: dict[str, int] = {}
+        self._last_sensor_seq_by_stream: dict[str, int] = {}
+        self._auto_reset_count = 0
         self._last_hold_reason = ""
         self._last_reported_status = "init"
 
@@ -173,6 +177,55 @@ class BridgeRuntime:
             max_age_ms = self.config.freshness_ms.get(stream, 50)
             requirements.append(StreamRequirement(stream=stream, max_age_ms=max_age_ms))
         return requirements
+
+    @staticmethod
+    def _snapshot_fingerprint(samples: dict[str, SensorPacket]) -> tuple[tuple[str, int, int], ...]:
+        return tuple(
+            sorted(
+                (
+                    str(stream),
+                    int(packet.seq),
+                    int(packet.stamp_ns),
+                )
+                for stream, packet in samples.items()
+            )
+        )
+
+    def _trigger_automatic_reset(self, *, reason: str) -> None:
+        self._auto_reset_count += 1
+        self._pending_reset = True
+        self._signature_tracker.reset()
+        self._sensor_cache.clear()
+        self._last_snapshot_fingerprint = None
+        self._log(
+            "reset",
+            f"Bridge auto-resetting state (count={self._auto_reset_count}): {reason}",
+        )
+
+    def _handle_sensor_packet(self, packet: SensorPacket) -> None:
+        previous_stamp_ns = self._last_sensor_stamp_by_stream.get(packet.stream)
+        previous_seq = self._last_sensor_seq_by_stream.get(packet.stream)
+
+        stamp_ns = int(packet.stamp_ns)
+        seq = int(packet.seq)
+        if previous_stamp_ns is not None and stamp_ns > 0 and stamp_ns < previous_stamp_ns:
+            self._trigger_automatic_reset(
+                reason=(
+                    f"time_rewind:stream={packet.stream},"
+                    f"previous_stamp_ns={previous_stamp_ns},current_stamp_ns={stamp_ns}"
+                )
+            )
+        elif previous_seq is not None and seq >= 0 and seq < previous_seq:
+            self._trigger_automatic_reset(
+                reason=(
+                    f"seq_rewind:stream={packet.stream},"
+                    f"previous_seq={previous_seq},current_seq={seq}"
+                )
+            )
+
+        self._last_sensor_stamp_by_stream[packet.stream] = stamp_ns
+        self._last_sensor_seq_by_stream[packet.stream] = seq
+        self._sensor_cache.update(packet)
 
     def _build_state_vector(self, samples: dict[str, SensorPacket]) -> np.ndarray:
         base_stream = self.config.state_streams["base"]
@@ -392,7 +445,7 @@ class BridgeRuntime:
                         except zmq.Again:
                             break
                         if isinstance(packet, SensorPacket):
-                            self._sensor_cache.update(packet)
+                            self._handle_sensor_packet(packet)
                         elif isinstance(packet, ControlPacket):
                             response = self._handle_control(packet)
                             if response.command == "ack" and packet.command == "reset_episode":
@@ -433,6 +486,10 @@ class BridgeRuntime:
                     )
                     continue
 
+                snapshot_fingerprint = self._snapshot_fingerprint(snapshot.samples)
+                if snapshot_fingerprint == self._last_snapshot_fingerprint:
+                    continue
+
                 observation = self._build_observation_packet(
                     stamp_ns=snapshot.stamp_ns,
                     samples=snapshot.samples,
@@ -452,6 +509,7 @@ class BridgeRuntime:
                     )
                     continue
 
+                self._last_snapshot_fingerprint = snapshot_fingerprint
                 self._pending_reset = False
                 self._last_obs_seq = observation.seq
                 command_packet = self._build_command_packet(action_packet)

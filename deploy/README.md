@@ -10,7 +10,7 @@
 
 - `policy_runtime/`: `torch`, `lerobot`, `pyzmq`
 - `bridge/`: `numpy`, `pyzmq`, 可选 `signatory`
-- `ros1_adapter/`: `rospy`, `sensor_msgs`, `nav_msgs`, `trajectory_msgs`, `geometry_msgs`, `opencv-python`, `pyzmq`
+- `ros1_adapter/`: `rospy`, `sensor_msgs`, `nav_msgs`, `geometry_msgs`, `opencv-python`, `pyzmq`
 - 如果配置文件使用 YAML，还需要 `PyYAML`
 
 ## 启动顺序
@@ -73,12 +73,7 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - `joint1 .. joint6`
 - `gripper`
 
-也就是说，bridge 当前会把每只手臂的最后 1 维和前 6 个关节一起下发成 7 维目标。`ros1_adapter` 现在同时支持：
-
-- `joint_trajectory`
-- `joint_state`
-
-可通过 `ros1.left_arm_command.message_type` 和 `ros1.right_arm_command.message_type` 配置；当前 zeno 配置默认使用 `JointState`。
+也就是说，bridge 当前会把每只手臂的最后 1 维和前 6 个关节一起下发成 7 维目标。`ros1_adapter` 现在固定发布 `sensor_msgs/JointState`。
 
 ## Signature Backend
 
