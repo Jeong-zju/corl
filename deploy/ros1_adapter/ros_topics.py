@@ -46,6 +46,7 @@ class Ros1AdapterConfig:
     sensor_endpoint: str
     command_endpoint: str
     command_poll_hz: float
+    status_log_interval_s: float
     outgoing_queue_size: int
     image_topics: tuple[ImageTopicConfig, ...]
     left_arm_state_topic: JointStateTopicConfig
@@ -81,6 +82,7 @@ class Ros1AdapterConfig:
             sensor_endpoint=str(root.get("sensor_endpoint", "tcp://127.0.0.1:5556")),
             command_endpoint=str(root.get("command_endpoint", "tcp://127.0.0.1:5557")),
             command_poll_hz=float(root.get("command_poll_hz", 100.0)),
+            status_log_interval_s=float(root.get("status_log_interval_s", 5.0)),
             outgoing_queue_size=int(root.get("outgoing_queue_size", 256)),
             image_topics=image_topics,
             left_arm_state_topic=JointStateTopicConfig(
@@ -117,4 +119,3 @@ class Ros1AdapterConfig:
     @classmethod
     def from_file(cls, path: str | Path) -> "Ros1AdapterConfig":
         return cls.from_mapping(load_mapping_file(path))
-
