@@ -1,9 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ORIGINAL_CWD="$(pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "${REPO_ROOT}"
+
+resolve_workspace_root() {
+  local script_dir="$1"
+  local -a candidates=(
+    "$(cd "${script_dir}/.." && pwd)"
+    "$(cd "${script_dir}/../.." && pwd)"
+    "${PWD}"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}/main/deploy/policy_runtime/server.py" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+    if [[ -f "${candidate}/deploy/policy_runtime/server.py" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+WORKSPACE_ROOT="$(resolve_workspace_root "${SCRIPT_DIR}")" || {
+  echo "[ERROR] Failed to resolve workspace root from ${SCRIPT_DIR}." >&2
+  exit 2
+}
+cd "${WORKSPACE_ROOT}"
+
+if [[ -d "${WORKSPACE_ROOT}/main/deploy" ]]; then
+  DEPLOY_PREFIX="main/deploy"
+elif [[ -d "${WORKSPACE_ROOT}/deploy" ]]; then
+  DEPLOY_PREFIX="deploy"
+else
+  echo "[ERROR] Could not locate deploy directory under ${WORKSPACE_ROOT}." >&2
+  exit 2
+fi
+
+resolve_user_path() {
+  local raw_path="$1"
+  local create_ok="${2:-false}"
+  python3 - "${ORIGINAL_CWD}" "${WORKSPACE_ROOT}" "${raw_path}" "${create_ok}" <<'PY'
+from pathlib import Path
+import sys
+
+original_cwd = Path(sys.argv[1])
+workspace_root = Path(sys.argv[2])
+raw = sys.argv[3]
+create_ok = sys.argv[4].strip().lower() == "true"
+
+raw_path = Path(raw).expanduser()
+if raw_path.is_absolute():
+    print(str(raw_path.resolve(strict=False)))
+    raise SystemExit(0)
+
+cwd_candidate = (original_cwd / raw_path).resolve(strict=False)
+workspace_candidate = (workspace_root / raw_path).resolve(strict=False)
+
+if cwd_candidate.exists():
+    print(str(cwd_candidate))
+elif workspace_candidate.exists():
+    print(str(workspace_candidate))
+elif create_ok:
+    print(str(cwd_candidate))
+else:
+    print(str(cwd_candidate))
+PY
+}
 
 ACT_POLICY_PATH=""
 STREAMING_ACT_POLICY_PATH=""
@@ -13,8 +79,8 @@ ACT_LOAD_DEVICE=""
 STREAMING_ACT_LOAD_DEVICE=""
 ACT_N_ACTION_STEPS=""
 STREAMING_ACT_N_ACTION_STEPS=""
-ACT_CONFIG="main/deploy/configs/deploy_zeno_compare_act.yaml"
-STREAMING_ACT_CONFIG="main/deploy/configs/deploy_zeno_compare_streaming_act.yaml"
+ACT_CONFIG="${DEPLOY_PREFIX}/configs/deploy_zeno_compare_act.yaml"
+STREAMING_ACT_CONFIG="${DEPLOY_PREFIX}/configs/deploy_zeno_compare_streaming_act.yaml"
 LOG_DIR=""
 
 usage() {
@@ -29,8 +95,8 @@ Usage:
     [--streaming-act-load-device cpu] \
     [--act-n-action-steps 1] \
     [--streaming-act-n-action-steps 1] \
-    [--act-config main/deploy/configs/deploy_zeno_compare_act.yaml] \
-    [--streaming-act-config main/deploy/configs/deploy_zeno_compare_streaming_act.yaml] \
+    [--act-config <compare_act_yaml>] \
+    [--streaming-act-config <compare_streaming_act_yaml>] \
     [--log-dir /tmp/corl_deploy_compare]
 
 This script starts 6 processes:
@@ -109,10 +175,27 @@ if [[ -z "${ACT_POLICY_PATH}" || -z "${STREAMING_ACT_POLICY_PATH}" ]]; then
   exit 2
 fi
 
+ACT_POLICY_PATH="$(resolve_user_path "${ACT_POLICY_PATH}")"
+STREAMING_ACT_POLICY_PATH="$(resolve_user_path "${STREAMING_ACT_POLICY_PATH}")"
+ACT_CONFIG="$(resolve_user_path "${ACT_CONFIG}")"
+STREAMING_ACT_CONFIG="$(resolve_user_path "${STREAMING_ACT_CONFIG}")"
+
 if [[ -z "${LOG_DIR}" ]]; then
   LOG_DIR="/tmp/corl_deploy_compare_$(date +%Y%m%d_%H%M%S)"
 fi
+LOG_DIR="$(resolve_user_path "${LOG_DIR}" true)"
 mkdir -p "${LOG_DIR}"
+
+for required_path in \
+  "${ACT_POLICY_PATH}" \
+  "${STREAMING_ACT_POLICY_PATH}" \
+  "${ACT_CONFIG}" \
+  "${STREAMING_ACT_CONFIG}"; do
+  if [[ ! -e "${required_path}" ]]; then
+    echo "[ERROR] Path does not exist: ${required_path}" >&2
+    exit 2
+  fi
+done
 
 read_config_endpoints() {
   local config_path="$1"
@@ -155,7 +238,7 @@ start_process() {
   shift 2
   echo "[start] ${name}" | tee -a "${LOG_DIR}/launcher.log"
   (
-    cd "${REPO_ROOT}"
+    cd "${WORKSPACE_ROOT}"
     "$@"
   ) >"${logfile}" 2>&1 &
   local pid=$!
@@ -189,7 +272,7 @@ STREAMING_POLICY_BIND="$(endpoint_to_bind "${STREAMING_ENDPOINTS[0]}")"
 STREAMING_POLICY_CONTROL_BIND="$(endpoint_to_bind "${STREAMING_ENDPOINTS[1]}")"
 
 act_runtime_cmd=(
-  python3 main/deploy/policy_runtime/server.py
+  python3 "${DEPLOY_PREFIX}/policy_runtime/server.py"
   --policy-type act
   --policy-path "${ACT_POLICY_PATH}"
   --device "${ACT_DEVICE}"
@@ -204,7 +287,7 @@ if [[ -n "${ACT_N_ACTION_STEPS}" ]]; then
 fi
 
 streaming_runtime_cmd=(
-  python3 main/deploy/policy_runtime/server.py
+  python3 "${DEPLOY_PREFIX}/policy_runtime/server.py"
   --policy-type streaming_act
   --policy-path "${STREAMING_ACT_POLICY_PATH}"
   --device "${STREAMING_ACT_DEVICE}"
@@ -220,15 +303,15 @@ fi
 
 start_process "act_policy_runtime" "${LOG_DIR}/act_policy_runtime.log" "${act_runtime_cmd[@]}"
 start_process "act_bridge" "${LOG_DIR}/act_bridge.log" \
-  python3 main/deploy/bridge/bridge_core.py --config "${ACT_CONFIG}"
+  python3 "${DEPLOY_PREFIX}/bridge/bridge_core.py" --config "${ACT_CONFIG}"
 start_process "act_ros1_adapter" "${LOG_DIR}/act_ros1_adapter.log" \
-  python3 main/deploy/ros1_adapter/ros1_adapter_node.py --config "${ACT_CONFIG}"
+  python3 "${DEPLOY_PREFIX}/ros1_adapter/ros1_adapter_node.py" --config "${ACT_CONFIG}"
 
 start_process "streaming_act_policy_runtime" "${LOG_DIR}/streaming_act_policy_runtime.log" "${streaming_runtime_cmd[@]}"
 start_process "streaming_act_bridge" "${LOG_DIR}/streaming_act_bridge.log" \
-  python3 main/deploy/bridge/bridge_core.py --config "${STREAMING_ACT_CONFIG}"
+  python3 "${DEPLOY_PREFIX}/bridge/bridge_core.py" --config "${STREAMING_ACT_CONFIG}"
 start_process "streaming_act_ros1_adapter" "${LOG_DIR}/streaming_act_ros1_adapter.log" \
-  python3 main/deploy/ros1_adapter/ros1_adapter_node.py --config "${STREAMING_ACT_CONFIG}"
+  python3 "${DEPLOY_PREFIX}/ros1_adapter/ros1_adapter_node.py" --config "${STREAMING_ACT_CONFIG}"
 
 echo "[ready] Compare stack started." | tee -a "${LOG_DIR}/launcher.log"
 echo "[ready] Logs: ${LOG_DIR}" | tee -a "${LOG_DIR}/launcher.log"
