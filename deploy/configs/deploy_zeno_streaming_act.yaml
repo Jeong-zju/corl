@@ -7,7 +7,7 @@ bridge:
   policy_type: "streaming_act"
   control_rate_hz: 30.0
   policy_request_timeout_ms: 80
-  signature_backend: "auto"
+  signature_backend: "signatory"
   signature_depth: 3
   max_skew_ms: 150
   left_arm_dim: 7

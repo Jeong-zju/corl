@@ -22,7 +22,7 @@ Documentation: https://signatory.readthedocs.io
 import torch  # must be imported before anything from signatory
 
 try:
-    from ......signatory.src.signatory import impl
+    from . import impl
 except ImportError as e:
     if 'specified procedure could not be found' in str(e):
         raise ImportError('Caught ImportError:\n```\n{}\n```\nThis can probably be fixed by updating your version of '
@@ -51,7 +51,8 @@ from .signature_module import (signature,
                                signature_combine,
                                multi_signature_combine)
 from .signature_inversion_module import invert_signature
-from ......signatory.src.signatory import unstable  # make it available as an attribute here, but don't import any unstable objects themselves
+# from ......signatory.src.signatory import unstable  # make it available as an attribute here, but don't import any unstable objects themselves
+from . import unstable  # make it available as an attribute here, but don't import any unstable objects themselves
 from .utility import (lyndon_words,
                       lyndon_brackets,
                       all_words)
