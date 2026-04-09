@@ -26,6 +26,7 @@ class ServerArgs:
     policy_type: str
     policy_path: str
     device: str
+    load_device: str | None
     bind: str
     control_bind: str
     n_action_steps: int | None
@@ -132,6 +133,7 @@ class PolicyRuntimeServer:
                 policy_type=self.bundle.policy_type,
                 device=str(new_device),
                 n_action_steps=None if new_n_action_steps is None else int(new_n_action_steps),
+                load_device="cpu" if str(new_device).split(":", 1)[0] == "cuda" else str(new_device),
             )
             self._last_episode_id = None
             self._paused = False
@@ -201,6 +203,15 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
     parser.add_argument("--policy-type", choices=["act", "streaming_act"], required=True)
     parser.add_argument("--policy-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--load-device",
+        type=str,
+        default=None,
+        help=(
+            "Optional device used only while reading weights. "
+            "Defaults to `cpu` when `--device` is CUDA, otherwise matches `--device`."
+        ),
+    )
     parser.add_argument("--bind", type=str, default="tcp://*:5555")
     parser.add_argument("--control-bind", type=str, default="tcp://*:5558")
     parser.add_argument("--n-action-steps", type=int, default=None)
@@ -209,6 +220,7 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
         policy_type=str(args.policy_type),
         policy_path=str(args.policy_path),
         device=str(args.device),
+        load_device=None if args.load_device is None else str(args.load_device),
         bind=str(args.bind),
         control_bind=str(args.control_bind),
         n_action_steps=None if args.n_action_steps is None else int(args.n_action_steps),
@@ -224,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
         policy_type=args.policy_type,
         device=args.device,
         n_action_steps=args.n_action_steps,
+        load_device=args.load_device,
     )
     server = PolicyRuntimeServer(
         bundle=bundle,
@@ -235,4 +248,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -84,9 +85,16 @@ def load_policy_bundle(
     policy_type: str,
     device: str,
     n_action_steps: int | None = None,
+    load_device: str | None = None,
 ) -> PolicyBundle:
     repo_root = repo_root_from_main(main_root)
     normalized_policy_type = str(policy_type).strip().lower()
+    requested_device = str(device)
+    effective_load_device = (
+        str(load_device)
+        if load_device is not None
+        else ("cpu" if requested_device.split(":", 1)[0] == "cuda" else requested_device)
+    )
 
     if normalized_policy_type == "streaming_act":
         ensure_streaming_act_importable(main_root)
@@ -115,30 +123,76 @@ def load_policy_bundle(
 
     resolved_policy_dir = resolve_policy_dir(Path(policy_path), repo_root)
     local_files_only = resolved_policy_dir.is_dir()
+    print(f"[load] Using policy directory: {resolved_policy_dir}", flush=True)
 
+    config_load_start_s = time.perf_counter()
+    print("[load] Loading policy config...", flush=True)
     cfg = PreTrainedConfig.from_pretrained(
         resolved_policy_dir,
         local_files_only=local_files_only,
     )
-    cfg.device = device
+    print(
+        f"[timing] Policy config loaded in {(time.perf_counter() - config_load_start_s):.2f}s",
+        flush=True,
+    )
+    cfg.device = effective_load_device
     if n_action_steps is not None:
         cfg.n_action_steps = int(n_action_steps)
 
+    policy_load_start_s = time.perf_counter()
+    print(
+        "[load] Loading policy weights "
+        f"(load_device={effective_load_device}, runtime_device={requested_device})...",
+        flush=True,
+    )
     policy = policy_cls.from_pretrained(
         resolved_policy_dir,
         config=cfg,
         local_files_only=local_files_only,
     )
+    print(
+        f"[timing] Policy weights loaded in {(time.perf_counter() - policy_load_start_s):.2f}s",
+        flush=True,
+    )
+    if effective_load_device != requested_device:
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Moving the loaded policy to the runtime device requires `torch`."
+            ) from exc
+        move_start_s = time.perf_counter()
+        print(
+            f"[load] Moving policy from {effective_load_device} to {requested_device}...",
+            flush=True,
+        )
+        policy.to(requested_device)
+        if requested_device.split(":", 1)[0] == "cuda":
+            torch.cuda.synchronize()
+        print(
+            f"[timing] Policy moved to {requested_device} in {(time.perf_counter() - move_start_s):.2f}s",
+            flush=True,
+        )
+    cfg.device = requested_device
+    if hasattr(policy, "config"):
+        policy.config.device = requested_device
     policy.eval()
 
     preprocessor_overrides = {
-        "device_processor": {"device": device},
+        "device_processor": {"device": requested_device},
         "rename_observations_processor": {"rename_map": {}},
     }
+    processor_load_start_s = time.perf_counter()
+    print("[load] Initializing pre/post processors...", flush=True)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg,
         pretrained_path=resolved_policy_dir,
         preprocessor_overrides=preprocessor_overrides,
+    )
+    print(
+        "[timing] Pre/post processors initialized in "
+        f"{(time.perf_counter() - processor_load_start_s):.2f}s",
+        flush=True,
     )
 
     visual_features = getattr(cfg, "visual_observation_features", None)
@@ -151,7 +205,7 @@ def load_policy_bundle(
     return PolicyBundle(
         policy_type=normalized_policy_type,
         policy_dir=resolved_policy_dir,
-        device=device,
+        device=requested_device,
         config=cfg,
         policy=policy,
         preprocessor=preprocessor,
@@ -162,4 +216,3 @@ def load_policy_bundle(
         use_delta_signature=bool(getattr(cfg, "use_delta_signature", False)),
         supports_reset=hasattr(policy, "reset"),
     )
-
