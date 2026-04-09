@@ -65,7 +65,7 @@ class BridgeConfig:
             policy_type=str(root.get("policy_type", "streaming_act")),
             control_rate_hz=float(root.get("control_rate_hz", 30.0)),
             policy_request_timeout_ms=int(root.get("policy_request_timeout_ms", 80)),
-            signature_backend=str(root.get("signature_backend", "simple")),
+            signature_backend=str(root.get("signature_backend", "auto")),
             signature_depth=int(root.get("signature_depth", 3)),
             state_streams={str(key): str(value) for key, value in state_streams.items()},
             image_streams={str(key): str(value) for key, value in image_streams.items()},

@@ -50,4 +50,20 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 
 也就是说，bridge 当前会把每只手臂的最后 1 维和前 6 个关节一起按 `JointTrajectory` 下发。前提是你的实际控制器也接受这种 6 DoF + gripper 的 7 维联合轨迹。
 
+## Signature Backend
+
+对于 `streaming_act` 的 zeno checkpoint，默认应使用：
+
+```yaml
+signature_backend: auto
+```
+
+不要用：
+
+```yaml
+signature_backend: simple
+```
+
+原因是当前数据集的 `observation.path_signature` 维度是 `5219`，而 `simple` backend 只会产生 `state_dim * depth` 的近似特征。对 zeno 的 17 维状态和 3 阶 depth，这只会得到 `51` 维，无法和 checkpoint 对齐。
+
 如果 `bridge` 判定观测 stale、推理超时或模式不是 `auto`，会发送 `hold` 命令包。
