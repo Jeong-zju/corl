@@ -8,15 +8,15 @@
 # - monitor web UI
 #
 # Notes:
-# - Run `conda env create -f main/environment.corl-py312.yml` from the repo root
-#   so the editable local policy package path resolves correctly.
+# - Create the environment from the repo root with:
+#   `conda env create -f main/environment.yml`
 # - The ROS1 adapter still requires a sourced system ROS1 installation.
 #   `rospy`, `sensor_msgs`, `nav_msgs`, `trajectory_msgs`, and
 #   `geometry_msgs` are not reliably provided by Conda, so they are not
 #   declared here.
 # - If you do not use `signature_backend=signatory` or
-#   `video_backend=torchcodec`, you can remove `signatory` / `torchcodec`
-#   to simplify installation.
+#   `video_backend=torchcodec`, you can remove the local
+#   `-e ./depends/signatory` entry and/or `torchcodec` to simplify installation.
 
 name: sism-py312
 channels:
@@ -48,11 +48,11 @@ dependencies:
       - opencv-python-headless>=4.11,<4.13
       - robot-descriptions>=1.23,<2
       - rosbags>=0.11,<0.12
-      - signatory==1.2.7
       - torch==2.9.1
       - torchcodec>=0.9,<0.10
       - torchvision==0.24.1
       - tqdm>=4.67,<5
       - uvicorn[standard]>=0.30,<1.0
       - wandb>=0.24,<0.25
+      - -e ./depends/signatory
       - -e ./policy/lerobot_policy_streaming_act
