@@ -177,6 +177,23 @@ def load_policy_bundle(
     if hasattr(policy, "config"):
         policy.config.device = requested_device
     policy.eval()
+    effective_cfg = getattr(policy, "config", cfg)
+    chunk_size = getattr(effective_cfg, "chunk_size", None)
+    effective_n_action_steps = getattr(effective_cfg, "n_action_steps", None)
+    print(
+        "[load] Policy config summary: "
+        f"policy_type={normalized_policy_type}, "
+        f"device={requested_device}, "
+        f"chunk_size={chunk_size}, "
+        f"n_action_steps={effective_n_action_steps}",
+        flush=True,
+    )
+    if effective_n_action_steps is not None and int(effective_n_action_steps) > 1:
+        print(
+            "[warn] Policy runtime is using n_action_steps>1. "
+            "For responsive online deployment, prefer `--n-action-steps 1`.",
+            flush=True,
+        )
 
     preprocessor_overrides = {
         "device_processor": {"device": requested_device},

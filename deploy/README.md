@@ -32,6 +32,7 @@ python3 main/deploy/policy_runtime/server.py \
   --policy-type act \
   --policy-path main/outputs/train/.../checkpoints/last/pretrained_model \
   --device cuda \
+  --n-action-steps 1 \
   --bind tcp://*:5555 \
   --control-bind tcp://*:5558
 ```
@@ -61,6 +62,14 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
   --config main/deploy/configs/deploy_zeno_act.yaml
 ```
+
+真机在线部署 `act` 时，强烈建议在 `policy_runtime/server.py` 启动命令里显式加上：
+
+```bash
+--n-action-steps 1
+```
+
+原因是部分 zeno `act` checkpoint 的默认 `n_action_steps` 很大，离线评测可以接受，但在线推理会显著增加单次响应时间，导致 bridge 连续报 `policy_request_timeout`。
 
 ## 双路对比模式
 
