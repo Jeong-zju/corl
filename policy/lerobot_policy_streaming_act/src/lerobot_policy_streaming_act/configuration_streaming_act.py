@@ -110,6 +110,10 @@ class StreamingACTConfig(PreTrainedConfig):
         use_signature_conditioned_visual_prefix_memory: Whether the visual prefix
             memory updater should explicitly condition on path signatures (and on
             delta signatures if enabled) instead of using only visual/state inputs.
+        use_signature_indexed_slot_memory: Whether to replace the legacy GRU-style
+            visual prefix memory updater with a Signature-Indexed Slot Memory
+            (SISM) updater that performs signature-driven slot routing and
+            slot-wise gated writes.
         use_memory_conditioned_encoder_film: Whether to let the pooled visual prefix
             memory state FiLM-modulate the current-step ACT encoder tokens before
             the transformer encoder runs. This gives the encoder a direct
@@ -118,6 +122,22 @@ class StreamingACTConfig(PreTrainedConfig):
         num_memory_slots: Number of visual prefix memory slots injected into the encoder.
             Each slot keeps an independent GRU-style memory state. The minimal
             experiments in this repository use 1 or 2 slots.
+        slot_memory_num_slots: Number of SISM slots when
+            `use_signature_indexed_slot_memory=True`.
+        slot_memory_routing_hidden_dim: Hidden dimension used by the SISM routing
+            network and slot-addressing projections.
+        slot_memory_use_delta_routing: Whether delta signatures participate in the
+            explicit SISM routing signal in addition to path signatures.
+        slot_memory_use_softmax_routing: Whether SISM routing weights are produced
+            by a softmax over slots. If disabled, independent sigmoid routing
+            strengths are used instead.
+        slot_memory_use_readout_pooling: Whether SISM should compute an attention
+            readout context from the slot state for encoder FiLM conditioning.
+            If disabled, FiLM falls back to mean pooling over slots.
+        slot_memory_balance_loss_coef: Optional coefficient for a routing-balance
+            auxiliary loss. Defaults to 0.0, which disables the term.
+        slot_memory_consistency_loss_coef: Optional coefficient for a readout/write
+            consistency auxiliary loss. Defaults to 0.0, which disables the term.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
@@ -171,8 +191,16 @@ class StreamingACTConfig(PreTrainedConfig):
     use_visual_prefix_memory: bool = False
     use_delta_signature: bool = False
     use_signature_conditioned_visual_prefix_memory: bool = False
+    use_signature_indexed_slot_memory: bool = False
     use_memory_conditioned_encoder_film: bool = False
     num_memory_slots: int = 1
+    slot_memory_num_slots: int = 4
+    slot_memory_routing_hidden_dim: int = 512
+    slot_memory_use_delta_routing: bool = False
+    slot_memory_use_softmax_routing: bool = True
+    slot_memory_use_readout_pooling: bool = True
+    slot_memory_balance_loss_coef: float = 0.0
+    slot_memory_consistency_loss_coef: float = 0.0
 
     # Streaming path-signature history module.
     history_length: int = 10
@@ -260,6 +288,51 @@ class StreamingACTConfig(PreTrainedConfig):
                 raise ValueError(
                     "`use_visual_prefix_memory=True` requires "
                     f"`num_memory_slots > 0`. Got {self.num_memory_slots}."
+                )
+        if self.use_signature_indexed_slot_memory:
+            if not self.use_visual_prefix_memory:
+                raise ValueError(
+                    "`use_signature_indexed_slot_memory=True` requires "
+                    "`use_visual_prefix_memory=True`."
+                )
+            if not self.use_path_signature:
+                raise ValueError(
+                    "`use_signature_indexed_slot_memory=True` requires "
+                    "`use_path_signature=True` because slot routing must be driven "
+                    "by path signatures."
+                )
+            if self.use_signature_conditioned_visual_prefix_memory:
+                raise ValueError(
+                    "`use_signature_indexed_slot_memory=True` is mutually exclusive "
+                    "with the legacy `use_signature_conditioned_visual_prefix_memory` "
+                    "GRU updater."
+                )
+            if self.slot_memory_num_slots <= 0:
+                raise ValueError(
+                    "`slot_memory_num_slots` must be > 0 when "
+                    "`use_signature_indexed_slot_memory=True`. "
+                    f"Got {self.slot_memory_num_slots}."
+                )
+            if self.slot_memory_routing_hidden_dim <= 0:
+                raise ValueError(
+                    "`slot_memory_routing_hidden_dim` must be > 0 when "
+                    "`use_signature_indexed_slot_memory=True`. "
+                    f"Got {self.slot_memory_routing_hidden_dim}."
+                )
+            if self.slot_memory_use_delta_routing and not self.use_delta_signature:
+                raise ValueError(
+                    "`slot_memory_use_delta_routing=True` requires "
+                    "`use_delta_signature=True`."
+                )
+            if self.slot_memory_balance_loss_coef < 0.0:
+                raise ValueError(
+                    "`slot_memory_balance_loss_coef` must be >= 0.0. "
+                    f"Got {self.slot_memory_balance_loss_coef}."
+                )
+            if self.slot_memory_consistency_loss_coef < 0.0:
+                raise ValueError(
+                    "`slot_memory_consistency_loss_coef` must be >= 0.0. "
+                    f"Got {self.slot_memory_consistency_loss_coef}."
                 )
         if self.use_signature_conditioned_visual_prefix_memory:
             if not self.use_visual_prefix_memory:
@@ -533,4 +606,9 @@ class StreamingACTConfig(PreTrainedConfig):
         return {
             key: ft for key, ft in self.image_features.items() if is_prefix_image_key(key)
         }
-    use_path_signature: bool = True
+
+    @property
+    def active_visual_prefix_memory_num_slots(self) -> int:
+        if self.use_signature_indexed_slot_memory:
+            return int(self.slot_memory_num_slots)
+        return int(self.num_memory_slots)

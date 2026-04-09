@@ -69,6 +69,9 @@ def _install_streaming_act_eval_hooks(
         getattr(cfg, "use_prefix_sequence_training", False)
     )
     use_visual_prefix_memory = bool(getattr(cfg, "use_visual_prefix_memory", False))
+    use_signature_indexed_slot_memory = bool(
+        getattr(cfg, "use_signature_indexed_slot_memory", False)
+    )
     use_delta_signature = bool(getattr(cfg, "use_delta_signature", False))
     build_explicit_prefix_eval_inputs = (
         use_prefix_sequence_training and not use_visual_prefix_memory
@@ -139,7 +142,11 @@ def _install_streaming_act_eval_hooks(
     elif use_visual_prefix_memory:
         print(
             "[info] visual prefix memory eval enabled: "
-            "the policy updates recurrent memory from the true current observation at each step"
+            + (
+                "the policy updates signature-indexed slot memory from the true current observation at each step"
+                if use_signature_indexed_slot_memory
+                else "the policy updates recurrent memory from the true current observation at each step"
+            )
         )
 
     original_reset = policy.reset

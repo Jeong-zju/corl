@@ -186,7 +186,10 @@ class StreamingACTPolicy(PreTrainedPolicy):
         return {
             "enabled": bool(self.config.use_visual_prefix_memory),
             "initialized": state is not None,
-            "num_slots": int(self.config.num_memory_slots),
+            "num_slots": int(self.config.active_visual_prefix_memory_num_slots),
+            "signature_indexed_slot_memory": bool(
+                getattr(self.config, "use_signature_indexed_slot_memory", False)
+            ),
             "signature_conditioned": bool(
                 getattr(self.config, "use_signature_conditioned_visual_prefix_memory", False)
             ),
@@ -220,6 +223,22 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        aux_losses = self.model.get_visual_prefix_memory_aux_losses()
+        if "slot_memory_balance_loss" in aux_losses:
+            balance_raw = aux_losses["slot_memory_balance_loss"]
+            balance_weighted = balance_raw * self.config.slot_memory_balance_loss_coef
+            loss = loss + balance_weighted
+            loss_dict["slot_memory_balance_loss"] = balance_raw.item()
+            loss_dict["slot_memory_balance_loss_weighted"] = balance_weighted.item()
+        if "slot_memory_consistency_loss" in aux_losses:
+            consistency_raw = aux_losses["slot_memory_consistency_loss"]
+            consistency_weighted = (
+                consistency_raw * self.config.slot_memory_consistency_loss_coef
+            )
+            loss = loss + consistency_weighted
+            loss_dict["slot_memory_consistency_loss"] = consistency_raw.item()
+            loss_dict["slot_memory_consistency_loss_weighted"] = consistency_weighted.item()
 
         return loss, loss_dict
 
@@ -362,7 +381,10 @@ class StreamingACT(nn.Module):
         self.use_signature_conditioned_visual_prefix_memory = (
             config.use_signature_conditioned_visual_prefix_memory
         )
+        self.use_signature_indexed_slot_memory = config.use_signature_indexed_slot_memory
         self.use_memory_conditioned_encoder_film = config.use_memory_conditioned_encoder_film
+        self.active_memory_num_slots = config.active_visual_prefix_memory_num_slots
+        self._last_visual_prefix_memory_aux_losses: dict[str, Tensor] = {}
 
         if self.use_path_signature:
             assert config.signature_dim > 0, (
@@ -452,20 +474,87 @@ class StreamingACT(nn.Module):
             self.anchor_token_proj = nn.Linear(config.dim_model, config.dim_model)
         if self.use_visual_prefix_memory:
             self.visual_prefix_memory_pool = nn.AdaptiveAvgPool2d((1, 1))
-            visual_prefix_memory_input_dim = config.dim_model * (
-                2 + int(self.use_signature_conditioned_visual_prefix_memory) + int(self.use_delta_signature)
-            )
-            self.visual_prefix_memory_update = nn.GRUCell(
-                input_size=visual_prefix_memory_input_dim,
-                hidden_size=config.dim_model,
-            )
-            self.visual_prefix_memory_extra_updates = nn.ModuleList(
-                nn.GRUCell(
+            if self.use_signature_indexed_slot_memory:
+                slot_route_input_dim = config.dim_model * (
+                    1 + int(config.slot_memory_use_delta_routing)
+                )
+                slot_write_input_dim = config.dim_model * (
+                    3 + int(config.slot_memory_use_delta_routing)
+                )
+                slot_state_input_dim = (
+                    config.dim_model * 2 + config.slot_memory_routing_hidden_dim
+                )
+                slot_read_query_input_dim = (
+                    config.dim_model * 2 + config.slot_memory_routing_hidden_dim
+                )
+                self.slot_memory_route_proj = nn.Sequential(
+                    nn.Linear(
+                        slot_route_input_dim,
+                        config.slot_memory_routing_hidden_dim,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        config.slot_memory_routing_hidden_dim,
+                        config.slot_memory_routing_hidden_dim,
+                    ),
+                )
+                self.slot_memory_route_query_proj = nn.Linear(
+                    config.slot_memory_routing_hidden_dim,
+                    config.slot_memory_routing_hidden_dim,
+                    bias=False,
+                )
+                self.slot_memory_route_key_proj = nn.Linear(
+                    config.dim_model,
+                    config.slot_memory_routing_hidden_dim,
+                    bias=False,
+                )
+                self.slot_memory_write_proj = nn.Sequential(
+                    nn.Linear(slot_write_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_candidate_proj = nn.Sequential(
+                    nn.Linear(slot_state_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_gate_proj = nn.Sequential(
+                    nn.Linear(slot_state_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, 1),
+                )
+                self.slot_memory_read_query_proj = nn.Sequential(
+                    nn.Linear(slot_read_query_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_read_key_proj = nn.Linear(
+                    config.dim_model,
+                    config.dim_model,
+                    bias=False,
+                )
+                self.slot_memory_read_value_proj = nn.Linear(
+                    config.dim_model,
+                    config.dim_model,
+                    bias=False,
+                )
+            else:
+                visual_prefix_memory_input_dim = config.dim_model * (
+                    2
+                    + int(self.use_signature_conditioned_visual_prefix_memory)
+                    + int(self.use_delta_signature)
+                )
+                self.visual_prefix_memory_update = nn.GRUCell(
                     input_size=visual_prefix_memory_input_dim,
                     hidden_size=config.dim_model,
                 )
-                for _ in range(config.num_memory_slots - 1)
-            )
+                self.visual_prefix_memory_extra_updates = nn.ModuleList(
+                    nn.GRUCell(
+                        input_size=visual_prefix_memory_input_dim,
+                        hidden_size=config.dim_model,
+                    )
+                    for _ in range(config.num_memory_slots - 1)
+                )
             if self.use_memory_conditioned_encoder_film:
                 self.visual_prefix_memory_encoder_film = nn.Sequential(
                     nn.Linear(config.dim_model, config.dim_model),
@@ -502,6 +591,9 @@ class StreamingACT(nn.Module):
         for p in chain(self.encoder.parameters(), self.decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def get_visual_prefix_memory_aux_losses(self) -> dict[str, Tensor]:
+        return dict(self._last_visual_prefix_memory_aux_losses)
 
     def _validate_prefix_sequence_inputs(self, batch: dict[str, Tensor], batch_size: int) -> None:
         if not self.config.use_prefix_sequence_training:
@@ -642,7 +734,7 @@ class StreamingACT(nn.Module):
         dtype: torch.dtype,
     ) -> Tensor:
         return torch.zeros(
-            (batch_size, self.config.num_memory_slots, self.config.dim_model),
+            (batch_size, self.active_memory_num_slots, self.config.dim_model),
             device=device,
             dtype=dtype,
         )
@@ -656,9 +748,9 @@ class StreamingACT(nn.Module):
         dtype: torch.dtype,
         context: str,
     ) -> Tensor:
-        expected_shape = (batch_size, self.config.num_memory_slots, self.config.dim_model)
+        expected_shape = (batch_size, self.active_memory_num_slots, self.config.dim_model)
         if hidden.ndim == 2:
-            if self.config.num_memory_slots != 1:
+            if self.active_memory_num_slots != 1:
                 raise ValueError(
                     f"{context} expects hidden state shape {expected_shape}. "
                     f"Got legacy single-slot shape {tuple(hidden.shape)}."
@@ -680,6 +772,11 @@ class StreamingACT(nn.Module):
         return hidden.to(device=device, dtype=dtype)
 
     def _iter_visual_prefix_memory_updates(self) -> list[nn.GRUCell]:
+        if self.use_signature_indexed_slot_memory:
+            raise RuntimeError(
+                "`_iter_visual_prefix_memory_updates` is only valid for the legacy "
+                "GRU-style visual prefix memory path."
+            )
         updates = [self.visual_prefix_memory_update, *self.visual_prefix_memory_extra_updates]
         assert len(updates) == self.config.num_memory_slots, (
             "Number of visual prefix memory updaters must match `num_memory_slots`. "
@@ -898,9 +995,167 @@ class StreamingACT(nn.Module):
                     raise ValueError(
                         "Delta-signature-conditioned visual prefix memory update requires "
                         "`delta_signature_t` when `use_delta_signature=True`."
-                    )
+                )
                 inputs.append(delta_signature_t)
         return torch.cat(inputs, dim=-1)
+
+    def _build_slot_memory_route_features(
+        self,
+        *,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        context: str,
+    ) -> Tensor:
+        if not self.use_signature_indexed_slot_memory:
+            raise RuntimeError(
+                "`_build_slot_memory_route_features` requires "
+                "`use_signature_indexed_slot_memory=True`."
+            )
+        if signature_t is None:
+            raise ValueError(f"{context} requires `signature_t` for slot routing.")
+        route_features = [signature_t]
+        if self.config.slot_memory_use_delta_routing:
+            if delta_signature_t is None:
+                raise ValueError(
+                    f"{context} requires `delta_signature_t` when "
+                    "`slot_memory_use_delta_routing=True`."
+                )
+            route_features.append(delta_signature_t)
+        route_features = torch.cat(route_features, dim=-1)
+        expected_dim = self.config.dim_model * (
+            1 + int(self.config.slot_memory_use_delta_routing)
+        )
+        if route_features.ndim != 2 or route_features.shape[1] != expected_dim:
+            raise ValueError(
+                f"{context} route features must have shape (batch_size, {expected_dim}). "
+                f"Got {tuple(route_features.shape)}."
+            )
+        return route_features
+
+    def _compute_signature_indexed_slot_memory_route(
+        self,
+        *,
+        memory_prev: Tensor,
+        route_features: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        route_hidden = self.slot_memory_route_proj(route_features)
+        routing_query = self.slot_memory_route_query_proj(route_hidden).unsqueeze(1)
+        routing_keys = self.slot_memory_route_key_proj(memory_prev)
+        routing_logits = torch.matmul(
+            routing_query, routing_keys.transpose(1, 2)
+        ).squeeze(1) / math.sqrt(self.config.slot_memory_routing_hidden_dim)
+        if self.config.slot_memory_use_softmax_routing:
+            routing_weights = torch.softmax(routing_logits, dim=-1)
+            routing_distribution = routing_weights
+        else:
+            routing_weights = torch.sigmoid(routing_logits)
+            routing_distribution = routing_weights / routing_weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+        return route_hidden, routing_logits, routing_weights, routing_distribution
+
+    def _read_signature_indexed_slot_memory_context(
+        self,
+        *,
+        memory_state: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        route_hidden: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if route_hidden is None:
+            route_features = self._build_slot_memory_route_features(
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                context="Signature-indexed slot memory readout",
+            )
+            route_hidden = self.slot_memory_route_proj(route_features)
+        read_query_input = torch.cat([visual_t, state_t, route_hidden], dim=-1)
+        read_query = self.slot_memory_read_query_proj(read_query_input).unsqueeze(1)
+        read_keys = self.slot_memory_read_key_proj(memory_state)
+        read_values = self.slot_memory_read_value_proj(memory_state)
+        read_logits = torch.matmul(
+            read_query, read_keys.transpose(1, 2)
+        ).squeeze(1) / math.sqrt(self.config.dim_model)
+        read_weights = torch.softmax(read_logits, dim=-1)
+        readout_context = torch.sum(read_weights.unsqueeze(-1) * read_values, dim=1)
+        return readout_context, read_logits, read_weights
+
+    def _update_signature_indexed_slot_memory_step(
+        self,
+        *,
+        memory_prev: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        valid_t: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        batch_size, num_slots, hidden_dim = memory_prev.shape
+        route_features = self._build_slot_memory_route_features(
+            signature_t=signature_t,
+            delta_signature_t=delta_signature_t,
+            context="Signature-indexed slot memory update",
+        )
+        route_hidden, routing_logits, routing_weights, routing_distribution = (
+            self._compute_signature_indexed_slot_memory_route(
+                memory_prev=memory_prev,
+                route_features=route_features,
+            )
+        )
+        write_input = torch.cat([visual_t, state_t, route_features], dim=-1)
+        write_base = self.slot_memory_write_proj(write_input)
+        slot_state_input = torch.cat(
+            [
+                memory_prev,
+                write_base.unsqueeze(1).expand(batch_size, num_slots, hidden_dim),
+                route_hidden.unsqueeze(1).expand(
+                    batch_size,
+                    num_slots,
+                    self.config.slot_memory_routing_hidden_dim,
+                ),
+            ],
+            dim=-1,
+        )
+        candidate = self.slot_memory_candidate_proj(slot_state_input)
+        gate = torch.sigmoid(self.slot_memory_gate_proj(slot_state_input))
+        write_strength = routing_weights.unsqueeze(-1) * gate
+        updated_hidden = memory_prev + write_strength * (candidate - memory_prev)
+
+        if valid_t is not None:
+            valid_t = valid_t.to(dtype=torch.bool, device=memory_prev.device)
+            if valid_t.shape != (batch_size,):
+                raise ValueError(
+                    "Signature-indexed slot memory valid mask must have shape "
+                    f"({batch_size},). Got {tuple(valid_t.shape)}."
+                )
+            updated_hidden = torch.where(
+                valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev
+            )
+
+        readout_context, readout_logits, readout_weights = (
+            self._read_signature_indexed_slot_memory_context(
+                memory_state=updated_hidden,
+                visual_t=visual_t,
+                state_t=state_t,
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                route_hidden=route_hidden,
+            )
+        )
+        return updated_hidden, {
+            "routing_logits": routing_logits,
+            "routing_weights": routing_weights,
+            "routing_distribution": routing_distribution,
+            "write_base": write_base,
+            "candidate": candidate,
+            "gate": gate,
+            "readout_context": readout_context,
+            "readout_logits": readout_logits,
+            "readout_weights": readout_weights,
+        }
 
     def _update_visual_prefix_memory_step(
         self,
@@ -911,7 +1166,16 @@ class StreamingACT(nn.Module):
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
         valid_t: Tensor | None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if self.use_signature_indexed_slot_memory:
+            return self._update_signature_indexed_slot_memory_step(
+                memory_prev=memory_prev,
+                visual_t=visual_t,
+                state_t=state_t,
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                valid_t=valid_t,
+            )
         batch_size = memory_prev.shape[0]
         step_input = self._build_visual_prefix_memory_step_input(
             visual_t=visual_t,
@@ -927,14 +1191,59 @@ class StreamingACT(nn.Module):
             dim=1,
         )
         if valid_t is None:
-            return updated_hidden
+            return updated_hidden, {}
         valid_t = valid_t.to(dtype=torch.bool, device=memory_prev.device)
         if valid_t.shape != (batch_size,):
             raise ValueError(
                 "Visual prefix memory valid mask must have shape "
                 f"({batch_size},). Got {tuple(valid_t.shape)}."
             )
-        return torch.where(valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev)
+        return torch.where(valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev), {}
+
+    def _build_visual_prefix_memory_aux_losses(
+        self,
+        *,
+        routing_distribution_sum: Tensor | None,
+        consistency_loss_sum: Tensor | None,
+        valid_step_count: Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Tensor]:
+        aux_losses: dict[str, Tensor] = {}
+        if valid_step_count is None:
+            return aux_losses
+        valid_step_count = valid_step_count.clamp_min(1.0)
+        if (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_balance_loss_coef > 0.0
+        ):
+            if routing_distribution_sum is None:
+                raise RuntimeError(
+                    "Missing routing distribution statistics for slot-memory "
+                    "balance loss."
+                )
+            average_routing = routing_distribution_sum / valid_step_count
+            uniform = torch.full(
+                average_routing.shape,
+                fill_value=1.0 / float(self.active_memory_num_slots),
+                device=device,
+                dtype=dtype,
+            )
+            aux_losses["slot_memory_balance_loss"] = F.mse_loss(
+                average_routing,
+                uniform,
+                reduction="mean",
+            )
+        if (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_consistency_loss_coef > 0.0
+        ):
+            if consistency_loss_sum is None:
+                raise RuntimeError(
+                    "Missing readout/write statistics for slot-memory consistency loss."
+                )
+            aux_losses["slot_memory_consistency_loss"] = consistency_loss_sum / valid_step_count
+        return aux_losses
 
     def _scan_visual_prefix_memory(
         self,
@@ -985,8 +1294,19 @@ class StreamingACT(nn.Module):
             )
 
         prefix_mask = prefix_mask.to(dtype=torch.bool, device=visual_embeddings.device)
+        need_balance_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_balance_loss_coef > 0.0
+        )
+        need_consistency_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_consistency_loss_coef > 0.0
+        )
+        routing_distribution_sum = None
+        consistency_loss_sum = None
+        valid_step_count = None
         for step_idx in range(time_steps):
-            hidden = self._update_visual_prefix_memory_step(
+            hidden, step_stats = self._update_visual_prefix_memory_step(
                 memory_prev=hidden,
                 visual_t=visual_embeddings[:, step_idx],
                 state_t=state_embeddings[:, step_idx],
@@ -1000,15 +1320,73 @@ class StreamingACT(nn.Module):
                 ),
                 valid_t=prefix_mask[:, step_idx],
             )
-        return hidden
+            if need_balance_loss:
+                step_distribution = step_stats["routing_distribution"]
+                masked_distribution = (
+                    step_distribution
+                    * prefix_mask[:, step_idx].to(step_distribution.dtype).unsqueeze(-1)
+                )
+                step_distribution_sum = masked_distribution.sum(dim=0)
+                if routing_distribution_sum is None:
+                    routing_distribution_sum = step_distribution_sum
+                else:
+                    routing_distribution_sum = routing_distribution_sum + step_distribution_sum
+            if need_consistency_loss:
+                readout_context = step_stats["readout_context"]
+                write_base = step_stats["write_base"]
+                step_consistency = F.mse_loss(
+                    readout_context,
+                    write_base,
+                    reduction="none",
+                ).mean(dim=-1)
+                masked_step_consistency = (
+                    step_consistency * prefix_mask[:, step_idx].to(step_consistency.dtype)
+                ).sum()
+                if consistency_loss_sum is None:
+                    consistency_loss_sum = masked_step_consistency
+                else:
+                    consistency_loss_sum = consistency_loss_sum + masked_step_consistency
+            if need_balance_loss or need_consistency_loss:
+                step_valid_count = prefix_mask[:, step_idx].to(hidden.dtype).sum()
+                if valid_step_count is None:
+                    valid_step_count = step_valid_count
+                else:
+                    valid_step_count = valid_step_count + step_valid_count
+        aux_losses = self._build_visual_prefix_memory_aux_losses(
+            routing_distribution_sum=routing_distribution_sum,
+            consistency_loss_sum=consistency_loss_sum,
+            valid_step_count=valid_step_count,
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        return hidden, aux_losses
 
-    def _pool_visual_prefix_memory_context(self, memory_state: Tensor) -> Tensor:
+    def _compute_visual_prefix_memory_context(
+        self,
+        *,
+        memory_state: Tensor,
+        visual_embedding: Tensor,
+        state_embedding: Tensor,
+        signature_embedding: Tensor | None,
+        delta_signature_embedding: Tensor | None,
+    ) -> Tensor:
         if memory_state.ndim != 3:
             raise ValueError(
                 "Visual prefix memory state must have shape "
                 f"(batch_size, num_memory_slots, dim_model). Got {tuple(memory_state.shape)}."
             )
-        return memory_state.mean(dim=1)
+        if not self.use_signature_indexed_slot_memory:
+            return memory_state.mean(dim=1)
+        if not self.config.slot_memory_use_readout_pooling:
+            return memory_state.mean(dim=1)
+        readout_context, _, _ = self._read_signature_indexed_slot_memory_context(
+            memory_state=memory_state,
+            visual_t=visual_embedding,
+            state_t=state_embedding,
+            signature_t=signature_embedding,
+            delta_signature_t=delta_signature_embedding,
+        )
+        return readout_context
 
     def _apply_visual_prefix_memory_encoder_film(
         self,
@@ -1060,7 +1438,7 @@ class StreamingACT(nn.Module):
     def _compute_visual_prefix_memory_token_from_prefix_sequence(
         self,
         batch: dict[str, Tensor],
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         assert PREFIX_STATE_KEY in batch, (
             f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
         )
@@ -1076,32 +1454,43 @@ class StreamingACT(nn.Module):
         state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
         signature_embeddings = None
         delta_signature_embeddings = None
-        if self.use_signature_conditioned_visual_prefix_memory:
+        uses_signature_routed_memory = (
+            self.use_signature_indexed_slot_memory
+            or self.use_signature_conditioned_visual_prefix_memory
+        )
+        requires_delta_memory_signature = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_use_delta_routing
+        ) or (
+            self.use_signature_conditioned_visual_prefix_memory
+            and self.use_delta_signature
+        )
+        if uses_signature_routed_memory:
             assert PREFIX_PATH_SIGNATURE_KEY in batch, (
-                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required to reconstruct signature-conditioned "
-                "visual prefix memory during training."
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required to reconstruct "
+                "signature-routed visual prefix memory during training."
             )
             signature_embeddings = self._project_signature_tensor(
                 batch[PREFIX_PATH_SIGNATURE_KEY],
                 context="Prefix path-signature sequence",
             )
-            if self.use_delta_signature:
+            if requires_delta_memory_signature:
                 assert PREFIX_DELTA_SIGNATURE_KEY in batch, (
                     f"`{PREFIX_DELTA_SIGNATURE_KEY}` is required to reconstruct "
-                    "delta-signature-conditioned visual prefix memory during training."
+                    "delta-signature-routed visual prefix memory during training."
                 )
                 delta_signature_embeddings = self._project_delta_signature_tensor(
                     batch[PREFIX_DELTA_SIGNATURE_KEY],
                     context="Prefix delta-signature sequence",
                 )
-        memory_state = self._scan_visual_prefix_memory(
+        memory_state, aux_losses = self._scan_visual_prefix_memory(
             visual_embeddings=visual_embeddings,
             state_embeddings=state_embeddings,
             signature_embeddings=signature_embeddings,
             delta_signature_embeddings=delta_signature_embeddings,
             prefix_mask=batch[PREFIX_MASK_KEY],
         )
-        return memory_state
+        return memory_state, aux_losses
 
     def compute_online_visual_prefix_memory_token(
         self,
@@ -1141,25 +1530,36 @@ class StreamingACT(nn.Module):
             )
         signature_embedding = None
         delta_signature_embedding = None
-        if self.use_signature_conditioned_visual_prefix_memory:
+        uses_signature_routed_memory = (
+            self.use_signature_indexed_slot_memory
+            or self.use_signature_conditioned_visual_prefix_memory
+        )
+        requires_delta_memory_signature = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_use_delta_routing
+        ) or (
+            self.use_signature_conditioned_visual_prefix_memory
+            and self.use_delta_signature
+        )
+        if uses_signature_routed_memory:
             assert PATH_SIGNATURE_KEY in batch, (
-                "Online signature-conditioned visual prefix memory update requires "
+                "Online signature-routed visual prefix memory update requires "
                 f"`{PATH_SIGNATURE_KEY}` in the batch."
             )
             signature_embedding = self._project_signature_tensor(
                 batch[PATH_SIGNATURE_KEY],
                 context="Current path signature",
             )
-            if self.use_delta_signature:
+            if requires_delta_memory_signature:
                 assert DELTA_SIGNATURE_KEY in batch, (
-                    "Online delta-signature-conditioned visual prefix memory update requires "
+                    "Online delta-signature-routed visual prefix memory update requires "
                     f"`{DELTA_SIGNATURE_KEY}` in the batch."
                 )
                 delta_signature_embedding = self._project_delta_signature_tensor(
                     batch[DELTA_SIGNATURE_KEY],
                     context="Current delta signature",
                 )
-        next_state = self._update_visual_prefix_memory_step(
+        next_state, _ = self._update_visual_prefix_memory_step(
             memory_prev=hidden,
             visual_t=visual_embedding,
             state_t=state_embedding,
@@ -1211,10 +1611,12 @@ class StreamingACT(nn.Module):
             )
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        self._last_visual_prefix_memory_aux_losses = {}
         if not skip_prefix_sequence_validation:
             self._validate_prefix_sequence_inputs(batch, batch_size)
 
         signature_embed = None
+        signature_step_embed = None
         if self.use_path_signature:
             assert PATH_SIGNATURE_KEY in batch, (
                 f"`{PATH_SIGNATURE_KEY}` is required when `use_path_signature=True`."
@@ -1232,16 +1634,17 @@ class StreamingACT(nn.Module):
                 f"`{PATH_SIGNATURE_KEY}` second dim must be `signature_dim={self.config.signature_dim}`. "
                 f"Got {path_signature.shape[1]}."
             )
-            signature_embed = self._project_signature_tensor(
+            signature_step_embed = self._project_signature_tensor(
                 path_signature,
                 context="Current path signature",
             )
-            assert signature_embed.shape == (batch_size, self.config.dim_model), (
+            assert signature_step_embed.shape == (batch_size, self.config.dim_model), (
                 f"`signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
-                f"Got {tuple(signature_embed.shape)}."
+                f"Got {tuple(signature_step_embed.shape)}."
             )
-            signature_embed = signature_embed.unsqueeze(1)  # (B, 1, D)
+            signature_embed = signature_step_embed.unsqueeze(1)  # (B, 1, D)
         delta_signature_embed = None
+        delta_signature_step_embed = None
         if self.use_delta_signature:
             assert DELTA_SIGNATURE_KEY in batch, (
                 f"`{DELTA_SIGNATURE_KEY}` is required when `use_delta_signature=True`."
@@ -1260,15 +1663,15 @@ class StreamingACT(nn.Module):
                 f"`signature_dim={self.config.signature_dim}`. "
                 f"Got {delta_signature.shape[1]}."
             )
-            delta_signature_embed = self._project_delta_signature_tensor(
+            delta_signature_step_embed = self._project_delta_signature_tensor(
                 delta_signature,
                 context="Current delta signature",
             )
-            assert delta_signature_embed.shape == (batch_size, self.config.dim_model), (
+            assert delta_signature_step_embed.shape == (batch_size, self.config.dim_model), (
                 f"`delta_signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
-                f"Got {tuple(delta_signature_embed.shape)}."
+                f"Got {tuple(delta_signature_step_embed.shape)}."
             )
-            delta_signature_embed = delta_signature_embed.unsqueeze(1)  # (B, 1, D)
+            delta_signature_embed = delta_signature_step_embed.unsqueeze(1)  # (B, 1, D)
 
         if self.use_first_frame_anchor:
             assert FIRST_FRAME_ANCHOR_KEY in batch, (
@@ -1296,9 +1699,10 @@ class StreamingACT(nn.Module):
         visual_prefix_memory_embed = None
         if self.use_visual_prefix_memory:
             if visual_prefix_memory_token is None:
-                visual_prefix_memory_embed = self._compute_visual_prefix_memory_token_from_prefix_sequence(
-                    batch
-                )
+                (
+                    visual_prefix_memory_embed,
+                    self._last_visual_prefix_memory_aux_losses,
+                ) = self._compute_visual_prefix_memory_token_from_prefix_sequence(batch)
             else:
                 if visual_prefix_memory_token.ndim != 3:
                     raise ValueError(
@@ -1307,7 +1711,7 @@ class StreamingACT(nn.Module):
                     )
                 expected_shape = (
                     batch_size,
-                    self.config.num_memory_slots,
+                    self.active_memory_num_slots,
                     self.config.dim_model,
                 )
                 if tuple(visual_prefix_memory_token.shape) != expected_shape:
@@ -1319,6 +1723,7 @@ class StreamingACT(nn.Module):
                     device=batch[OBS_STATE].device,
                     dtype=self.encoder_latent_input_proj.weight.dtype,
                 )
+                self._last_visual_prefix_memory_aux_losses = {}
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -1377,9 +1782,11 @@ class StreamingACT(nn.Module):
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        current_robot_state_embed = None
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            current_robot_state_embed = self.encoder_robot_state_input_proj(batch[OBS_STATE])
+            encoder_in_tokens.append(current_robot_state_embed)
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
@@ -1402,7 +1809,20 @@ class StreamingACT(nn.Module):
             assert visual_prefix_memory_embed is not None, (
                 "Memory-conditioned encoder FiLM requires `visual_prefix_memory_embed`."
             )
-            memory_context = self._pool_visual_prefix_memory_context(visual_prefix_memory_embed)
+            assert current_robot_state_embed is not None, (
+                "Memory-conditioned encoder FiLM requires a projected robot state token."
+            )
+            assert image_token_seq is not None, (
+                "Memory-conditioned encoder FiLM requires current-step image tokens "
+                "to derive the readout query."
+            )
+            memory_context = self._compute_visual_prefix_memory_context(
+                memory_state=visual_prefix_memory_embed,
+                visual_embedding=image_token_seq.mean(dim=0),
+                state_embedding=current_robot_state_embed,
+                signature_embedding=signature_step_embed,
+                delta_signature_embedding=delta_signature_step_embed,
+            )
             # Keep the latent token untouched and modulate the current-step observation tokens.
             encoder_in_tokens = self._apply_visual_prefix_memory_encoder_film(
                 encoder_in_tokens,
@@ -1461,7 +1881,7 @@ class StreamingACT(nn.Module):
                 dtype=encoder_out.dtype,
             )
             visual_prefix_memory_pos_embed = torch.zeros(
-                (self.config.num_memory_slots, 1, self.config.dim_model),
+                (self.active_memory_num_slots, 1, self.config.dim_model),
                 dtype=encoder_in_pos_embed.dtype,
                 device=encoder_in_pos_embed.device,
             )

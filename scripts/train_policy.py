@@ -1630,7 +1630,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             dest="use_visual_prefix_memory",
             action="store_true",
             help=(
-                "Enable GRU-style visual prefix memory tokens built from prefix "
+                "Enable fixed-budget historical memory tokens built from prefix "
                 "images and prefix states."
             ),
         )
@@ -1648,9 +1648,114 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=int,
             default=defaults.get("num_memory_slots", 1),
             help=(
-                "Number of visual prefix memory slots. Each slot keeps an "
-                "independent GRU-style memory state."
+                "Number of legacy GRU-style visual prefix memory slots. "
+                "Ignored when --enable-signature-indexed-slot-memory is used."
             ),
+        )
+        signature_indexed_slot_memory_group = parser.add_mutually_exclusive_group()
+        signature_indexed_slot_memory_group.add_argument(
+            "--enable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_true",
+            help=(
+                "Replace the legacy GRU-style visual prefix memory updater with "
+                "a Signature-Indexed Slot Memory (SISM) updater."
+            ),
+        )
+        signature_indexed_slot_memory_group.add_argument(
+            "--disable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_false",
+            help="Disable the SISM updater and use the legacy GRU-style updater instead.",
+        )
+        parser.set_defaults(
+            use_signature_indexed_slot_memory=defaults.get(
+                "use_signature_indexed_slot_memory", False
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-num-slots",
+            type=int,
+            default=defaults.get("slot_memory_num_slots", 4),
+            help=(
+                "Number of SISM slots when --enable-signature-indexed-slot-memory "
+                "is active."
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-routing-hidden-dim",
+            type=int,
+            default=defaults.get("slot_memory_routing_hidden_dim", 512),
+            help="Hidden dimension used by the SISM routing network.",
+        )
+        slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
+        slot_memory_delta_routing_group.add_argument(
+            "--enable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_true",
+            help="Include delta signatures in the explicit SISM routing signal.",
+        )
+        slot_memory_delta_routing_group.add_argument(
+            "--disable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_false",
+            help="Route SISM slots using path signatures only.",
+        )
+        parser.set_defaults(
+            slot_memory_use_delta_routing=defaults.get(
+                "slot_memory_use_delta_routing", False
+            ),
+        )
+        slot_memory_softmax_group = parser.add_mutually_exclusive_group()
+        slot_memory_softmax_group.add_argument(
+            "--enable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_true",
+            help="Use softmax routing weights across SISM slots.",
+        )
+        slot_memory_softmax_group.add_argument(
+            "--disable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_false",
+            help="Use independent sigmoid routing strengths for SISM slots.",
+        )
+        parser.set_defaults(
+            slot_memory_use_softmax_routing=defaults.get(
+                "slot_memory_use_softmax_routing", True
+            ),
+        )
+        slot_memory_readout_group = parser.add_mutually_exclusive_group()
+        slot_memory_readout_group.add_argument(
+            "--enable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_true",
+            help=(
+                "Use an attention readout over SISM slots to produce the pooled "
+                "memory context for encoder FiLM."
+            ),
+        )
+        slot_memory_readout_group.add_argument(
+            "--disable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_false",
+            help="Use mean pooling over SISM slots for encoder FiLM context.",
+        )
+        parser.set_defaults(
+            slot_memory_use_readout_pooling=defaults.get(
+                "slot_memory_use_readout_pooling", True
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-balance-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_balance_loss_coef", 0.0),
+            help="Optional routing-balance loss coefficient for SISM.",
+        )
+        parser.add_argument(
+            "--slot-memory-consistency-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_consistency_loss_coef", 0.0),
+            help="Optional readout/write consistency loss coefficient for SISM.",
         )
         signature_conditioned_memory_group = parser.add_mutually_exclusive_group()
         signature_conditioned_memory_group.add_argument(
@@ -1933,10 +2038,32 @@ def main(argv: list[str] | None = None) -> None:
             use_signature_conditioned_visual_prefix_memory=bool(
                 args.use_signature_conditioned_visual_prefix_memory
             ),
+            use_signature_indexed_slot_memory=bool(
+                args.use_signature_indexed_slot_memory
+            ),
             use_memory_conditioned_encoder_film=bool(
                 args.use_memory_conditioned_encoder_film
             ),
             num_memory_slots=int(args.num_memory_slots),
+            slot_memory_num_slots=int(args.slot_memory_num_slots),
+            slot_memory_routing_hidden_dim=int(
+                args.slot_memory_routing_hidden_dim
+            ),
+            slot_memory_use_delta_routing=bool(
+                args.slot_memory_use_delta_routing
+            ),
+            slot_memory_use_softmax_routing=bool(
+                args.slot_memory_use_softmax_routing
+            ),
+            slot_memory_use_readout_pooling=bool(
+                args.slot_memory_use_readout_pooling
+            ),
+            slot_memory_balance_loss_coef=float(
+                args.slot_memory_balance_loss_coef
+            ),
+            slot_memory_consistency_loss_coef=float(
+                args.slot_memory_consistency_loss_coef
+            ),
             input_features=input_features_override,
             output_features=output_features_override,
         )
@@ -2061,11 +2188,29 @@ def main(argv: list[str] | None = None) -> None:
             print(
                 "- visual_prefix_memory: "
                 f"num_memory_slots={args.num_memory_slots}, "
+                "signature_indexed_slot_memory="
+                f"{bool(args.use_signature_indexed_slot_memory)}, "
                 "signature_conditioned="
                 f"{bool(args.use_signature_conditioned_visual_prefix_memory)}, "
                 "encoder_film="
                 f"{bool(args.use_memory_conditioned_encoder_film)}"
             )
+            if bool(args.use_signature_indexed_slot_memory):
+                print(
+                    "- slot_memory: "
+                    f"num_slots={int(args.slot_memory_num_slots)}, "
+                    f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                    "delta_routing="
+                    f"{bool(args.slot_memory_use_delta_routing)}, "
+                    "softmax_routing="
+                    f"{bool(args.slot_memory_use_softmax_routing)}, "
+                    "readout_pooling="
+                    f"{bool(args.slot_memory_use_readout_pooling)}, "
+                    "balance_loss_coef="
+                    f"{float(args.slot_memory_balance_loss_coef)}, "
+                    "consistency_loss_coef="
+                    f"{float(args.slot_memory_consistency_loss_coef)}"
+                )
     print(
         f"- wandb: enable={wandb_enable}, project={resolved_wandb_project}, mode={args.wandb_mode}"
     )

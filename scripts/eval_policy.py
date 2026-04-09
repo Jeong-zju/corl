@@ -797,6 +797,10 @@ def run_dataset_evaluation(
         args.policy == "streaming_act"
         and getattr(cfg, "use_visual_prefix_memory", False)
     )
+    use_signature_indexed_slot_memory = bool(
+        args.policy == "streaming_act"
+        and getattr(cfg, "use_signature_indexed_slot_memory", False)
+    )
     use_delta_signature = bool(
         args.policy == "streaming_act" and getattr(cfg, "use_delta_signature", False)
     )
@@ -827,7 +831,11 @@ def run_dataset_evaluation(
     elif use_visual_prefix_memory:
         print(
             "[info] visual prefix memory eval enabled: "
-            "the policy updates recurrent memory from the true current observation at each step"
+            + (
+                "the policy updates signature-indexed slot memory from the true current observation at each step"
+                if use_signature_indexed_slot_memory
+                else "the policy updates recurrent memory from the true current observation at each step"
+            )
         )
     if use_first_frame_anchor:
         print(

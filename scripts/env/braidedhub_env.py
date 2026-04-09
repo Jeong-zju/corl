@@ -2171,6 +2171,10 @@ def evaluate_policy(
         policy_type == "streaming_act"
         and getattr(cfg, "use_visual_prefix_memory", False)
     )
+    use_signature_indexed_slot_memory = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_signature_indexed_slot_memory", False)
+    )
     use_delta_signature = bool(
         policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
     )
@@ -2208,8 +2212,13 @@ def evaluate_policy(
     elif use_visual_prefix_memory:
         print(
             "[info] visual prefix memory online update enabled: "
-            "rollout uses fixed-size recurrent memory without rebuilding "
-            "explicit prefix-sequence tensors each step"
+            + (
+                "rollout uses signature-indexed slot memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+                if use_signature_indexed_slot_memory
+                else "rollout uses fixed-size recurrent memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+            )
         )
     if use_first_frame_anchor:
         print(
