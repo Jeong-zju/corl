@@ -116,7 +116,8 @@ class PolicyClient:
             close_socket(self._socket)
             self._socket = self._make_socket()
             raise TimeoutError(
-                f"Timed out waiting for policy runtime response after {self.timeout_ms} ms."
+                "Timed out waiting for policy runtime response "
+                f"from {self.endpoint} after {self.timeout_ms} ms."
             )
         response = decode_packet(self._socket.recv_multipart())
         if not isinstance(response, ActionPacket):
@@ -124,6 +125,56 @@ class PolicyClient:
                 f"Expected ActionPacket from policy runtime, got {type(response).__name__}."
             )
         return response
+
+    def close(self) -> None:
+        close_socket(self._socket)
+
+
+class PolicyControlClient:
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        timeout_ms: int,
+    ) -> None:
+        self.endpoint = endpoint
+        self.timeout_ms = int(timeout_ms)
+        self._ctx = require_zmq().Context.instance()
+        self._socket = self._make_socket()
+
+    def _make_socket(self):
+        zmq = require_zmq()
+        return make_socket(
+            self._ctx,
+            zmq.REQ,
+            self.endpoint,
+            bind=False,
+            snd_hwm=1,
+            rcv_hwm=1,
+        )
+
+    def request(self, packet: ControlPacket) -> ControlPacket:
+        zmq = require_zmq()
+        poller = zmq.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        self._socket.send_multipart(packet.to_multipart())
+        ready = dict(poller.poll(self.timeout_ms))
+        if self._socket not in ready:
+            close_socket(self._socket)
+            self._socket = self._make_socket()
+            raise TimeoutError(
+                "Timed out waiting for policy control response "
+                f"from {self.endpoint} after {self.timeout_ms} ms."
+            )
+        response = decode_packet(self._socket.recv_multipart())
+        if not isinstance(response, ControlPacket):
+            raise RuntimeError(
+                f"Expected ControlPacket from policy runtime, got {type(response).__name__}."
+            )
+        return response
+
+    def health_check(self) -> ControlPacket:
+        return self.request(ControlPacket(command="health_check"))
 
     def close(self) -> None:
         close_socket(self._socket)
@@ -167,6 +218,19 @@ class BridgeRuntime:
             self._log("status", f"Bridge resumed auto execution: {detail}")
             return
         self._log("status", f"{status}: {detail}")
+
+    @staticmethod
+    def _summarize_policy_health(packet: ControlPacket) -> str:
+        params = packet.params if isinstance(packet.params, dict) else {}
+        parts = [f"command={packet.command}"]
+        if "ok" in params:
+            parts.append(f"ok={params['ok']}")
+        for key in ("policy_type", "policy_dir", "device", "paused"):
+            if key in params:
+                parts.append(f"{key}={params[key]}")
+        if "message" in params:
+            parts.append(f"message={params['message']}")
+        return ", ".join(parts)
 
     def _build_requirements(self) -> list[StreamRequirement]:
         requirements = []
@@ -434,6 +498,12 @@ class BridgeRuntime:
             endpoint=self.config.policy_endpoint,
             timeout_ms=self.config.policy_request_timeout_ms,
         )
+        policy_control_client = None
+        if self.config.policy_control_endpoint:
+            policy_control_client = PolicyControlClient(
+                endpoint=str(self.config.policy_control_endpoint),
+                timeout_ms=max(50, min(200, self.config.policy_request_timeout_ms)),
+            )
         requirements = self._build_requirements()
         period_s = 1.0 / max(self.config.control_rate_hz, 1e-6)
         next_tick_s = time.monotonic()
@@ -444,6 +514,21 @@ class BridgeRuntime:
             f"control={self.config.control_bind or 'disabled'}, "
             f"policy={self.config.policy_endpoint}, mode={self._mode}",
         )
+        if policy_control_client is not None:
+            try:
+                response = policy_control_client.health_check()
+                self._log(
+                    "policy",
+                    "Policy runtime health check OK: "
+                    f"endpoint={policy_control_client.endpoint}, "
+                    f"{self._summarize_policy_health(response)}",
+                )
+            except Exception as exc:
+                self._log(
+                    "warn",
+                    "Policy runtime health check failed: "
+                    f"endpoint={policy_control_client.endpoint}, detail={exc}",
+                )
 
         try:
             while self._running:
@@ -508,6 +593,27 @@ class BridgeRuntime:
                 )
                 try:
                     action_packet = policy_client.request_action(observation)
+                except TimeoutError as exc:
+                    detail = str(exc)
+                    if policy_control_client is not None:
+                        try:
+                            response = policy_control_client.health_check()
+                            detail = (
+                                f"{detail}; control_check={self._summarize_policy_health(response)}"
+                            )
+                        except Exception as health_exc:
+                            detail = f"{detail}; control_check_failed:{health_exc}"
+                    self._report_status_transition(
+                        status="hold",
+                        detail=f"policy_request_failed:{detail}",
+                    )
+                    command_socket.send_multipart(
+                        self._make_hold_command(
+                            reason=f"policy_request_failed:{detail}",
+                            obs_seq=observation.seq,
+                        ).to_multipart()
+                    )
+                    continue
                 except Exception as exc:
                     self._report_status_transition(
                         status="hold",
@@ -538,6 +644,8 @@ class BridgeRuntime:
                 command_socket.send_multipart(command_packet.to_multipart())
         finally:
             policy_client.close()
+            if policy_control_client is not None:
+                policy_control_client.close()
             close_socket(sensor_socket)
             close_socket(command_socket)
             if control_socket is not None:

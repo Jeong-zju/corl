@@ -153,6 +153,29 @@ class BridgeRuntimeObservationTest(unittest.TestCase):
         assert snapshot is not None
         self.assertEqual(int(snapshot.samples["odom"].stamp_ns), 100)
 
+    def test_policy_health_summary(self) -> None:
+        from deploy.bridge.protocol import ControlPacket
+
+        summary = BridgeRuntime._summarize_policy_health(
+            ControlPacket(
+                command="health_check_ack",
+                params={
+                    "ok": True,
+                    "policy_type": "act",
+                    "policy_dir": "/tmp/policy",
+                    "device": "cuda:0",
+                    "paused": False,
+                },
+            )
+        )
+
+        self.assertIn("command=health_check_ack", summary)
+        self.assertIn("ok=True", summary)
+        self.assertIn("policy_type=act", summary)
+        self.assertIn("policy_dir=/tmp/policy", summary)
+        self.assertIn("device=cuda:0", summary)
+        self.assertIn("paused=False", summary)
+
 
 if __name__ == "__main__":
     unittest.main()
