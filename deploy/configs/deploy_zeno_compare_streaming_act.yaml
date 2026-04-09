@@ -5,8 +5,8 @@ bridge:
   policy_endpoint: "tcp://127.0.0.1:5575"
   policy_control_endpoint: "tcp://127.0.0.1:5578"
   policy_type: "streaming_act"
-  control_rate_hz: 30.0
-  policy_request_timeout_ms: 80
+  control_rate_hz: 10.0
+  policy_request_timeout_ms: 300
   signature_backend: "signatory"
   signature_depth: 3
   max_skew_ms: 150
