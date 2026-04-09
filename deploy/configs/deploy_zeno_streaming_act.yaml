@@ -1,0 +1,101 @@
+bridge:
+  sensor_bind: "tcp://*:5556"
+  command_bind: "tcp://*:5557"
+  control_bind: "tcp://*:5559"
+  policy_endpoint: "tcp://127.0.0.1:5555"
+  policy_control_endpoint: "tcp://127.0.0.1:5558"
+  policy_type: "streaming_act"
+  control_rate_hz: 30.0
+  policy_request_timeout_ms: 80
+  signature_backend: "simple"
+  signature_depth: 3
+  max_skew_ms: 40
+  left_arm_dim: 7
+  right_arm_dim: 7
+  enable_base_action: false
+  initial_episode_id: "episode-0000"
+  initial_mode: "auto"
+  state_streams:
+    base: "odom"
+    left_arm: "left_arm_joint_state"
+    right_arm: "right_arm_joint_state"
+  image_streams:
+    observation.images.realsense_top: "realsense_top"
+    observation.images.realsense_left: "realsense_left"
+    observation.images.realsense_right: "realsense_right"
+  freshness_ms:
+    odom: 20
+    left_arm_joint_state: 20
+    right_arm_joint_state: 20
+    realsense_top: 50
+    realsense_left: 50
+    realsense_right: 50
+
+ros1:
+  node_name: "policy_bridge_ros1_adapter"
+  sensor_endpoint: "tcp://127.0.0.1:5556"
+  command_endpoint: "tcp://127.0.0.1:5557"
+  command_poll_hz: 100.0
+  outgoing_queue_size: 256
+  publish_zero_base_on_hold: true
+  image_topics:
+    - stream: "realsense_top"
+      topic: "/realsense_top/color/image_raw/compressed"
+      compressed: true
+    - stream: "realsense_left"
+      topic: "/realsense_left/color/image_raw/compressed"
+      compressed: true
+    - stream: "realsense_right"
+      topic: "/realsense_right/color/image_raw/compressed"
+      compressed: true
+  left_arm_state_topic:
+    stream: "left_arm_joint_state"
+    topic: "/robot/arm_left/joint_states_single"
+    joint_names:
+      - "left_joint_0"
+      - "left_joint_1"
+      - "left_joint_2"
+      - "left_joint_3"
+      - "left_joint_4"
+      - "left_joint_5"
+      - "left_joint_6"
+  right_arm_state_topic:
+    stream: "right_arm_joint_state"
+    topic: "/robot/arm_right/joint_states_single"
+    joint_names:
+      - "right_joint_0"
+      - "right_joint_1"
+      - "right_joint_2"
+      - "right_joint_3"
+      - "right_joint_4"
+      - "right_joint_5"
+      - "right_joint_6"
+  odom_topic:
+    stream: "odom"
+    topic: "/ranger_base_node/odom"
+  left_arm_command:
+    topic: "/bridge/left_arm_joint_trajectory"
+    duration_s: 0.2
+    joint_names:
+      - "left_joint_0"
+      - "left_joint_1"
+      - "left_joint_2"
+      - "left_joint_3"
+      - "left_joint_4"
+      - "left_joint_5"
+      - "left_joint_6"
+  right_arm_command:
+    topic: "/bridge/right_arm_joint_trajectory"
+    duration_s: 0.2
+    joint_names:
+      - "right_joint_0"
+      - "right_joint_1"
+      - "right_joint_2"
+      - "right_joint_3"
+      - "right_joint_4"
+      - "right_joint_5"
+      - "right_joint_6"
+  base_command:
+    topic: "/cmd_vel"
+    enabled: false
+
