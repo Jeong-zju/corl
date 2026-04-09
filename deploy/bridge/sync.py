@@ -1,80 +1,66 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
-from deploy.bridge.protocol import SensorPacket
+import numpy as np
 
 
-@dataclass(slots=True)
-class StreamRequirement:
-    stream: str
-    max_age_ms: int
-    required: bool = True
+SOURCE_IMAGE_LEFT = "image_left"
+SOURCE_IMAGE_RIGHT = "image_right"
+SOURCE_IMAGE_TOP = "image_top"
+SOURCE_JOINT_LEFT = "joint_state_left"
+SOURCE_JOINT_RIGHT = "joint_state_right"
+SOURCE_ODOM = "odom"
 
 
-@dataclass(slots=True)
-class BufferedSample:
-    packet: SensorPacket
-    received_mono_ns: int
-
-
-@dataclass(slots=True)
-class SyncSnapshot:
+@dataclass
+class TimedSample:
     stamp_ns: int
-    samples: dict[str, SensorPacket]
+    received_ns: int
+    value: np.ndarray | bytes
 
 
-class LatestSensorCache:
-    def __init__(self, *, max_skew_ms: int) -> None:
-        self._max_skew_ns = int(max_skew_ms) * 1_000_000
-        self._samples: dict[str, BufferedSample] = {}
+class SensorCache:
+    def __init__(self) -> None:
+        self._samples: dict[str, TimedSample] = {}
 
-    def clear(self) -> None:
-        self._samples.clear()
+    def update(self, source: str, sample: TimedSample) -> None:
+        self._samples[source] = sample
 
-    def update(self, packet: SensorPacket, *, received_mono_ns: int | None = None) -> None:
-        self._samples[packet.stream] = BufferedSample(
-            packet=packet,
-            received_mono_ns=time.monotonic_ns() if received_mono_ns is None else int(received_mono_ns),
-        )
+    def get(self, source: str) -> TimedSample | None:
+        return self._samples.get(source)
 
-    def snapshot(
-        self,
-        requirements: list[StreamRequirement],
-        *,
-        now_mono_ns: int | None = None,
-    ) -> tuple[SyncSnapshot | None, str | None]:
-        now_ns = time.monotonic_ns() if now_mono_ns is None else int(now_mono_ns)
-        selected: dict[str, SensorPacket] = {}
-        latest_stamp_ns = 0
+    def latest_state_vector(self, *, arm_dof: int) -> np.ndarray | None:
+        odom = self.get(SOURCE_ODOM)
+        left = self.get(SOURCE_JOINT_LEFT)
+        right = self.get(SOURCE_JOINT_RIGHT)
+        if odom is None or left is None or right is None:
+            return None
 
-        for requirement in requirements:
-            buffered = self._samples.get(requirement.stream)
-            if buffered is None:
-                if requirement.required:
-                    return None, f"missing:{requirement.stream}"
-                continue
+        state = np.empty((3 + arm_dof * 2,), dtype=np.float32)
+        split = 3 + arm_dof
+        state[:3] = np.asarray(odom.value, dtype=np.float32).reshape(-1)[:3]
+        state[3:split] = np.asarray(left.value, dtype=np.float32).reshape(-1)[:arm_dof]
+        state[split:] = np.asarray(right.value, dtype=np.float32).reshape(-1)[:arm_dof]
+        return state
 
-            age_ns = now_ns - buffered.received_mono_ns
-            max_age_ns = int(requirement.max_age_ms) * 1_000_000
-            if age_ns > max_age_ns:
-                if requirement.required:
-                    return None, f"stale:{requirement.stream}"
-                continue
+    def all_sources_present(self, sources: list[str]) -> bool:
+        return all(source in self._samples for source in sources)
 
-            selected[requirement.stream] = buffered.packet
-            latest_stamp_ns = max(latest_stamp_ns, int(buffered.packet.stamp_ns))
+    def max_age_ms(self, sources: list[str], *, now_ns: int) -> float:
+        ages = [
+            max(0.0, (now_ns - self._samples[source].received_ns) / 1_000_000.0)
+            for source in sources
+            if source in self._samples
+        ]
+        return max(ages) if ages else float("inf")
 
-        if latest_stamp_ns <= 0:
-            return None, "no_fresh_streams"
-
-        for requirement in requirements:
-            if requirement.stream not in selected:
-                continue
-            packet = selected[requirement.stream]
-            skew_ns = latest_stamp_ns - int(packet.stamp_ns)
-            if skew_ns > self._max_skew_ns:
-                return None, f"skew:{requirement.stream}"
-
-        return SyncSnapshot(stamp_ns=latest_stamp_ns, samples=selected), None
+    def stamp_span_ms(self, sources: list[str]) -> float:
+        stamps = [
+            self._samples[source].stamp_ns
+            for source in sources
+            if source in self._samples
+        ]
+        if not stamps:
+            return float("inf")
+        return max(stamps) / 1_000_000.0 - min(stamps) / 1_000_000.0

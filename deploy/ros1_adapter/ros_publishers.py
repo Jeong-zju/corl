@@ -1,47 +1,59 @@
 from __future__ import annotations
 
-import numpy as np
-
-from deploy.ros1_adapter.ros_topics import ArmCommandConfig, BaseCommandConfig
+from config import DeployConfig
 
 
-class ArmCommandPublisher:
-    def __init__(self, config: ArmCommandConfig, *, queue_size: int = 1) -> None:
+class CommandPublishers:
+    def __init__(self, config: DeployConfig) -> None:
         import rospy
+        from geometry_msgs.msg import Twist
         from sensor_msgs.msg import JointState
 
         self._rospy = rospy
-        self._joint_state_cls = JointState
-        self._joint_names = list(config.joint_names)
-        self._publisher = rospy.Publisher(config.topic, JointState, queue_size=queue_size)
+        self._Twist = Twist
+        self._JointState = JointState
+        self._config = config
+        self._base_pub = rospy.Publisher(
+            config.ros.topics.cmd_vel,
+            Twist,
+            queue_size=config.ros.queue_size,
+        )
+        self._left_pub = rospy.Publisher(
+            config.ros.topics.cmd_joint_left,
+            JointState,
+            queue_size=config.ros.queue_size,
+        )
+        self._right_pub = rospy.Publisher(
+            config.ros.topics.cmd_joint_right,
+            JointState,
+            queue_size=config.ros.queue_size,
+        )
 
-    def publish_positions(self, positions: np.ndarray) -> None:
-        command = [float(value) for value in np.asarray(positions, dtype=np.float32).reshape(-1)]
-        msg = self._joint_state_cls()
+    def _make_joint_state(self, names: list[str], positions) -> object:
+        msg = self._JointState()
         msg.header.stamp = self._rospy.Time.now()
-        msg.name = list(self._joint_names)
-        msg.position = command
-        self._publisher.publish(msg)
+        msg.name = list(names)
+        msg.position = [float(value) for value in positions]
+        return msg
 
+    def publish(self, command_packet: dict[str, object]) -> None:
+        if command_packet.get("publish_base", False):
+            twist = self._Twist()
+            values = command_packet.get("base_twist")
+            if values is not None:
+                twist.linear.x = float(values[0]) if len(values) > 0 else 0.0
+                twist.linear.y = float(values[1]) if len(values) > 1 else 0.0
+                twist.angular.z = float(values[2]) if len(values) > 2 else 0.0
+            self._base_pub.publish(twist)
 
-class BaseTwistPublisher:
-    def __init__(self, config: BaseCommandConfig, *, queue_size: int = 1) -> None:
-        import rospy
-        from geometry_msgs.msg import Twist
-
-        self._twist_cls = Twist
-        self._publisher = rospy.Publisher(config.topic, Twist, queue_size=queue_size)
-
-    def publish_twist(self, base_command: np.ndarray) -> None:
-        command = np.asarray(base_command, dtype=np.float32).reshape(-1)
-        msg = self._twist_cls()
-        if command.shape[0] > 0:
-            msg.linear.x = float(command[0])
-        if command.shape[0] > 1:
-            msg.linear.y = float(command[1])
-        if command.shape[0] > 2:
-            msg.angular.z = float(command[2])
-        self._publisher.publish(msg)
-
-    def publish_zero(self) -> None:
-        self.publish_twist(np.zeros((3,), dtype=np.float32))
+        if command_packet.get("publish_arms", False):
+            left_msg = self._make_joint_state(
+                self._config.ros.joint_names_left.name,
+                command_packet.get("left_joint_positions", []),
+            )
+            right_msg = self._make_joint_state(
+                self._config.ros.joint_names_right.name,
+                command_packet.get("right_joint_positions", []),
+            )
+            self._left_pub.publish(left_msg)
+            self._right_pub.publish(right_msg)

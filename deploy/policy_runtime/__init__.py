@@ -1,2 +1,1 @@
-"""Policy runtime server for `main/` checkpoints."""
-
+"""Local policy loading helpers for deployment."""

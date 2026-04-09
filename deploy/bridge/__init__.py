@@ -1,2 +1,1 @@
-"""Bridge-side deployment modules."""
-
+"""Bridge components for deployment."""

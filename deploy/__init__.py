@@ -1,2 +1,1 @@
-"""Deployment helpers for bridging `main/` policies to ROS1."""
-
+"""Deployment stack for bridging LeRobot policies to ROS1."""

@@ -1,98 +1,68 @@
-bridge:
-  sensor_bind: "tcp://*:5576"
-  command_bind: "tcp://*:5577"
-  control_bind: "tcp://*:5579"
-  policy_endpoint: "tcp://127.0.0.1:5575"
-  policy_control_endpoint: "tcp://127.0.0.1:5578"
-  policy_type: "streaming_act"
-  control_rate_hz: 10.0
-  policy_request_timeout_ms: 300
-  signature_backend: "signatory"
+policy:
+  type: streaming_act
+  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/streaming-act-sism/20260408_184500/checkpoints/050000
+  device: cuda
+  load_device: null
+  n_action_steps: 1
+  state_dim: 17
+  action_dim: 17
+  arm_dof: 7
+  base_action_dim: 3
+  state_key: observation.state
+  action_key: action
+  image_keys:
+    left: observation.images.realsense_left
+    right: observation.images.realsense_right
+    top: observation.images.realsense_top
+  use_path_signature: true
+  use_delta_signature: true
   signature_depth: 3
-  max_skew_ms: 150
-  left_arm_dim: 7
-  right_arm_dim: 7
-  enable_base_action: true
-  initial_episode_id: "compare-streaming-act-episode-0000"
-  initial_mode: "auto"
-  state_streams:
-    base: "odom"
-    left_arm: "left_arm_joint_state"
-    right_arm: "right_arm_joint_state"
-  image_streams:
-    observation.images.realsense_top: "realsense_top"
-    observation.images.realsense_left: "realsense_left"
-    observation.images.realsense_right: "realsense_right"
-  freshness_ms:
-    odom: 100
-    left_arm_joint_state: 100
-    right_arm_joint_state: 100
-    realsense_top: 300
-    realsense_left: 300
-    realsense_right: 300
+  signature_dim: 5219
+  signature_backend: auto
 
-ros1:
-  node_name: "policy_bridge_ros1_adapter_compare_streaming_act"
-  sensor_endpoint: "tcp://127.0.0.1:5576"
-  command_endpoint: "tcp://127.0.0.1:5577"
-  command_poll_hz: 100.0
-  outgoing_queue_size: 256
-  publish_zero_base_on_hold: true
-  image_topics:
-    - stream: "realsense_top"
-      topic: "/realsense_top/color/image_raw/compressed"
-      compressed: true
-    - stream: "realsense_left"
-      topic: "/realsense_left/color/image_raw/compressed"
-      compressed: true
-    - stream: "realsense_right"
-      topic: "/realsense_right/color/image_raw/compressed"
-      compressed: true
-  left_arm_state_topic:
-    stream: "left_arm_joint_state"
-    topic: "/robot/arm_left/joint_states_single"
-    joint_names:
-      - "joint1"
-      - "joint2"
-      - "joint3"
-      - "joint4"
-      - "joint5"
-      - "joint6"
-      - "gripper"
-  right_arm_state_topic:
-    stream: "right_arm_joint_state"
-    topic: "/robot/arm_right/joint_states_single"
-    joint_names:
-      - "joint1"
-      - "joint2"
-      - "joint3"
-      - "joint4"
-      - "joint5"
-      - "joint6"
-      - "gripper"
-  odom_topic:
-    stream: "odom"
-    topic: "/ranger_base_node/odom"
-  left_arm_command:
-    topic: "/compare/streaming_act/left_arm_joint_states"
-    joint_names:
-      - "joint1"
-      - "joint2"
-      - "joint3"
-      - "joint4"
-      - "joint5"
-      - "joint6"
-      - "gripper"
-  right_arm_command:
-    topic: "/compare/streaming_act/right_arm_joint_states"
-    joint_names:
-      - "joint1"
-      - "joint2"
-      - "joint3"
-      - "joint4"
-      - "joint5"
-      - "joint6"
-      - "gripper"
-  base_command:
-    topic: "/compare/streaming_act/cmd_vel"
-    enabled: true
+runtime:
+  control_hz: 20.0
+
+image:
+  width: 224
+  height: 224
+  color_order: rgb
+
+ros:
+  node_name: zeno_compare_streaming_act_deploy
+  queue_size: 1
+  topics:
+    image_left: /realsense_left/color/image_raw/compressed
+    image_right: /realsense_right/color/image_raw/compressed
+    image_top: /realsense_top/color/image_raw/compressed
+    joint_state_left: /robot/arm_left/joint_states_single
+    joint_state_right: /robot/arm_right/joint_states_single
+    odom: /ranger_base_node/odom
+    cmd_vel: /deploy_compare/streaming_act/cmd_vel
+    cmd_joint_left: /deploy_compare/streaming_act/arm_left/joint_states
+    cmd_joint_right: /deploy_compare/streaming_act/arm_right/joint_states
+  joint_names_left:
+    name:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      - gripper
+  joint_names_right:
+    name:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      - gripper
+
+command:
+  publish_base: true
+  publish_arms: true
+  max_linear_x: 0.20
+  max_linear_y: 0.20
+  max_angular_z: 0.40
