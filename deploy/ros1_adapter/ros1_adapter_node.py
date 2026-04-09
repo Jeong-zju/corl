@@ -122,6 +122,25 @@ class DeployRosNode:
             self._control_step,
         )
 
+    def _topic_name_by_source(self, source: str) -> str:
+        topic_map = {
+            SOURCE_IMAGE_LEFT: self.config.ros.topics.image_left,
+            SOURCE_IMAGE_RIGHT: self.config.ros.topics.image_right,
+            SOURCE_IMAGE_TOP: self.config.ros.topics.image_top,
+            SOURCE_JOINT_LEFT: self.config.ros.topics.joint_state_left,
+            SOURCE_JOINT_RIGHT: self.config.ros.topics.joint_state_right,
+            SOURCE_ODOM: self.config.ros.topics.odom,
+        }
+        return topic_map.get(source, source)
+
+    def _missing_required_topics_locked(self) -> list[str]:
+        missing_sources = [
+            source
+            for source in ALL_REQUIRED_SOURCES
+            if self.cache.get(source) is None
+        ]
+        return [self._topic_name_by_source(source) for source in missing_sources]
+
     def _store_sample(self, source: str, stamp_ns: int, value: np.ndarray) -> None:
         with self.lock:
             self.cache.update(
@@ -208,7 +227,8 @@ class DeployRosNode:
 
     def _build_observation_locked(self) -> tuple[dict[str, object] | None, str]:
         if not self.cache.all_sources_present(list(ALL_REQUIRED_SOURCES)):
-            return None, "Waiting for all required ROS topics."
+            missing_topics = self._missing_required_topics_locked()
+            return None, "Waiting for ROS topics: " + ", ".join(missing_topics)
 
         state = self.cache.latest_state_vector(arm_dof=self.config.policy.arm_dof)
         if state is None:
