@@ -40,8 +40,14 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 ## 当前默认动作映射
 
 - `action[0:3]`: 底盘，默认关闭下发
-- `action[3:10]`: 左臂 7 维关节目标
-- `action[10:17]`: 右臂 7 维关节目标
+- `action[3:10]`: 左臂 7 维目标
+- `action[10:17]`: 右臂 7 维目标
+
+对于当前 zeno 配置，这两个 7 维目标的语义是：
+
+- `joint1 .. joint6`
+- `gripper`
+
+也就是说，bridge 当前会把每只手臂的最后 1 维和前 6 个关节一起按 `JointTrajectory` 下发。前提是你的实际控制器也接受这种 6 DoF + gripper 的 7 维联合轨迹。
 
 如果 `bridge` 判定观测 stale、推理超时或模式不是 `auto`，会发送 `hold` 命令包。
-

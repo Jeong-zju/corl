@@ -146,6 +146,23 @@ class BridgeRuntime:
         self._running = True
         self._last_obs_seq = -1
         self._last_hold_reason = ""
+        self._last_reported_status = "init"
+
+    def _log(self, level: str, message: str) -> None:
+        print(f"[{level}] {message}", flush=True)
+
+    def _report_status_transition(self, *, status: str, detail: str) -> None:
+        marker = f"{status}:{detail}"
+        if marker == self._last_reported_status:
+            return
+        self._last_reported_status = marker
+        if status == "hold":
+            self._log("status", f"Bridge entering hold: {detail}")
+            return
+        if status == "auto":
+            self._log("status", f"Bridge resumed auto execution: {detail}")
+            return
+        self._log("status", f"{status}: {detail}")
 
     def _build_requirements(self) -> list[StreamRequirement]:
         requirements = []
@@ -343,6 +360,13 @@ class BridgeRuntime:
         requirements = self._build_requirements()
         period_s = 1.0 / max(self.config.control_rate_hz, 1e-6)
         next_tick_s = time.monotonic()
+        self._log(
+            "ready",
+            "Bridge is listening: "
+            f"sensors={self.config.sensor_bind}, commands={self.config.command_bind}, "
+            f"control={self.config.control_bind or 'disabled'}, "
+            f"policy={self.config.policy_endpoint}, mode={self._mode}",
+        )
 
         try:
             while self._running:
@@ -380,6 +404,7 @@ class BridgeRuntime:
 
                 next_tick_s += period_s
                 if self._mode != "auto":
+                    self._report_status_transition(status="hold", detail=f"mode:{self._mode}")
                     command_socket.send_multipart(
                         self._make_hold_command(reason=f"mode:{self._mode}", obs_seq=self._last_obs_seq).to_multipart()
                     )
@@ -387,6 +412,10 @@ class BridgeRuntime:
 
                 snapshot, failure = self._sensor_cache.snapshot(requirements)
                 if snapshot is None:
+                    self._report_status_transition(
+                        status="hold",
+                        detail=f"observation_unavailable:{failure}",
+                    )
                     command_socket.send_multipart(
                         self._make_hold_command(reason=f"observation_unavailable:{failure}", obs_seq=self._last_obs_seq).to_multipart()
                     )
@@ -399,6 +428,10 @@ class BridgeRuntime:
                 try:
                     action_packet = policy_client.request_action(observation)
                 except Exception as exc:
+                    self._report_status_transition(
+                        status="hold",
+                        detail=f"policy_request_failed:{exc}",
+                    )
                     command_socket.send_multipart(
                         self._make_hold_command(
                             reason=f"policy_request_failed:{exc}",
@@ -410,6 +443,16 @@ class BridgeRuntime:
                 self._pending_reset = False
                 self._last_obs_seq = observation.seq
                 command_packet = self._build_command_packet(action_packet)
+                if command_packet.mode == "auto":
+                    self._report_status_transition(
+                        status="auto",
+                        detail=f"obs_seq={observation.seq}",
+                    )
+                else:
+                    self._report_status_transition(
+                        status="hold",
+                        detail=command_packet.hold_reason or command_packet.status,
+                    )
                 command_socket.send_multipart(command_packet.to_multipart())
         finally:
             policy_client.close()
@@ -437,4 +480,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

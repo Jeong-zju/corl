@@ -94,20 +94,23 @@ observation.images.realsense_right
 - 更稳妥的第一版部署应当优先做“机械臂主控，底盘固定/限权/人工接管”
 - 如果你后续一定要让 policy 控底盘，建议补采真实 base action 并重训
 
-### 2.6 当前数据里没有显式 gripper 维度
+### 2.6 需要按真实 embodiment 确认这 7 维的语义
 
-当前导出的状态和动作里只有：
+当前导出的状态和动作在形式上是：
 
 - 3 维底盘速度
-- 左右臂各 7 维关节
+- 左右臂各 7 维
 
-没有独立 gripper 开合维度。
+但这 7 维在不同机器人上可能有两种语义：
 
-因此：
+- 7 个 arm joints
+- 6 DoF arm + 1 gripper
 
-- 如果真实任务需要 gripper 开合，而你的 checkpoint 也是基于这套 17 维训练的
-- 那么 bridge 不应该自行“脑补” gripper 指令
-- gripper 要么固定策略，要么走单独 FSM/脚本，要么补数据重训
+对当前 zeno 平台，后续确认的真实语义是：
+
+- 每臂 7 维 = `joint1 .. joint6 + gripper`
+
+这意味着 bridge 和 ROS1 adapter 必须严格保持这个顺序，不要把最后 1 维误当成“第 7 个 arm joint”。
 
 ## 3. 推荐总体架构
 
@@ -401,15 +404,13 @@ reset 时应当同时清空：
 
 ### 8.3 gripper
 
-当前 17 维动作里没有显式 gripper 维度。
+如果你的 embodiment 和当前 zeno 一样，是每臂 `6 DoF + gripper`，那么：
 
-所以第一版部署里，gripper 应当：
+- gripper 已经包含在每臂 7 维动作里
+- bridge 不需要额外脑补 gripper 指令
+- 但 ROS1 command topic 必须支持把 `joint1 .. joint6 + gripper` 一起下发
 
-- 固定保持某个状态，或
-- 走单独 FSM，或
-- 在任务流程里用规则逻辑控制
-
-不要把 gripper 强行塞到这 17 维之外的隐含逻辑里。
+如果某个控制器不接受联合轨迹，而要求 gripper 单独 topic，那么就需要在 bridge 里再拆一层 command adapter。
 
 ## 9. 实时性与时延预算
 
