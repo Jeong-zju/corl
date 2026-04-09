@@ -242,6 +242,18 @@ class BridgeRuntime:
         self._command_seq += 1
         raw_action = np.asarray(action_packet.action, dtype=np.float32).reshape(-1)
         expected_dim = 3 + self.config.left_arm_dim + self.config.right_arm_dim
+        if action_packet.status != "ok":
+            detail = action_packet.message or action_packet.status
+            return RobotCommandPacket.hold(
+                seq=self._command_seq,
+                obs_seq=action_packet.obs_seq,
+                stamp_ns=time.time_ns(),
+                raw_action_dim=max(expected_dim, int(raw_action.shape[0])),
+                left_arm_dim=self.config.left_arm_dim,
+                right_arm_dim=self.config.right_arm_dim,
+                hold_reason=f"policy_{action_packet.status}:{detail}",
+                metadata={"status": action_packet.status, "message": action_packet.message},
+            )
         if raw_action.shape[0] != expected_dim:
             return RobotCommandPacket.hold(
                 seq=self._command_seq,

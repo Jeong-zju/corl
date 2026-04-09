@@ -9,7 +9,7 @@ bridge:
   policy_request_timeout_ms: 80
   signature_backend: "simple"
   signature_depth: 3
-  max_skew_ms: 40
+  max_skew_ms: 150
   left_arm_dim: 7
   right_arm_dim: 7
   enable_base_action: false
@@ -27,9 +27,9 @@ bridge:
     odom: 100
     left_arm_joint_state: 100
     right_arm_joint_state: 100
-    realsense_top: 100
-    realsense_left: 100
-    realsense_right: 100
+    realsense_top: 300
+    realsense_left: 300
+    realsense_right: 300
 
 ros1:
   node_name: "policy_bridge_ros1_adapter"
