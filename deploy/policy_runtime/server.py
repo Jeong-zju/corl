@@ -161,6 +161,11 @@ class PolicyRuntimeServer:
         poller = zmq.Poller()
         poller.register(inference_socket, zmq.POLLIN)
         poller.register(control_socket, zmq.POLLIN)
+        print(
+            "[ready] Policy runtime is listening for requests: "
+            f"inference={self.inference_bind}, control={self.control_bind}",
+            flush=True,
+        )
 
         try:
             while self._running:
