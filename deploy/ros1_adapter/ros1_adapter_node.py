@@ -68,6 +68,39 @@ class OutgoingPacket:
     packet: SensorPacket
 
 
+def _summarize_robot_command(packet: RobotCommandPacket) -> str:
+    parts = [
+        f"mode={packet.mode}",
+        f"status={packet.status}",
+        f"obs_seq={packet.obs_seq}",
+        f"hold_reason={packet.hold_reason or '-'}",
+    ]
+    metadata = packet.metadata if isinstance(packet.metadata, dict) else {}
+
+    policy_seq = metadata.get("policy_seq")
+    if policy_seq is not None:
+        parts.append(f"policy_seq={policy_seq}")
+
+    policy_status = metadata.get("policy_status")
+    if policy_status:
+        parts.append(f"policy_status={policy_status}")
+
+    policy_runtime_ms = metadata.get("policy_runtime_ms")
+    if policy_runtime_ms is not None:
+        try:
+            parts.append(f"policy_runtime_ms={float(policy_runtime_ms):.1f}")
+        except (TypeError, ValueError):
+            parts.append(f"policy_runtime_ms={policy_runtime_ms}")
+
+    policy_message = metadata.get("policy_message")
+    if not policy_message:
+        policy_message = metadata.get("message")
+    if policy_message:
+        parts.append(f"policy_message={policy_message}")
+
+    return ", ".join(parts)
+
+
 class Ros1BridgeAdapter:
     def __init__(self, *, config: Ros1AdapterConfig) -> None:
         self.config = config
@@ -311,10 +344,7 @@ class Ros1BridgeAdapter:
                 )
 
     def _handle_robot_command(self, packet: RobotCommandPacket) -> None:
-        self._last_command_summary = (
-            f"mode={packet.mode}, status={packet.status}, obs_seq={packet.obs_seq}, "
-            f"hold_reason={packet.hold_reason or '-'}"
-        )
+        self._last_command_summary = _summarize_robot_command(packet)
         if packet.mode != "auto":
             if self._base_publisher is not None and self.config.publish_zero_base_on_hold:
                 self._base_publisher.publish_zero()

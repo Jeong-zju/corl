@@ -305,7 +305,12 @@ class BridgeRuntime:
                 left_arm_dim=self.config.left_arm_dim,
                 right_arm_dim=self.config.right_arm_dim,
                 hold_reason=f"policy_{action_packet.status}:{detail}",
-                metadata={"status": action_packet.status, "message": action_packet.message},
+                metadata={
+                    "policy_seq": action_packet.seq,
+                    "policy_runtime_ms": action_packet.runtime_ms,
+                    "policy_status": action_packet.status,
+                    "policy_message": action_packet.message,
+                },
             )
         if raw_action.shape[0] != expected_dim:
             return RobotCommandPacket.hold(
@@ -319,7 +324,12 @@ class BridgeRuntime:
                     "action_dim_mismatch:"
                     f"expected={expected_dim},got={raw_action.shape[0]}"
                 ),
-                metadata={"status": action_packet.status, "message": action_packet.message},
+                metadata={
+                    "policy_seq": action_packet.seq,
+                    "policy_runtime_ms": action_packet.runtime_ms,
+                    "policy_status": action_packet.status,
+                    "policy_message": action_packet.message,
+                },
             )
 
         left_start = 3
@@ -340,8 +350,10 @@ class BridgeRuntime:
             base=base,
             hold_reason=hold_reason,
             metadata={
+                "policy_seq": action_packet.seq,
                 "policy_runtime_ms": action_packet.runtime_ms,
                 "policy_status": action_packet.status,
+                "policy_message": action_packet.message,
             },
         )
 
