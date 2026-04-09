@@ -1,6 +1,6 @@
 policy:
   type: act
-  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/act/20260408_153316/checkpoints/050000
+  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/act/20260408_153316/checkpoints/last
   device: cuda
   load_device: null
   n_action_steps: 1
