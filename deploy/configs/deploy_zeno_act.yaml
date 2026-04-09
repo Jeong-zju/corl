@@ -39,8 +39,8 @@ ros:
     joint_state_right: /robot/arm_right/joint_states_single
     odom: /ranger_base_node/odom
     cmd_vel: /deploy/cmd_vel
-    cmd_joint_left: /deploy/arm_left/joint_states
-    cmd_joint_right: /deploy/arm_right/joint_states
+    cmd_joint_left: /robot/arm_left/vla_joint_cmd
+    cmd_joint_right: /robot/arm_right/vla_joint_cmd
   joint_names_left:
     name:
       - joint1
