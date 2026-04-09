@@ -367,6 +367,87 @@ def get_chunk_and_file_index(
     )
 
 
+def collect_chunk_file_indices(
+    source_episodes_meta: Sequence[dict[str, Any]],
+) -> dict[int, list[int]]:
+    chunk_to_file_indices: dict[int, set[int]] = {}
+    for episode_meta in source_episodes_meta:
+        chunk_index = int(episode_meta["data/chunk_index"])
+        file_index = int(episode_meta["data/file_index"])
+        chunk_to_file_indices.setdefault(chunk_index, set()).add(file_index)
+    return {
+        chunk_index: sorted(file_indices)
+        for chunk_index, file_indices in chunk_to_file_indices.items()
+    }
+
+
+def infer_source_episodes_per_chunk(
+    source_episodes_meta: Sequence[dict[str, Any]],
+) -> int | None:
+    chunk_file_indices = collect_chunk_file_indices(source_episodes_meta)
+    if not chunk_file_indices:
+        return None
+    return max(len(file_indices) for file_indices in chunk_file_indices.values())
+
+
+def is_declared_chunk_layout_consistent(
+    source_episodes_meta: Sequence[dict[str, Any]],
+    declared_episodes_per_chunk: int,
+) -> bool:
+    if declared_episodes_per_chunk <= 0:
+        return False
+
+    chunk_file_indices = collect_chunk_file_indices(source_episodes_meta)
+    if not chunk_file_indices:
+        return False
+
+    ordered_chunk_indices = sorted(chunk_file_indices)
+    for position, chunk_index in enumerate(ordered_chunk_indices):
+        file_indices = chunk_file_indices[chunk_index]
+        if file_indices != list(range(len(file_indices))):
+            return False
+
+        file_count = len(file_indices)
+        is_last_chunk = position == len(ordered_chunk_indices) - 1
+        if file_count > declared_episodes_per_chunk:
+            return False
+        if not is_last_chunk and file_count != declared_episodes_per_chunk:
+            return False
+    return True
+
+
+def resolve_episodes_per_chunk(
+    *,
+    requested_episodes_per_chunk: int | None,
+    source_info: dict[str, Any],
+    source_episodes_meta: Sequence[dict[str, Any]],
+) -> int:
+    if requested_episodes_per_chunk is not None:
+        resolved = int(requested_episodes_per_chunk)
+        if resolved <= 0:
+            raise ValueError("`episodes_per_chunk` must be positive.")
+        return resolved
+
+    declared_raw = source_info.get("chunks_size")
+    declared = None if declared_raw is None else int(declared_raw)
+    if declared is not None and is_declared_chunk_layout_consistent(source_episodes_meta, declared):
+        return declared
+
+    inferred = infer_source_episodes_per_chunk(source_episodes_meta)
+    if inferred is not None and inferred > 0:
+        if declared is not None and declared != inferred:
+            print(
+                "[info] Source metadata chunks_size does not match the observed data layout. "
+                f"declared={declared}, inferred={inferred}. Using inferred value."
+            )
+        return inferred
+
+    fallback = 1000
+    if declared is not None and declared > 0:
+        return declared
+    return fallback
+
+
 def estimate_total_size_mb(paths: Sequence[Path]) -> int:
     if not paths:
         return 0
@@ -1091,19 +1172,17 @@ def process_dataset(args: argparse.Namespace) -> Path:
     data_path_pattern = str(source_info.get("data_path", DEFAULT_DATA_PATH))
     video_path_pattern = str(source_info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"))
     fps = int(source_info.get("fps", args.fps))
-    episodes_per_chunk = int(
-        args.episodes_per_chunk
-        if args.episodes_per_chunk is not None
-        else source_info.get("chunks_size", 1000)
-    )
-    if episodes_per_chunk <= 0:
-        raise ValueError("`episodes_per_chunk` must be positive.")
 
     source_episodes_path = source_root / DEFAULT_EPISODES_PATH
     source_episodes_table = pq.read_table(source_episodes_path)
     source_episodes_meta = source_episodes_table.to_pylist()
     if not source_episodes_meta:
         raise ValueError(f"No source episodes found in {source_episodes_path}")
+    episodes_per_chunk = resolve_episodes_per_chunk(
+        requested_episodes_per_chunk=args.episodes_per_chunk,
+        source_info=source_info,
+        source_episodes_meta=source_episodes_meta,
+    )
 
     first_episode_data_file = build_data_file_path(
         source_root,

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""
-从Hugging Face下载数据集的脚本，支持断点续传和自动重试
+"""从 Hugging Face 下载仓库快照，支持断点续传、自动重试和自动并发。
+
+默认会下载到脚本所在目录，也就是 ``main/data/{dataset_id}``。例如：
+
+    python data/download_dataset.py Yinpei/robomme_data_lerobot \
+      --cache-dir ~/.cache/huggingface
+
+会把数据下载到：
+
+    data/Yinpei/robomme_data_lerobot
 """
 
 import argparse
@@ -17,6 +25,16 @@ except ImportError:  # pragma: no cover
 AUTO_MAX_WORKERS = "auto"
 MIN_AUTO_MAX_WORKERS = 8
 MAX_AUTO_MAX_WORKERS = 64
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_local_dir(output_path: Path, dataset_name: str) -> Path:
+    dataset_parts = [part for part in dataset_name.split("/") if part]
+    if not dataset_parts or any(part in {".", ".."} for part in dataset_parts):
+        raise ValueError(
+            f"Invalid dataset name `{dataset_name}`. Expected a Hugging Face repo id such as `owner/name`."
+        )
+    return output_path.joinpath(*dataset_parts)
 
 
 def get_available_cpu_count() -> int:
@@ -66,7 +84,7 @@ def resolve_max_workers(max_workers: int | str | None) -> int:
 
 def download_dataset(
     dataset_name: str,
-    output_dir: str = "./",
+    output_dir: str | os.PathLike[str] = DEFAULT_OUTPUT_DIR,
     repo_type: str = "dataset",
     cache_dir: str = "./.cache",
     max_retries: int = 10,
@@ -78,7 +96,7 @@ def download_dataset(
 
     Args:
         dataset_name: 数据集名称 (例如: "squad", "glue")
-        output_dir: 输出目录
+        output_dir: 输出根目录，默认是脚本所在的 data 目录
         repo_type: 仓库类型 ("dataset", "model", "space")
         cache_dir: 缓存目录
         max_retries: 最大重试次数
@@ -91,7 +109,7 @@ def download_dataset(
     cache_path = Path(cache_dir).expanduser()
     cache_path.mkdir(parents=True, exist_ok=True)
 
-    local_dir = output_path / dataset_name.replace("/", "_")
+    local_dir = resolve_local_dir(output_path, dataset_name)
     resolved_max_workers = resolve_max_workers(max_workers)
 
     try:
@@ -135,19 +153,44 @@ def download_dataset(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="从Hugging Face下载数据集，支持断点续传"
+        description=(
+            "从 Hugging Face 下载仓库快照，支持断点续传、自动重试和自动并发。"
+        ),
+        epilog=(
+            "示例:\n"
+            "  python data/download_dataset.py Yinpei/robomme_data_lerobot \\\n"
+            "    --cache-dir ~/.cache/huggingface\n\n"
+            "默认输出目录:\n"
+            "  data/Yinpei/robomme_data_lerobot"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("dataset_name", type=str, help="数据集名称")
-    parser.add_argument("--output-dir", type=str, default="./", help="输出目录")
-    parser.add_argument("--repo-type", type=str, default="dataset", help="仓库类型")
-    parser.add_argument("--cache-dir", type=str, default="~/.cache", help="缓存目录")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="输出根目录；默认是脚本所在的 data 目录，实际下载目录为 <output_dir>/<dataset_id>",
+    )
+    parser.add_argument(
+        "--repo-type",
+        type=str,
+        default="dataset",
+        help='仓库类型，可选 "dataset"、"model"、"space"',
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default="~/.cache",
+        help="缓存目录；下载失败后会基于缓存自动续传",
+    )
     parser.add_argument("--max-retries", type=int, default=1000, help="最大重试次数")
     parser.add_argument("--retry-delay", type=int, default=30, help="重试延迟（秒）")
     parser.add_argument(
         "--max-workers",
         type=str,
         default=AUTO_MAX_WORKERS,
-        help='下载并发数，传正整数或 "auto"（默认）',
+        help='下载并发数，传正整数或 "auto"（默认，会结合 CPU 和文件描述符上限估算）',
     )
 
     args = parser.parse_args()

@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""Convert non-LeRobot datasets into local LeRobot v3.0 datasets.
-
-Examples:
-    python3 main/data/convert_dataset.py \
-        /home/jeong/zeno/corl/RMBench/data \
-        --convert rmbench \
-        --dataset-id rmbench
-"""
+"""Convert ROS bag datasets into local LeRobot v3 datasets."""
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
 import json
+import math
+import multiprocessing as mp
 import os
-import queue
+from contextlib import ExitStack
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-import re
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -30,61 +25,144 @@ DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 DEFAULT_EPISODES_PATH = "meta/episodes/chunk-000/file-000.parquet"
-DEFAULT_FPS = 50
-DEFAULT_TRAIN_RATIO = 0.8
-DEFAULT_IMAGE_HEIGHT = 480
-DEFAULT_IMAGE_WIDTH = 640
+DEFAULT_STAGING_DIRNAME = ".staging"
+DEFAULT_FPS = 30
+DEFAULT_IMAGE_WIDTH = 224
+DEFAULT_IMAGE_HEIGHT = 224
+DEFAULT_ARM_DOF = 7
 DEFAULT_WORKERS = "auto"
 DEFAULT_VIDEO_ENCODER = "auto"
-DEFAULT_GPU_VIDEO_ENCODERS = ("h264_nvenc", "hevc_nvenc")
+DEFAULT_GPU_VIDEO_ENCODERS = (
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_qsv",
+    "h264_vaapi",
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
+)
 DEFAULT_CPU_VIDEO_ENCODER = "libx264"
-SUPPORTED_CONVERTERS = ("rmbench",)
-RMbench_RAW_CAMERA_TO_LEROBOT = {
-    "head_camera": "cam_high",
-    "left_camera": "cam_left_wrist",
-    "right_camera": "cam_right_wrist",
-}
-MOTOR_NAMES = [
-    "left_waist",
-    "left_shoulder",
-    "left_elbow",
-    "left_forearm_roll",
-    "left_wrist_angle",
-    "left_wrist_rotate",
-    "left_gripper",
-    "right_waist",
-    "right_shoulder",
-    "right_elbow",
-    "right_forearm_roll",
-    "right_wrist_angle",
-    "right_wrist_rotate",
-    "right_gripper",
-]
-EPISODE_FILE_RE = re.compile(r"episode(\d+)$")
+
+DEFAULT_CAMERA_TOP_TOPIC = "/realsense_top/color/image_raw/compressed"
+DEFAULT_CAMERA_LEFT_TOPIC = "/realsense_left/color/image_raw/compressed"
+DEFAULT_CAMERA_RIGHT_TOPIC = "/realsense_right/color/image_raw/compressed"
+DEFAULT_STATE_LEFT_TOPIC = "/robot/arm_left/joint_states_single"
+DEFAULT_STATE_RIGHT_TOPIC = "/robot/arm_right/joint_states_single"
+DEFAULT_ACTION_LEFT_TOPIC = "/teleop/arm_left/joint_states_single"
+DEFAULT_ACTION_RIGHT_TOPIC = "/teleop/arm_right/joint_states_single"
+DEFAULT_ODOM_TOPIC = "/ranger_base_node/odom"
+
+CAMERA_TOP_KEY = "observation.images.realsense_top"
+CAMERA_LEFT_KEY = "observation.images.realsense_left"
+CAMERA_RIGHT_KEY = "observation.images.realsense_right"
 
 
 @dataclass(frozen=True)
-class EpisodeSource:
-    source_task: str
-    episode_id: int
-    hdf5_path: Path
-    instruction_path: Path
-    primary_task: str
-    task_candidates: tuple[str, ...]
+class RosbagTopics:
+    camera_top_topic: str
+    camera_left_topic: str
+    camera_right_topic: str
+    state_left_topic: str
+    state_right_topic: str
+    action_left_topic: str
+    action_right_topic: str
+    odom_topic: str | None
+
+    def camera_topic_pairs(self) -> list[tuple[str, str]]:
+        return [
+            (self.camera_top_topic, CAMERA_TOP_KEY),
+            (self.camera_left_topic, CAMERA_LEFT_KEY),
+            (self.camera_right_topic, CAMERA_RIGHT_KEY),
+        ]
+
+    def required_topics(self) -> list[str]:
+        return [
+            self.camera_top_topic,
+            self.camera_left_topic,
+            self.camera_right_topic,
+            self.state_left_topic,
+            self.state_right_topic,
+            self.action_left_topic,
+            self.action_right_topic,
+        ]
+
+    def all_topics(self) -> list[str]:
+        topics = self.required_topics()
+        if self.odom_topic:
+            topics.append(self.odom_topic)
+        return topics
 
 
 @dataclass(frozen=True)
-class EpisodeConversionResult:
-    episode_index: int
-    source_task: str
-    source_episode_id: int
-    primary_task: str
-    task_candidates: tuple[str, ...]
+class ConversionConfig:
+    dataset_id: str
+    task_label: str
+    robot_type: str
+    fps: int
+    image_width: int
+    image_height: int
+    arm_dof: int
+    topics: RosbagTopics
+
+
+@dataclass(frozen=True)
+class WorkerTask:
+    bag_index: int
+    bag_path: str
+    staging_root: str
+    config: ConversionConfig
+    video_encoder: str
+
+
+@dataclass(frozen=True)
+class EpisodeArtifact:
+    bag_index: int
+    bag_path: str
+    status: str
     frame_count: int
-    state_sequence: np.ndarray
-    action_sequence: np.ndarray
-    video_paths: dict[str, str]
-    image_stats_by_key: dict[str, dict[str, Any]]
+    elapsed_s: float
+    detail: str | None = None
+    staging_dir: str | None = None
+    data_path: str | None = None
+    video_paths: dict[str, str] | None = None
+    state_stats: dict[str, Any] | None = None
+    action_stats: dict[str, Any] | None = None
+    reward_stats: dict[str, Any] | None = None
+    timestamp_stats: dict[str, Any] | None = None
+    image_stats_by_key: dict[str, dict[str, Any]] | None = None
+
+
+@dataclass
+class LowDimStreams:
+    camera_bounds: dict[str, tuple[int, int]]
+    state_left_times: np.ndarray
+    state_left_values: np.ndarray
+    state_right_times: np.ndarray
+    state_right_values: np.ndarray
+    action_left_times: np.ndarray
+    action_left_values: np.ndarray
+    action_right_times: np.ndarray
+    action_right_values: np.ndarray
+    odom_times: np.ndarray
+    odom_values: np.ndarray
+
+
+@dataclass
+class CameraCursor:
+    topic: str
+    video_key: str
+    reader: Any
+    connection: Any
+    iterator: Iterator[tuple[Any, int, Any]]
+    prev_timestamp: int | None = None
+    prev_raw: Any | None = None
+    curr_timestamp: int | None = None
+    curr_raw: Any | None = None
+    cached_timestamp: int | None = None
+    cached_frame: np.ndarray | None = None
+
+
+class SkippedBag(RuntimeError):
+    """Raised when a bag should be skipped without failing the whole run."""
 
 
 def maybe_import_tqdm():
@@ -103,7 +181,7 @@ def require_binary(binary_name: str) -> None:
         )
 
 
-def require_rmbench_dependencies():
+def require_rosbag_decode_dependencies():
     missing: list[str] = []
     imported: dict[str, Any] = {}
 
@@ -115,140 +193,43 @@ def require_rmbench_dependencies():
         imported["cv2"] = cv2
 
     try:
-        import h5py  # type: ignore
+        from rosbags.highlevel import AnyReader  # type: ignore
     except Exception:
-        missing.append("h5py")
+        missing.append("rosbags")
     else:
-        imported["h5py"] = h5py
-
-    try:
-        import pyarrow as pa  # type: ignore
-        import pyarrow.parquet as pq  # type: ignore
-    except Exception:
-        missing.append("pyarrow")
-    else:
-        imported["pa"] = pa
-        imported["pq"] = pq
+        imported["AnyReader"] = AnyReader
 
     if missing:
         missing_text = ", ".join(missing)
         raise RuntimeError(
-            "RMBench conversion requires extra Python packages: "
+            "ROS bag conversion requires extra Python packages: "
             f"{missing_text}. Install them in the current environment first."
         )
 
-    return imported["cv2"], imported["h5py"], imported["pa"], imported["pq"]
+    return imported["cv2"], imported["AnyReader"]
+
+
+def require_output_dependencies():
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Dataset writing requires `pyarrow`. "
+            "Install it in the current environment first."
+        ) from exc
+    return pa, pq
 
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def extract_episode_id(path: Path) -> int:
-    match = EPISODE_FILE_RE.fullmatch(path.stem)
-    if match is None:
-        raise ValueError(f"Expected an episode file like `episode12.*`, got {path.name}")
-    return int(match.group(1))
-
-
-def dedupe_texts(values: list[str]) -> list[str]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        deduped.append(text)
-    return deduped
-
-
-def humanize_task_name(task_name: str) -> str:
-    return task_name.replace("_", " ").strip() or task_name
-
-
-def is_rmbench_demo_root(path: Path) -> bool:
-    return (
-        path.is_dir()
-        and (path / "data").is_dir()
-        and (path / "instructions").is_dir()
-    )
-
-
-def discover_rmbench_demo_roots(source_root: Path) -> list[tuple[str, Path]]:
-    resolved = source_root.expanduser().resolve()
-
-    if is_rmbench_demo_root(resolved):
-        return [(resolved.parent.name, resolved)]
-
-    direct_demo = resolved / "demo_clean"
-    if is_rmbench_demo_root(direct_demo):
-        return [(resolved.name, direct_demo)]
-
-    discovered: list[tuple[str, Path]] = []
-    for child in sorted(resolved.iterdir()):
-        if not child.is_dir() or child.name.startswith(".") or child.name == "__pycache__":
-            continue
-        demo_root = child / "demo_clean"
-        if is_rmbench_demo_root(demo_root):
-            discovered.append((child.name, demo_root))
-
-    if not discovered:
-        raise FileNotFoundError(
-            "Could not find any RMBench task directories under "
-            f"{resolved}. Expected child folders containing `demo_clean/data` "
-            "and `demo_clean/instructions`."
-        )
-    return discovered
-
-
-def resolve_episode_tasks(instruction_path: Path, *, fallback_task_name: str) -> tuple[str, tuple[str, ...]]:
-    payload = load_json(instruction_path)
-    seen_values = payload.get("seen", []) if isinstance(payload, dict) else []
-    unseen_values = payload.get("unseen", []) if isinstance(payload, dict) else []
-    task_candidates = dedupe_texts(
-        [str(value) for value in seen_values] + [str(value) for value in unseen_values]
-    )
-    if not task_candidates:
-        task_candidates = [humanize_task_name(fallback_task_name)]
-    return task_candidates[0], tuple(task_candidates)
-
-
-def collect_rmbench_task_groups(source_root: Path) -> dict[str, list[EpisodeSource]]:
-    grouped: dict[str, list[EpisodeSource]] = {}
-    for task_name, demo_root in discover_rmbench_demo_roots(source_root):
-        data_dir = demo_root / "data"
-        instruction_dir = demo_root / "instructions"
-        data_files = sorted(data_dir.glob("episode*.hdf5"), key=extract_episode_id)
-        if not data_files:
-            raise FileNotFoundError(f"No HDF5 episodes were found under {data_dir}.")
-
-        task_episodes: list[EpisodeSource] = []
-        for hdf5_path in data_files:
-            episode_id = extract_episode_id(hdf5_path)
-            instruction_path = instruction_dir / f"episode{episode_id}.json"
-            if not instruction_path.exists():
-                raise FileNotFoundError(
-                    "Instruction file is missing for RMBench episode: "
-                    f"{instruction_path}"
-                )
-            primary_task, task_candidates = resolve_episode_tasks(
-                instruction_path,
-                fallback_task_name=task_name,
-            )
-            task_episodes.append(
-                EpisodeSource(
-                    source_task=task_name,
-                    episode_id=episode_id,
-                    hdf5_path=hdf5_path.resolve(),
-                    instruction_path=instruction_path.resolve(),
-                    primary_task=primary_task,
-                    task_candidates=task_candidates,
-                )
-            )
-
-        grouped[task_name] = task_episodes
-    return grouped
+def maybe_get_load_average() -> float | None:
+    try:
+        return float(os.getloadavg()[0])
+    except (AttributeError, OSError):
+        return None
 
 
 def list_ffmpeg_encoders() -> set[str]:
@@ -280,7 +261,7 @@ def probe_video_encoder_runtime(encoder_name: str) -> tuple[bool, str]:
     probe_path: Path | None = None
     temp_dir: str | None = None
     try:
-        temp_dir = tempfile.mkdtemp(prefix="rmbench_ffmpeg_probe_")
+        temp_dir = tempfile.mkdtemp(prefix="rosbag_ffmpeg_probe_")
         probe_path = Path(temp_dir) / "probe.mp4"
         frame = np.zeros((16, 16, 3), dtype=np.uint8)
         command = [
@@ -330,6 +311,13 @@ def probe_video_encoder_runtime(encoder_name: str) -> tuple[bool, str]:
 def resolve_video_encoder(requested: str) -> tuple[str, str | None]:
     requested_text = str(requested).strip().lower()
     available_encoders = list_ffmpeg_encoders()
+    aliases = {
+        "cpu": "libx264",
+        "h264": "libx264",
+        "libx264": "libx264",
+        "hevc": "libx265",
+        "libx265": "libx265",
+    }
 
     if requested_text == "auto":
         for encoder_name in DEFAULT_GPU_VIDEO_ENCODERS:
@@ -367,45 +355,57 @@ def resolve_video_encoder(requested: str) -> tuple[str, str | None]:
             f"Available GPU-like encoders: {available_text}"
         )
 
-    if requested_text == "cpu":
-        return DEFAULT_CPU_VIDEO_ENCODER, None
-
-    if requested_text not in available_encoders:
+    resolved = aliases.get(requested_text, requested_text)
+    if resolved not in available_encoders:
         raise RuntimeError(
             f"Requested ffmpeg video encoder `{requested_text}` is not available."
         )
-    if is_gpu_video_encoder(requested_text):
-        is_usable, detail = probe_video_encoder_runtime(requested_text)
+    if is_gpu_video_encoder(resolved):
+        is_usable, detail = probe_video_encoder_runtime(resolved)
         if not is_usable:
             raise RuntimeError(
-                f"Requested GPU video encoder `{requested_text}` failed runtime probing. "
+                f"Requested GPU video encoder `{resolved}` failed runtime probing. "
                 f"Detail: {detail or 'unknown error'}"
             )
-    return requested_text, None
+    return resolved, None
 
 
 def resolve_worker_count(
     requested: int | str,
     *,
-    total_episodes: int,
+    total_bags: int,
     video_encoder: str,
-) -> int:
-    if total_episodes <= 0:
-        return 1
+) -> tuple[int, str | None]:
+    if total_bags <= 0:
+        return 1, None
 
     if isinstance(requested, int):
-        return max(1, min(int(requested), total_episodes))
+        return max(1, min(int(requested), total_bags)), None
 
     requested_text = str(requested).strip().lower()
     if requested_text != DEFAULT_WORKERS:
-        return max(1, min(int(requested_text), total_episodes))
+        return max(1, min(int(requested_text), total_bags)), None
 
     cpu_count = max(1, os.cpu_count() or 1)
-    if is_gpu_video_encoder(video_encoder):
-        # Each episode launches three camera encoders, so keep the default
-        # conservative to avoid exhausting NVENC session limits.
-        return max(1, min(1, total_episodes))
-    return max(1, min(4, cpu_count, total_episodes))
+    load1 = maybe_get_load_average()
+    if load1 is None:
+        available_cpu = cpu_count
+    else:
+        available_cpu = max(1, int(math.floor(cpu_count - load1)))
+
+    divisor = 12 if is_gpu_video_encoder(video_encoder) else 8
+    estimated_workers = max(1, available_cpu // divisor)
+    if cpu_count >= 16 and estimated_workers < 2:
+        estimated_workers = 2
+    cap = 2 if is_gpu_video_encoder(video_encoder) else 6
+    resolved = max(1, min(total_bags, cap, estimated_workers))
+    notice = (
+        "Auto worker selection: "
+        f"cpu_count={cpu_count}, "
+        f"load1={'n/a' if load1 is None else f'{load1:.2f}'}, "
+        f"available_cpu={available_cpu} -> workers={resolved}"
+    )
+    return resolved, notice
 
 
 def start_ffmpeg_raw_writer(
@@ -436,8 +436,11 @@ def start_ffmpeg_raw_writer(
         "-c:v",
         video_encoder,
     ]
+
     if video_encoder == "libx264":
         command.extend(["-preset", "medium", "-crf", "23"])
+    elif video_encoder == "libx265":
+        command.extend(["-preset", "medium", "-crf", "28"])
     elif video_encoder == "h264_nvenc":
         command.extend(["-preset", "p4", "-tune", "hq", "-cq", "23"])
     elif video_encoder == "hevc_nvenc":
@@ -488,16 +491,53 @@ def ffprobe_video(video_path: Path) -> dict[str, Any]:
     }
 
 
-def build_stats(values: np.ndarray | list[float]) -> dict[str, Any]:
-    array = np.asarray(values)
+def init_vector_stats_accumulator(num_features: int) -> dict[str, Any]:
+    if num_features <= 0:
+        raise ValueError(f"`num_features` must be positive, got {num_features}.")
+    return {
+        "sum": np.zeros((num_features,), dtype=np.float64),
+        "sumsq": np.zeros((num_features,), dtype=np.float64),
+        "min": np.full((num_features,), np.inf, dtype=np.float64),
+        "max": np.full((num_features,), -np.inf, dtype=np.float64),
+        "count": 0,
+    }
+
+
+def update_vector_stats_accumulator(accumulator: dict[str, Any], values: np.ndarray) -> None:
+    array = np.asarray(values, dtype=np.float32)
     if array.ndim == 1:
         array = array[:, None]
+    if array.ndim != 2:
+        raise ValueError(f"Expected a 2D array, got shape={array.shape}.")
+    accumulator["sum"] += array.sum(axis=0, dtype=np.float64)
+    accumulator["sumsq"] += np.square(array, dtype=np.float64).sum(axis=0, dtype=np.float64)
+    accumulator["min"] = np.minimum(accumulator["min"], array.min(axis=0).astype(np.float64))
+    accumulator["max"] = np.maximum(accumulator["max"], array.max(axis=0).astype(np.float64))
+    accumulator["count"] += int(array.shape[0])
+
+
+def merge_vector_stats_accumulator(target: dict[str, Any], source: dict[str, Any]) -> None:
+    target["sum"] += source["sum"]
+    target["sumsq"] += source["sumsq"]
+    target["min"] = np.minimum(target["min"], source["min"])
+    target["max"] = np.maximum(target["max"], source["max"])
+    target["count"] += int(source["count"])
+
+
+def finalize_vector_stats(accumulator: dict[str, Any]) -> dict[str, Any]:
+    count = int(accumulator["count"])
+    if count <= 0:
+        raise ValueError("Vector stats accumulator is empty.")
+    mean = accumulator["sum"] / count
+    variance = accumulator["sumsq"] / count - np.square(mean, dtype=np.float64)
+    variance = np.maximum(variance, 0.0)
+    std = np.sqrt(variance, dtype=np.float64)
     return {
-        "min": array.min(axis=0).astype(np.float64).tolist(),
-        "max": array.max(axis=0).astype(np.float64).tolist(),
-        "mean": array.mean(axis=0).astype(np.float64).tolist(),
-        "std": array.std(axis=0).astype(np.float64).tolist(),
-        "count": [int(array.shape[0])],
+        "min": accumulator["min"].tolist(),
+        "max": accumulator["max"].tolist(),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "count": [count],
     }
 
 
@@ -572,55 +612,47 @@ def fixed_size_float_list_array(pa, values: np.ndarray):
     )
 
 
-def scalar_feature(dtype: str) -> dict[str, Any]:
-    return {"dtype": dtype, "shape": [1], "names": None}
+def scalar_feature(dtype: str, *, fps: int | None = None) -> dict[str, Any]:
+    feature: dict[str, Any] = {"dtype": dtype, "shape": [1], "names": None}
+    if fps is not None:
+        feature["fps"] = int(fps)
+    return feature
 
 
-def decode_rmbench_image(cv2, encoded: Any) -> np.ndarray:
-    if isinstance(encoded, np.ndarray) and encoded.dtype == np.uint8:
-        encoded_array = encoded.reshape(-1)
-    elif isinstance(encoded, (bytes, bytearray, np.bytes_)):
-        encoded_array = np.frombuffer(encoded, dtype=np.uint8)
-    else:
-        encoded_array = np.frombuffer(bytes(encoded), dtype=np.uint8)
-
-    frame = cv2.imdecode(encoded_array, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise RuntimeError("Failed to decode an RMBench JPEG frame from HDF5.")
-    if frame.shape[0] != DEFAULT_IMAGE_HEIGHT or frame.shape[1] != DEFAULT_IMAGE_WIDTH:
-        frame = cv2.resize(
-            frame,
-            (DEFAULT_IMAGE_WIDTH, DEFAULT_IMAGE_HEIGHT),
-            interpolation=cv2.INTER_AREA,
-        )
-    return np.ascontiguousarray(frame)
+def vector_feature(
+    dtype: str,
+    shape: list[int],
+    names: list[str] | None,
+    *,
+    fps: int | None = None,
+) -> dict[str, Any]:
+    feature: dict[str, Any] = {"dtype": dtype, "shape": shape, "names": names}
+    if fps is not None:
+        feature["fps"] = int(fps)
+    return feature
 
 
-def build_joint_state_matrix(h5_file) -> np.ndarray:
-    joint_group = h5_file["/joint_action"]
-    if "vector" in joint_group:
-        state_matrix = np.asarray(joint_group["vector"][()], dtype=np.float32)
-    else:
-        left_arm = np.asarray(joint_group["left_arm"][()], dtype=np.float32)
-        left_gripper = np.asarray(joint_group["left_gripper"][()], dtype=np.float32)[:, None]
-        right_arm = np.asarray(joint_group["right_arm"][()], dtype=np.float32)
-        right_gripper = np.asarray(joint_group["right_gripper"][()], dtype=np.float32)[:, None]
-        state_matrix = np.concatenate(
-            [left_arm, left_gripper, right_arm, right_gripper],
-            axis=1,
-        ).astype(np.float32, copy=False)
-
-    if state_matrix.ndim != 2:
-        raise RuntimeError(
-            "Expected RMBench joint_action data with shape (T, state_dim). "
-            f"Got shape={state_matrix.shape}."
-        )
-    if state_matrix.shape[0] < 2:
-        raise RuntimeError(
-            "Each RMBench episode must contain at least 2 timesteps to derive actions. "
-            f"Got shape={state_matrix.shape}."
-        )
-    return state_matrix
+def video_feature(
+    *,
+    video_info: dict[str, Any],
+    fps: int,
+) -> dict[str, Any]:
+    return {
+        "dtype": "video",
+        "shape": [3, int(video_info["height"]), int(video_info["width"])],
+        "names": ["channels", "height", "width"],
+        "fps": int(fps),
+        "info": {
+            "video.height": int(video_info["height"]),
+            "video.width": int(video_info["width"]),
+            "video.codec": str(video_info["codec"]),
+            "video.pix_fmt": str(video_info["pix_fmt"]),
+            "video.is_depth_map": False,
+            "video.fps": int(fps),
+            "video.channels": 3,
+            "has_audio": False,
+        },
+    }
 
 
 def write_tasks_tables(pa, pq, *, output_root: Path, task_index_by_text: dict[str, int]) -> None:
@@ -742,183 +774,639 @@ def validate_episode_ranges(*, total_frames: int, episodes_meta: list[dict[str, 
         )
 
 
-def build_split_spec(total_episodes: int, train_ratio: float) -> dict[str, str]:
-    if total_episodes <= 0:
-        raise ValueError("`total_episodes` must be positive.")
-    if total_episodes == 1:
-        return {"train": "0:1"}
-    if not 0.0 < train_ratio < 1.0:
-        raise ValueError(f"`train_ratio` must lie in (0, 1), got {train_ratio}.")
-    train_count = int(round(total_episodes * train_ratio))
-    train_count = min(max(1, train_count), total_episodes - 1)
-    return {
-        "train": f"0:{train_count}",
-        "val": f"{train_count}:{total_episodes}",
-    }
+def normalize_optional_topic(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in {"none", "null", "disable", "disabled", "false", "off"}:
+        return None
+    return text
 
 
-def convert_one_rmbench_episode(
+def safe_video_key_filename(video_key: str) -> str:
+    return video_key.replace("/", "__").replace(".", "_") + ".mp4"
+
+
+def collect_bag_files(source_path: Path, bag_glob: str) -> list[Path]:
+    resolved = source_path.expanduser().resolve()
+    if resolved.is_file():
+        if resolved.suffix != ".bag":
+            raise ValueError(f"Expected a `.bag` file, got {resolved}.")
+        return [resolved]
+
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Source path does not exist: {resolved}")
+
+    bag_files = sorted(path.resolve() for path in resolved.glob(bag_glob) if path.is_file())
+    if not bag_files:
+        raise FileNotFoundError(
+            f"No `.bag` files matched `{bag_glob}` under {resolved}."
+        )
+    return bag_files
+
+
+def nearest_indices(times: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    if times.size == 0:
+        raise ValueError("`times` must not be empty.")
+    right = np.searchsorted(times, targets, side="left")
+    right_clipped = np.clip(right, 0, times.size - 1)
+    left = np.clip(right - 1, 0, times.size - 1)
+    choose_left = (right > 0) & (
+        (right == times.size)
+        | (np.abs(times[right_clipped] - targets) >= np.abs(targets - times[left]))
+    )
+    return np.where(choose_left, left, right_clipped).astype(np.int64, copy=False)
+
+
+def extract_joint_positions(msg: Any, *, dof: int) -> np.ndarray:
+    positions = list(msg.position)
+    if len(positions) >= dof:
+        values = positions[:dof]
+    else:
+        values = positions + [0.0] * (dof - len(positions))
+    return np.asarray(values, dtype=np.float32)
+
+
+def extract_base_velocity(msg: Any) -> np.ndarray:
+    twist = msg.twist.twist
+    return np.asarray(
+        [twist.linear.x, twist.linear.y, twist.angular.z],
+        dtype=np.float32,
+    )
+
+
+def decode_compressed_image(
+    cv2,
+    msg: Any,
     *,
-    episode_index: int,
-    episode: EpisodeSource,
-    output_root: Path,
-    fps: int,
-    video_encoder: str,
-    progress_slots: queue.SimpleQueue[int] | None,
-    tqdm_cls,
-) -> EpisodeConversionResult:
-    cv2, h5py, _, _ = require_rmbench_dependencies()
-    video_keys = [
-        f"observation.images.{camera_name}"
-        for camera_name in RMbench_RAW_CAMERA_TO_LEROBOT.values()
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    encoded_array = np.frombuffer(msg.data, dtype=np.uint8)
+    frame = cv2.imdecode(encoded_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError("Failed to decode a compressed ROS image.")
+    if frame.shape[1] != image_width or frame.shape[0] != image_height:
+        frame = cv2.resize(
+            frame,
+            (image_width, image_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    return np.ascontiguousarray(frame)
+
+
+def build_connection_map(reader: Any, topics: list[str]) -> dict[str, Any]:
+    topic_set = set(topics)
+    connection_map: dict[str, Any] = {}
+    for connection in reader.connections:
+        if connection.topic in topic_set and connection.topic not in connection_map:
+            connection_map[connection.topic] = connection
+    return connection_map
+
+
+def collect_low_dim_streams(bag_path: Path, config: ConversionConfig) -> LowDimStreams:
+    _, AnyReader = require_rosbag_decode_dependencies()
+    topics = config.topics
+
+    with AnyReader([bag_path]) as reader:
+        connection_map = build_connection_map(reader, topics.all_topics())
+        missing_required = [
+            topic for topic in topics.required_topics() if topic not in connection_map
+        ]
+        if missing_required:
+            raise SkippedBag(
+                "Bag is missing required topics: " + ", ".join(sorted(missing_required))
+            )
+
+        camera_bounds: dict[str, list[int | None]] = {
+            topic: [None, None] for topic, _ in topics.camera_topic_pairs()
+        }
+        state_left_times: list[int] = []
+        state_left_values: list[np.ndarray] = []
+        state_right_times: list[int] = []
+        state_right_values: list[np.ndarray] = []
+        action_left_times: list[int] = []
+        action_left_values: list[np.ndarray] = []
+        action_right_times: list[int] = []
+        action_right_values: list[np.ndarray] = []
+        odom_times: list[int] = []
+        odom_values: list[np.ndarray] = []
+
+        selected_connections = list(connection_map.values())
+        for connection, timestamp, raw in reader.messages(connections=selected_connections):
+            topic = connection.topic
+            if topic in camera_bounds:
+                if camera_bounds[topic][0] is None:
+                    camera_bounds[topic][0] = int(timestamp)
+                camera_bounds[topic][1] = int(timestamp)
+                continue
+
+            msg = reader.deserialize(raw, connection.msgtype)
+            if topic == topics.state_left_topic:
+                state_left_times.append(int(timestamp))
+                state_left_values.append(extract_joint_positions(msg, dof=config.arm_dof))
+            elif topic == topics.state_right_topic:
+                state_right_times.append(int(timestamp))
+                state_right_values.append(extract_joint_positions(msg, dof=config.arm_dof))
+            elif topic == topics.action_left_topic:
+                action_left_times.append(int(timestamp))
+                action_left_values.append(extract_joint_positions(msg, dof=config.arm_dof))
+            elif topic == topics.action_right_topic:
+                action_right_times.append(int(timestamp))
+                action_right_values.append(extract_joint_positions(msg, dof=config.arm_dof))
+            elif topics.odom_topic and topic == topics.odom_topic:
+                odom_times.append(int(timestamp))
+                odom_values.append(extract_base_velocity(msg))
+
+    missing_camera_bounds = [
+        topic
+        for topic, bounds in camera_bounds.items()
+        if bounds[0] is None or bounds[1] is None
     ]
-    image_stats_by_key = {
-        video_key: init_image_stats_accumulator(num_channels=3) for video_key in video_keys
-    }
-    progress_slot: int | None = None
-    progress_bar = None
+    if missing_camera_bounds:
+        raise SkippedBag(
+            "Bag is missing camera data on topics: "
+            + ", ".join(sorted(missing_camera_bounds))
+        )
+
+    if not state_left_times or not state_right_times or not action_left_times or not action_right_times:
+        raise SkippedBag("Bag is missing required state/action messages.")
+
+    return LowDimStreams(
+        camera_bounds={
+            topic: (int(bounds[0]), int(bounds[1]))  # type: ignore[arg-type]
+            for topic, bounds in camera_bounds.items()
+        },
+        state_left_times=np.asarray(state_left_times, dtype=np.int64),
+        state_left_values=np.asarray(state_left_values, dtype=np.float32),
+        state_right_times=np.asarray(state_right_times, dtype=np.int64),
+        state_right_values=np.asarray(state_right_values, dtype=np.float32),
+        action_left_times=np.asarray(action_left_times, dtype=np.int64),
+        action_left_values=np.asarray(action_left_values, dtype=np.float32),
+        action_right_times=np.asarray(action_right_times, dtype=np.int64),
+        action_right_values=np.asarray(action_right_values, dtype=np.float32),
+        odom_times=np.asarray(odom_times, dtype=np.int64),
+        odom_values=np.asarray(odom_values, dtype=np.float32),
+    )
+
+
+def build_sample_times(streams: LowDimStreams, config: ConversionConfig) -> np.ndarray:
+    starts = [
+        streams.camera_bounds[config.topics.camera_top_topic][0],
+        streams.camera_bounds[config.topics.camera_left_topic][0],
+        streams.camera_bounds[config.topics.camera_right_topic][0],
+        int(streams.state_left_times[0]),
+        int(streams.state_right_times[0]),
+        int(streams.action_left_times[0]),
+        int(streams.action_right_times[0]),
+    ]
+    ends = [
+        streams.camera_bounds[config.topics.camera_top_topic][1],
+        streams.camera_bounds[config.topics.camera_left_topic][1],
+        streams.camera_bounds[config.topics.camera_right_topic][1],
+        int(streams.state_left_times[-1]),
+        int(streams.state_right_times[-1]),
+        int(streams.action_left_times[-1]),
+        int(streams.action_right_times[-1]),
+    ]
+    if streams.odom_times.size > 0:
+        starts.append(int(streams.odom_times[0]))
+        ends.append(int(streams.odom_times[-1]))
+
+    t_start = max(starts)
+    t_end = min(ends)
+    if t_end <= t_start:
+        raise SkippedBag(
+            f"Bag has no overlapping time window across required topics. start={t_start}, end={t_end}"
+        )
+
+    duration_s = (t_end - t_start) / 1e9
+    frame_count = int(duration_s * config.fps)
+    if frame_count < 2:
+        raise SkippedBag(
+            f"Bag is too short after alignment ({duration_s:.3f}s, {frame_count} frames)."
+        )
+    return np.linspace(t_start, t_end, frame_count, dtype=np.int64)
+
+
+def open_camera_cursor(
+    *,
+    stack: ExitStack,
+    bag_path: Path,
+    AnyReader,
+    topic: str,
+    video_key: str,
+) -> CameraCursor:
+    reader = stack.enter_context(AnyReader([bag_path]))
+    connection_map = build_connection_map(reader, [topic])
+    connection = connection_map.get(topic)
+    if connection is None:
+        raise SkippedBag(f"Bag is missing camera topic `{topic}`.")
+    iterator = reader.messages(connections=[connection])
+    cursor = CameraCursor(
+        topic=topic,
+        video_key=video_key,
+        reader=reader,
+        connection=connection,
+        iterator=iterator,
+    )
+    advance_camera_cursor(cursor)
+    if cursor.curr_timestamp is None:
+        raise SkippedBag(f"Bag camera topic `{topic}` does not contain any messages.")
+    return cursor
+
+
+def advance_camera_cursor(cursor: CameraCursor) -> bool:
+    try:
+        _, timestamp, raw = next(cursor.iterator)
+    except StopIteration:
+        cursor.curr_timestamp = None
+        cursor.curr_raw = None
+        return False
+    cursor.curr_timestamp = int(timestamp)
+    cursor.curr_raw = raw
+    return True
+
+
+def select_camera_message(cursor: CameraCursor, sample_time: int) -> tuple[int, Any]:
+    while cursor.curr_timestamp is not None and cursor.curr_timestamp < sample_time:
+        cursor.prev_timestamp = cursor.curr_timestamp
+        cursor.prev_raw = cursor.curr_raw
+        advance_camera_cursor(cursor)
+
+    if cursor.prev_timestamp is None:
+        if cursor.curr_timestamp is None or cursor.curr_raw is None:
+            raise RuntimeError(f"Camera topic `{cursor.topic}` has no message near {sample_time}.")
+        return cursor.curr_timestamp, cursor.curr_raw
+
+    if cursor.curr_timestamp is None or cursor.curr_raw is None:
+        if cursor.prev_raw is None:
+            raise RuntimeError(f"Camera topic `{cursor.topic}` exhausted unexpectedly.")
+        return cursor.prev_timestamp, cursor.prev_raw
+
+    if abs(cursor.curr_timestamp - sample_time) < abs(sample_time - cursor.prev_timestamp):
+        return cursor.curr_timestamp, cursor.curr_raw
+    if cursor.prev_raw is None:
+        raise RuntimeError(f"Camera topic `{cursor.topic}` lost previous frame cache.")
+    return cursor.prev_timestamp, cursor.prev_raw
+
+
+def decode_camera_frame_for_sample(
+    *,
+    cursor: CameraCursor,
+    sample_time: int,
+    cv2,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    chosen_timestamp, chosen_raw = select_camera_message(cursor, sample_time)
+    if cursor.cached_timestamp != chosen_timestamp:
+        msg = cursor.reader.deserialize(chosen_raw, cursor.connection.msgtype)
+        cursor.cached_frame = decode_compressed_image(
+            cv2,
+            msg,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        cursor.cached_timestamp = chosen_timestamp
+    if cursor.cached_frame is None:
+        raise RuntimeError(f"Camera topic `{cursor.topic}` failed to decode frame cache.")
+    return cursor.cached_frame
+
+
+def stage_episode_table(
+    *,
+    pa,
+    pq,
+    output_path: Path,
+    state_array: np.ndarray,
+    action_array: np.ndarray,
+    reward_array: np.ndarray,
+    done_array: np.ndarray,
+    success_array: np.ndarray,
+    timestamp_array: np.ndarray,
+    frame_index_array: np.ndarray,
+) -> None:
+    table = pa.Table.from_arrays(
+        [
+            fixed_size_float_list_array(pa, state_array),
+            fixed_size_float_list_array(pa, action_array),
+            pa.array(reward_array, type=pa.float32()),
+            pa.array(done_array, type=pa.bool_()),
+            pa.array(success_array, type=pa.bool_()),
+            pa.array(timestamp_array, type=pa.float32()),
+            pa.array(frame_index_array, type=pa.int64()),
+        ],
+        names=[
+            "observation.state",
+            "action",
+            "next.reward",
+            "next.done",
+            "next.success",
+            "timestamp",
+            "frame_index",
+        ],
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, output_path, compression="snappy")
+
+
+def convert_one_bag(task: WorkerTask) -> EpisodeArtifact:
+    start_time = time.time()
+    bag_path = Path(task.bag_path)
+    staging_root = Path(task.staging_root)
+    staging_dir = staging_root / f"bag-{task.bag_index:06d}"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        if progress_slots is not None:
-            progress_slot = progress_slots.get()
+        cv2, AnyReader = require_rosbag_decode_dependencies()
+        pa, pq = require_output_dependencies()
+        require_binary("ffmpeg")
 
-        with h5py.File(episode.hdf5_path, "r") as h5_file:
-            state_matrix = build_joint_state_matrix(h5_file)
-            frame_count = int(state_matrix.shape[0]) - 1
-            state_sequence = state_matrix[:-1].astype(np.float32, copy=False)
-            action_sequence = state_matrix[1:].astype(np.float32, copy=False)
+        streams = collect_low_dim_streams(bag_path, task.config)
+        sample_times = build_sample_times(streams, task.config)
+        frame_count = int(sample_times.shape[0])
+        state_dim = 3 + task.config.arm_dof * 2
 
-            if tqdm_cls is not None and progress_slot is not None:
-                progress_bar = tqdm_cls(
-                    total=frame_count,
-                    desc=f"ep {episode_index:03d} {episode.source_task}",
-                    position=progress_slot,
-                    leave=False,
-                    dynamic_ncols=True,
+        base_velocity = np.zeros((frame_count, 3), dtype=np.float32)
+        if streams.odom_times.size > 0:
+            odom_indices = nearest_indices(streams.odom_times, sample_times)
+            base_velocity = streams.odom_values[odom_indices]
+
+        state_left_indices = nearest_indices(streams.state_left_times, sample_times)
+        state_right_indices = nearest_indices(streams.state_right_times, sample_times)
+        action_left_indices = nearest_indices(streams.action_left_times, sample_times)
+        action_right_indices = nearest_indices(streams.action_right_times, sample_times)
+
+        state_array = np.empty((frame_count, state_dim), dtype=np.float32)
+        action_array = np.empty((frame_count, state_dim), dtype=np.float32)
+        split = 3 + task.config.arm_dof
+        state_array[:, :3] = base_velocity
+        state_array[:, 3:split] = streams.state_left_values[state_left_indices]
+        state_array[:, split:] = streams.state_right_values[state_right_indices]
+        action_array[:, :3] = base_velocity
+        action_array[:, 3:split] = streams.action_left_values[action_left_indices]
+        action_array[:, split:] = streams.action_right_values[action_right_indices]
+
+        reward_array = np.zeros((frame_count,), dtype=np.float32)
+        reward_array[-1] = 1.0
+        done_array = np.zeros((frame_count,), dtype=bool)
+        done_array[-1] = True
+        success_array = done_array.copy()
+        timestamp_array = np.arange(frame_count, dtype=np.float32) / float(task.config.fps)
+        frame_index_array = np.arange(frame_count, dtype=np.int64)
+
+        state_stats = init_vector_stats_accumulator(state_dim)
+        action_stats = init_vector_stats_accumulator(state_dim)
+        reward_stats = init_vector_stats_accumulator(1)
+        timestamp_stats = init_vector_stats_accumulator(1)
+        update_vector_stats_accumulator(state_stats, state_array)
+        update_vector_stats_accumulator(action_stats, action_array)
+        update_vector_stats_accumulator(reward_stats, reward_array)
+        update_vector_stats_accumulator(timestamp_stats, timestamp_array)
+
+        image_stats_by_key = {
+            video_key: init_image_stats_accumulator(num_channels=3)
+            for _, video_key in task.config.topics.camera_topic_pairs()
+        }
+        video_paths: dict[str, str] = {}
+
+        with ExitStack() as stack:
+            camera_cursors = [
+                open_camera_cursor(
+                    stack=stack,
+                    bag_path=bag_path,
+                    AnyReader=AnyReader,
+                    topic=topic,
+                    video_key=video_key,
+                )
+                for topic, video_key in task.config.topics.camera_topic_pairs()
+            ]
+            writers: dict[str, subprocess.Popen] = {}
+            for cursor in camera_cursors:
+                video_path = staging_dir / safe_video_key_filename(cursor.video_key)
+                video_paths[cursor.video_key] = str(video_path)
+                writers[cursor.video_key] = start_ffmpeg_raw_writer(
+                    video_path,
+                    width=task.config.image_width,
+                    height=task.config.image_height,
+                    fps=task.config.fps,
+                    video_encoder=task.video_encoder,
                 )
 
-            video_paths: dict[str, str] = {}
-            writer_by_key: dict[str, subprocess.Popen] = {}
             try:
-                for raw_camera_name, lerobot_camera_name in RMbench_RAW_CAMERA_TO_LEROBOT.items():
-                    video_key = f"observation.images.{lerobot_camera_name}"
-                    video_path = output_root / DEFAULT_VIDEO_PATH.format(
-                        video_key=video_key,
-                        chunk_index=0,
-                        file_index=episode_index,
-                    )
-                    video_paths[video_key] = str(video_path)
-                    writer_by_key[video_key] = start_ffmpeg_raw_writer(
-                        video_path,
-                        width=DEFAULT_IMAGE_WIDTH,
-                        height=DEFAULT_IMAGE_HEIGHT,
-                        fps=fps,
-                        video_encoder=video_encoder,
-                    )
-
-                for frame_index in range(frame_count):
-                    for raw_camera_name, lerobot_camera_name in RMbench_RAW_CAMERA_TO_LEROBOT.items():
-                        video_key = f"observation.images.{lerobot_camera_name}"
-                        encoded = h5_file[f"/observation/{raw_camera_name}/rgb"][frame_index]
-                        frame = decode_rmbench_image(cv2, encoded)
-                        writer = writer_by_key[video_key]
+                for sample_time in sample_times:
+                    for cursor in camera_cursors:
+                        frame = decode_camera_frame_for_sample(
+                            cursor=cursor,
+                            sample_time=int(sample_time),
+                            cv2=cv2,
+                            image_width=task.config.image_width,
+                            image_height=task.config.image_height,
+                        )
+                        writer = writers[cursor.video_key]
                         if writer.stdin is None:
-                            raise RuntimeError(f"ffmpeg stdin closed unexpectedly for {video_key}.")
+                            raise RuntimeError(
+                                f"ffmpeg stdin closed unexpectedly for {cursor.video_key}."
+                            )
                         writer.stdin.write(frame.tobytes())
-                        update_image_stats_accumulator(image_stats_by_key[video_key], frame)
-                    if progress_bar is not None:
-                        progress_bar.update(1)
+                        update_image_stats_accumulator(
+                            image_stats_by_key[cursor.video_key],
+                            frame,
+                        )
             finally:
-                for video_key, writer in writer_by_key.items():
+                for video_key, writer in writers.items():
                     if writer.stdin is not None and not writer.stdin.closed:
                         writer.stdin.close()
                     return_code = writer.wait()
                     if return_code != 0:
                         raise RuntimeError(
-                            f"ffmpeg failed while encoding {video_key} for episode {episode_index} "
+                            f"ffmpeg failed while encoding {video_key} for {bag_path.name} "
                             f"with exit code {return_code}."
                         )
 
-        return EpisodeConversionResult(
-            episode_index=int(episode_index),
-            source_task=episode.source_task,
-            source_episode_id=int(episode.episode_id),
-            primary_task=episode.primary_task,
-            task_candidates=episode.task_candidates,
-            frame_count=int(frame_count),
-            state_sequence=state_sequence,
-            action_sequence=action_sequence,
+        data_path = staging_dir / "episode.parquet"
+        stage_episode_table(
+            pa=pa,
+            pq=pq,
+            output_path=data_path,
+            state_array=state_array,
+            action_array=action_array,
+            reward_array=reward_array,
+            done_array=done_array,
+            success_array=success_array,
+            timestamp_array=timestamp_array,
+            frame_index_array=frame_index_array,
+        )
+
+        elapsed = time.time() - start_time
+        return EpisodeArtifact(
+            bag_index=task.bag_index,
+            bag_path=str(bag_path),
+            status="ready",
+            frame_count=frame_count,
+            elapsed_s=elapsed,
+            staging_dir=str(staging_dir),
+            data_path=str(data_path),
             video_paths=video_paths,
+            state_stats=state_stats,
+            action_stats=action_stats,
+            reward_stats=reward_stats,
+            timestamp_stats=timestamp_stats,
             image_stats_by_key=image_stats_by_key,
         )
-    finally:
-        if progress_bar is not None:
-            progress_bar.close()
-        if progress_slot is not None and progress_slots is not None:
-            progress_slots.put(progress_slot)
-
-
-def write_rmbench_collection_manifest(
-    *,
-    output_root: Path,
-    source_root: Path,
-    dataset_id: str,
-    task_groups: dict[str, list[EpisodeSource]],
-) -> None:
-    tasks_payload: list[dict[str, Any]] = []
-    total_episodes = 0
-    for task_name, episodes in sorted(task_groups.items()):
-        total_episodes += len(episodes)
-        tasks_payload.append(
-            {
-                "task_name": task_name,
-                "dataset_id": f"{dataset_id}/{task_name}",
-                "episode_count": int(len(episodes)),
-                "path": task_name,
-            }
+    except SkippedBag as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return EpisodeArtifact(
+            bag_index=task.bag_index,
+            bag_path=str(bag_path),
+            status="skipped",
+            frame_count=0,
+            elapsed_s=time.time() - start_time,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return EpisodeArtifact(
+            bag_index=task.bag_index,
+            bag_path=str(bag_path),
+            status="error",
+            frame_count=0,
+            elapsed_s=time.time() - start_time,
+            detail=f"{type(exc).__name__}: {exc}",
         )
 
-    payload = {
-        "source_format": "rmbench",
-        "source_path": str(source_root),
-        "dataset_id": str(dataset_id),
-        "storage": "per_task",
-        "task_datasets": tasks_payload,
-        "total_task_datasets": int(len(tasks_payload)),
-        "total_episodes": int(total_episodes),
+
+def finalize_episode_artifact(
+    *,
+    pa,
+    pq,
+    artifact: EpisodeArtifact,
+    output_root: Path,
+    final_episode_index: int,
+    global_frame_offset: int,
+    fps: int,
+    task_label: str,
+) -> tuple[int, dict[str, Any], dict[str, Path]]:
+    if artifact.data_path is None or artifact.video_paths is None or artifact.staging_dir is None:
+        raise RuntimeError("Episode artifact is incomplete and cannot be finalized.")
+
+    episode_table = pq.read_table(artifact.data_path)
+    frame_count = int(episode_table.num_rows)
+    if frame_count != artifact.frame_count:
+        raise RuntimeError(
+            "Episode parquet row count does not match artifact metadata. "
+            f"rows={frame_count}, artifact.frame_count={artifact.frame_count}"
+        )
+
+    final_table = episode_table
+    final_table = final_table.append_column(
+        "episode_index",
+        pa.array([final_episode_index] * frame_count, type=pa.int64()),
+    )
+    final_table = final_table.append_column(
+        "index",
+        pa.array(
+            list(range(global_frame_offset, global_frame_offset + frame_count)),
+            type=pa.int64(),
+        ),
+    )
+    final_table = final_table.append_column(
+        "task_index",
+        pa.array([0] * frame_count, type=pa.int64()),
+    )
+
+    data_output_path = output_root / DEFAULT_DATA_PATH.format(
+        chunk_index=0,
+        file_index=final_episode_index,
+    )
+    data_output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(final_table, data_output_path, compression="snappy")
+
+    moved_video_paths: dict[str, Path] = {}
+    for video_key, staging_video_path_text in artifact.video_paths.items():
+        staging_video_path = Path(staging_video_path_text)
+        final_video_path = output_root / DEFAULT_VIDEO_PATH.format(
+            video_key=video_key,
+            chunk_index=0,
+            file_index=final_episode_index,
+        )
+        final_video_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staging_video_path), str(final_video_path))
+        moved_video_paths[video_key] = final_video_path
+
+    episode_metadata: dict[str, Any] = {
+        "episode_index": int(final_episode_index),
+        "tasks": [task_label],
+        "length": int(frame_count),
+        "data/chunk_index": 0,
+        "data/file_index": int(final_episode_index),
+        "dataset_from_index": int(global_frame_offset),
+        "dataset_to_index": int(global_frame_offset + frame_count),
+        "meta/episodes/chunk_index": 0,
+        "meta/episodes/file_index": 0,
     }
-    (output_root / "collection.json").write_text(
-        json.dumps(payload, indent=4, ensure_ascii=False),
-        encoding="utf-8",
+    for video_key in moved_video_paths:
+        episode_metadata[f"videos/{video_key}/chunk_index"] = 0
+        episode_metadata[f"videos/{video_key}/file_index"] = int(final_episode_index)
+        episode_metadata[f"videos/{video_key}/from_timestamp"] = float(0.0)
+        episode_metadata[f"videos/{video_key}/to_timestamp"] = float(frame_count / fps)
+
+    shutil.rmtree(Path(artifact.staging_dir), ignore_errors=True)
+    return frame_count, episode_metadata, moved_video_paths
+
+
+def directory_size_in_mb(paths: list[Path]) -> int:
+    total_bytes = 0
+    for path in paths:
+        if path.exists():
+            total_bytes += int(path.stat().st_size)
+    if total_bytes <= 0:
+        return 0
+    return int(math.ceil(total_bytes / (1024 * 1024)))
+
+
+def build_state_feature_names(arm_dof: int) -> list[str]:
+    return (
+        ["base_vx", "base_vy", "base_omega"]
+        + [f"left_joint_{index}" for index in range(arm_dof)]
+        + [f"right_joint_{index}" for index in range(arm_dof)]
     )
 
 
-def convert_rmbench_task_dataset(
+def convert_dataset(
     *,
-    source_root: Path,
-    task_name: str,
-    episodes: list[EpisodeSource],
+    source_path: Path,
     dataset_id: str,
     output_root: Path,
+    task_label: str,
+    robot_type: str,
     fps: int,
-    train_ratio: float,
-    overwrite: bool,
+    image_width: int,
+    image_height: int,
+    arm_dof: int,
+    bag_glob: str,
     workers: int | str,
     video_encoder: str,
+    overwrite: bool,
+    topics: RosbagTopics,
 ) -> Path:
     require_binary("ffmpeg")
     require_binary("ffprobe")
-    _, _, pa, pq = require_rmbench_dependencies()
-    tqdm_cls = maybe_import_tqdm()
+    require_output_dependencies()
+    require_rosbag_decode_dependencies()
 
-    if not episodes:
-        raise RuntimeError(
-            f"No RMBench episodes were discovered for task `{task_name}` under {source_root}."
-        )
+    source_path = source_path.expanduser().resolve()
+    output_root = output_root.expanduser().resolve()
+    bag_files = collect_bag_files(source_path, bag_glob)
     resolved_video_encoder, encoder_notice = resolve_video_encoder(video_encoder)
-    resolved_workers = resolve_worker_count(
+    resolved_workers, worker_notice = resolve_worker_count(
         workers,
-        total_episodes=len(episodes),
+        total_bags=len(bag_files),
         video_encoder=resolved_video_encoder,
     )
 
@@ -930,276 +1418,257 @@ def convert_rmbench_task_dataset(
             )
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    staging_root = output_root / DEFAULT_STAGING_DIRNAME
+    staging_root.mkdir(parents=True, exist_ok=True)
 
-    video_keys = [
-        f"observation.images.{camera_name}"
-        for camera_name in RMbench_RAW_CAMERA_TO_LEROBOT.values()
-    ]
-    image_stats_by_key = {
-        video_key: init_image_stats_accumulator(num_channels=3) for video_key in video_keys
-    }
-    sample_video_path_by_key: dict[str, Path] = {}
-    task_index_by_text: dict[str, int] = {}
-    for episode in episodes:
-        task_index_by_text.setdefault(episode.primary_task, len(task_index_by_text))
-    records: dict[str, list[Any]] = {
-        "next.reward": [],
-        "next.done": [],
-        "next.success": [],
-        "timestamp": [],
-        "frame_index": [],
-        "episode_index": [],
-        "index": [],
-        "task_index": [],
-    }
-    state_rows: list[np.ndarray] = []
-    action_rows: list[np.ndarray] = []
-    episodes_meta: list[dict[str, Any]] = []
-    state_dim: int | None = None
-    global_frame_index = 0
+    config = ConversionConfig(
+        dataset_id=dataset_id,
+        task_label=task_label,
+        robot_type=robot_type,
+        fps=fps,
+        image_width=image_width,
+        image_height=image_height,
+        arm_dof=arm_dof,
+        topics=topics,
+    )
+    video_keys = [video_key for _, video_key in topics.camera_topic_pairs()]
+    state_dim = 3 + arm_dof * 2
 
-    source_task_names = sorted({episode.source_task for episode in episodes})
+    pa, pq = require_output_dependencies()
+    tqdm_cls = maybe_import_tqdm()
+
     print(
-        "Converting RMBench task dataset: "
-        f"source={source_root}, task={task_name}, episodes={len(episodes)}, "
-        f"dataset_id={dataset_id}, output={output_root}, "
-        f"video_encoder={resolved_video_encoder}, workers={resolved_workers}"
+        "Converting ROS bag dataset: "
+        f"source={source_path}, bags={len(bag_files)}, dataset_id={dataset_id}, "
+        f"output={output_root}, fps={fps}, encoder={resolved_video_encoder}"
     )
     if encoder_notice:
         print(f"[info] {encoder_notice}")
-    progress_slots: queue.SimpleQueue[int] | None = None
-    if tqdm_cls is not None:
-        progress_slots = queue.SimpleQueue()
-        for position in range(1, resolved_workers + 1):
-            progress_slots.put(position)
+    if worker_notice:
+        print(f"[info] {worker_notice}")
+
+    task_index_by_text = {task_label: 0}
+    episodes_meta: list[dict[str, Any]] = []
+    sample_video_path_by_key: dict[str, Path] = {}
+    finalized_data_paths: list[Path] = []
+    finalized_video_paths: list[Path] = []
+    global_frame_index = 0
+    saved_episodes = 0
+    skipped_episodes = 0
+    error_episodes = 0
+    error_messages: list[str] = []
+
+    state_stats = init_vector_stats_accumulator(state_dim)
+    action_stats = init_vector_stats_accumulator(state_dim)
+    reward_stats = init_vector_stats_accumulator(1)
+    timestamp_stats = init_vector_stats_accumulator(1)
+    image_stats_by_key = {
+        video_key: init_image_stats_accumulator(num_channels=3) for video_key in video_keys
+    }
 
     overall_progress = (
         None
         if tqdm_cls is None
         else tqdm_cls(
-            total=len(episodes),
-            desc=f"episodes {task_name}",
-            position=0,
+            total=len(bag_files),
+            desc="bags",
             leave=True,
             dynamic_ncols=True,
         )
     )
 
-    results_by_episode_index: dict[int, EpisodeConversionResult] = {}
+    pending_results: dict[int, EpisodeArtifact] = {}
+    next_bag_index_to_flush = 0
+    worker_tasks = [
+        WorkerTask(
+            bag_index=bag_index,
+            bag_path=str(bag_path),
+            staging_root=str(staging_root),
+            config=config,
+            video_encoder=resolved_video_encoder,
+        )
+        for bag_index, bag_path in enumerate(bag_files)
+    ]
+
+    def update_progress() -> None:
+        if overall_progress is not None:
+            overall_progress.set_postfix(
+                saved=saved_episodes,
+                skipped=skipped_episodes,
+                errors=error_episodes,
+                frames=global_frame_index,
+            )
+
     try:
-        with cf.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
-            futures = [
-                executor.submit(
-                    convert_one_rmbench_episode,
-                    episode_index=episode_index,
-                    episode=episode,
-                    output_root=output_root,
-                    fps=fps,
-                    video_encoder=resolved_video_encoder,
-                    progress_slots=progress_slots,
-                    tqdm_cls=tqdm_cls,
-                )
-                for episode_index, episode in enumerate(episodes)
-            ]
-            for future in cf.as_completed(futures):
-                result = future.result()
-                results_by_episode_index[result.episode_index] = result
-                if overall_progress is not None:
-                    overall_progress.update(1)
+        with cf.ProcessPoolExecutor(
+            max_workers=resolved_workers,
+            mp_context=mp.get_context("spawn"),
+            max_tasks_per_child=1,
+        ) as executor:
+            future_to_task = {
+                executor.submit(convert_one_bag, task): task for task in worker_tasks
+            }
+            for future in cf.as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    artifact = future.result()
+                except Exception as exc:
+                    artifact = EpisodeArtifact(
+                        bag_index=task.bag_index,
+                        bag_path=task.bag_path,
+                        status="error",
+                        frame_count=0,
+                        elapsed_s=0.0,
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+
+                pending_results[artifact.bag_index] = artifact
+
+                while next_bag_index_to_flush in pending_results:
+                    ready_artifact = pending_results.pop(next_bag_index_to_flush)
+                    if ready_artifact.status == "ready":
+                        if (
+                            ready_artifact.state_stats is None
+                            or ready_artifact.action_stats is None
+                            or ready_artifact.reward_stats is None
+                            or ready_artifact.timestamp_stats is None
+                            or ready_artifact.image_stats_by_key is None
+                        ):
+                            raise RuntimeError(
+                                f"Ready artifact for {ready_artifact.bag_path} is missing stats."
+                            )
+
+                        frame_count, episode_metadata, moved_video_paths = finalize_episode_artifact(
+                            pa=pa,
+                            pq=pq,
+                            artifact=ready_artifact,
+                            output_root=output_root,
+                            final_episode_index=saved_episodes,
+                            global_frame_offset=global_frame_index,
+                            fps=fps,
+                            task_label=task_label,
+                        )
+                        episodes_meta.append(episode_metadata)
+                        merge_vector_stats_accumulator(state_stats, ready_artifact.state_stats)
+                        merge_vector_stats_accumulator(action_stats, ready_artifact.action_stats)
+                        merge_vector_stats_accumulator(reward_stats, ready_artifact.reward_stats)
+                        merge_vector_stats_accumulator(timestamp_stats, ready_artifact.timestamp_stats)
+                        for video_key in video_keys:
+                            merge_image_stats_accumulator(
+                                image_stats_by_key[video_key],
+                                ready_artifact.image_stats_by_key[video_key],
+                            )
+                            sample_video_path_by_key.setdefault(video_key, moved_video_paths[video_key])
+                            finalized_video_paths.append(moved_video_paths[video_key])
+                        finalized_data_paths.append(
+                            output_root
+                            / DEFAULT_DATA_PATH.format(
+                                chunk_index=0,
+                                file_index=saved_episodes,
+                            )
+                        )
+                        saved_episodes += 1
+                        global_frame_index += frame_count
+                    elif ready_artifact.status == "skipped":
+                        skipped_episodes += 1
+                        if ready_artifact.detail:
+                            error_messages.append(
+                                f"[skip] {Path(ready_artifact.bag_path).name}: {ready_artifact.detail}"
+                            )
+                    else:
+                        error_episodes += 1
+                        if ready_artifact.detail:
+                            error_messages.append(
+                                f"[error] {Path(ready_artifact.bag_path).name}: {ready_artifact.detail}"
+                            )
+                        if ready_artifact.staging_dir:
+                            shutil.rmtree(Path(ready_artifact.staging_dir), ignore_errors=True)
+
+                    next_bag_index_to_flush += 1
+                    if overall_progress is not None:
+                        overall_progress.update(1)
+                    update_progress()
     finally:
         if overall_progress is not None:
             overall_progress.close()
 
-    for episode_index, episode in enumerate(episodes):
-        result = results_by_episode_index[episode_index]
-        task_index = task_index_by_text[result.primary_task]
-        episode_from_index = global_frame_index
+    shutil.rmtree(staging_root, ignore_errors=True)
 
-        if state_dim is None:
-            state_dim = int(result.state_sequence.shape[1])
-        elif int(result.state_sequence.shape[1]) != state_dim:
-            raise RuntimeError(
-                "All RMBench episodes must share the same state dimension. "
-                f"Expected {state_dim}, got {int(result.state_sequence.shape[1])} "
-                f"in episode_index={episode_index}."
-            )
-
-        state_rows.append(result.state_sequence)
-        action_rows.append(result.action_sequence)
-        episode_length = int(result.frame_count)
-        for frame_index in range(episode_length):
-            done = frame_index == episode_length - 1
-            success = done
-            records["next.reward"].append(float(1.0 if success else 0.0))
-            records["next.done"].append(bool(done))
-            records["next.success"].append(bool(success))
-            records["timestamp"].append(float(frame_index / fps))
-            records["frame_index"].append(int(frame_index))
-            records["episode_index"].append(int(episode_index))
-            records["index"].append(int(global_frame_index))
-            records["task_index"].append(int(task_index))
-            global_frame_index += 1
-
-        for video_key in video_keys:
-            merge_image_stats_accumulator(
-                image_stats_by_key[video_key],
-                result.image_stats_by_key[video_key],
-            )
-            sample_video_path_by_key.setdefault(video_key, Path(result.video_paths[video_key]))
-
-        episode_to_index = global_frame_index
-        episode_length = episode_to_index - episode_from_index
-        episode_metadata: dict[str, Any] = {
-            "episode_index": int(episode_index),
-            "tasks": list(result.task_candidates),
-            "length": int(episode_length),
-            "data/chunk_index": 0,
-            "data/file_index": 0,
-            "dataset_from_index": int(episode_from_index),
-            "dataset_to_index": int(episode_to_index),
-            "meta/episodes/chunk_index": 0,
-            "meta/episodes/file_index": 0,
-        }
-        for video_key in video_keys:
-            episode_metadata[f"videos/{video_key}/chunk_index"] = 0
-            episode_metadata[f"videos/{video_key}/file_index"] = int(episode_index)
-            episode_metadata[f"videos/{video_key}/from_timestamp"] = float(0.0)
-            episode_metadata[f"videos/{video_key}/to_timestamp"] = float(episode_length / fps)
-        episodes_meta.append(episode_metadata)
-
-    if state_dim is None:
-        raise RuntimeError("No RMBench frames were converted.")
-
-    validate_episode_ranges(
-        total_frames=global_frame_index,
-        episodes_meta=episodes_meta,
-    )
-
-    state_array = np.concatenate(state_rows, axis=0)
-    action_array = np.concatenate(action_rows, axis=0)
-    total_frames = int(state_array.shape[0])
-    total_episodes = int(len(episodes_meta))
-    if int(action_array.shape[0]) != total_frames:
+    if saved_episodes <= 0:
+        issue_summary = "\n".join(error_messages[:10])
         raise RuntimeError(
-            "State/action frame counts diverged during conversion. "
-            f"state_frames={total_frames}, action_frames={int(action_array.shape[0])}"
+            "No episodes were converted successfully."
+            + (f"\nFirst issues:\n{issue_summary}" if issue_summary else "")
         )
 
-    data_table = pa.Table.from_arrays(
-        [
-            fixed_size_float_list_array(pa, state_array),
-            fixed_size_float_list_array(pa, action_array),
-            pa.array(records["next.reward"], type=pa.float32()),
-            pa.array(records["next.done"], type=pa.bool_()),
-            pa.array(records["next.success"], type=pa.bool_()),
-            pa.array(records["timestamp"], type=pa.float32()),
-            pa.array(records["frame_index"], type=pa.int64()),
-            pa.array(records["episode_index"], type=pa.int64()),
-            pa.array(records["index"], type=pa.int64()),
-            pa.array(records["task_index"], type=pa.int64()),
-        ],
-        names=[
-            "observation.state",
-            "action",
-            "next.reward",
-            "next.done",
-            "next.success",
-            "timestamp",
-            "frame_index",
-            "episode_index",
-            "index",
-            "task_index",
-        ],
-    )
-    data_output_path = output_root / DEFAULT_DATA_PATH.format(chunk_index=0, file_index=0)
-    data_output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(data_table, data_output_path, compression="snappy")
-
-    write_episodes_table(
-        pa,
-        pq,
-        output_root=output_root,
-        episodes_meta=episodes_meta,
-        video_keys=video_keys,
-    )
-    write_tasks_tables(
-        pa,
-        pq,
-        output_root=output_root,
-        task_index_by_text=task_index_by_text,
-    )
+    validate_episode_ranges(total_frames=global_frame_index, episodes_meta=episodes_meta)
+    write_tasks_tables(pa, pq, output_root=output_root, task_index_by_text=task_index_by_text)
+    write_episodes_table(pa, pq, output_root=output_root, episodes_meta=episodes_meta, video_keys=video_keys)
 
     sample_video_info_by_key = {
-        video_key: ffprobe_video(sample_video_path_by_key[video_key]) for video_key in video_keys
+        video_key: ffprobe_video(sample_video_path_by_key[video_key])
+        for video_key in video_keys
     }
-    splits = build_split_spec(total_episodes, train_ratio)
-    state_feature_names = (
-        MOTOR_NAMES if state_dim == len(MOTOR_NAMES) else [f"joint_{index}" for index in range(state_dim)]
-    )
 
     info = {
         "codebase_version": "v3.0",
-        "robot_type": "aloha",
-        "source_format": "rmbench",
-        "source_path": str(source_root),
-        "source_task_names": source_task_names,
-        "dataset_id": str(dataset_id),
-        "total_episodes": total_episodes,
-        "total_frames": total_frames,
+        "robot_type": robot_type,
+        "source_format": "rosbag",
+        "source_path": str(source_path),
+        "dataset_id": dataset_id,
+        "task_label": task_label,
+        "total_episodes": int(saved_episodes),
+        "total_frames": int(global_frame_index),
         "total_tasks": int(len(task_index_by_text)),
-        "chunks_size": 1000,
-        "data_files_size_in_mb": 100,
-        "video_files_size_in_mb": 200,
+        "chunks_size": int(max(saved_episodes, 1)),
+        "data_files_size_in_mb": directory_size_in_mb(finalized_data_paths),
+        "video_files_size_in_mb": directory_size_in_mb(finalized_video_paths),
         "fps": int(fps),
         "video_encoder": resolved_video_encoder,
         "conversion_workers": int(resolved_workers),
-        "splits": splits,
+        "splits": {"train": f"0:{saved_episodes}"},
         "data_path": DEFAULT_DATA_PATH,
         "video_path": DEFAULT_VIDEO_PATH,
         "features": {
-            "observation.state": {
-                "dtype": "float32",
-                "shape": [int(state_dim)],
-                "names": state_feature_names,
-            },
-            "action": {
-                "dtype": "float32",
-                "shape": [int(state_dim)],
-                "names": state_feature_names,
-            },
-            "next.reward": scalar_feature("float32"),
-            "next.done": scalar_feature("bool"),
-            "next.success": scalar_feature("bool"),
+            "observation.state": vector_feature(
+                "float32",
+                [state_dim],
+                build_state_feature_names(arm_dof),
+                fps=fps,
+            ),
+            "action": vector_feature(
+                "float32",
+                [state_dim],
+                build_state_feature_names(arm_dof),
+                fps=fps,
+            ),
+            "next.reward": scalar_feature("float32", fps=fps),
+            "next.done": scalar_feature("bool", fps=fps),
+            "next.success": scalar_feature("bool", fps=fps),
             "timestamp": scalar_feature("float32"),
             "frame_index": scalar_feature("int64"),
             "episode_index": scalar_feature("int64"),
             "index": scalar_feature("int64"),
             "task_index": scalar_feature("int64"),
         },
+        "conversion_summary": {
+            "input_bags": int(len(bag_files)),
+            "saved_episodes": int(saved_episodes),
+            "skipped_episodes": int(skipped_episodes),
+            "error_episodes": int(error_episodes),
+        },
     }
     for video_key in video_keys:
-        video_info = sample_video_info_by_key[video_key]
-        info["features"][video_key] = {
-            "dtype": "video",
-            "shape": [video_info["height"], video_info["width"], 3],
-            "names": ["height", "width", "channels"],
-            "info": {
-                "video.height": video_info["height"],
-                "video.width": video_info["width"],
-                "video.codec": video_info["codec"],
-                "video.pix_fmt": video_info["pix_fmt"],
-                "video.is_depth_map": False,
-                "video.fps": int(fps),
-                "video.channels": 3,
-                "has_audio": False,
-            },
-        }
+        info["features"][video_key] = video_feature(
+            video_info=sample_video_info_by_key[video_key],
+            fps=fps,
+        )
 
     stats = {
-        "observation.state": build_stats(state_array),
-        "action": build_stats(action_array),
-        "next.reward": build_stats(np.asarray(records["next.reward"], dtype=np.float32)),
-        "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
+        "observation.state": finalize_vector_stats(state_stats),
+        "action": finalize_vector_stats(action_stats),
+        "next.reward": finalize_vector_stats(reward_stats),
+        "timestamp": finalize_vector_stats(timestamp_stats),
     }
     for video_key in video_keys:
         stats[video_key] = finalize_image_stats(image_stats_by_key[video_key])
@@ -1215,101 +1684,35 @@ def convert_rmbench_task_dataset(
         encoding="utf-8",
     )
 
-    print(
-        "Generated LeRobotDataset v3.0 at: "
-        f"{output_root.resolve()} "
-        f"(task={task_name}, episodes={total_episodes}, frames={total_frames}, tasks={len(task_index_by_text)})"
-    )
-    return output_root
-
-
-def convert_rmbench_dataset(
-    *,
-    source_root: Path,
-    dataset_id: str,
-    output_root: Path,
-    fps: int,
-    train_ratio: float,
-    overwrite: bool,
-    workers: int | str,
-    video_encoder: str,
-) -> Path:
-    require_binary("ffmpeg")
-    require_binary("ffprobe")
-    require_rmbench_dependencies()
-
-    source_root = source_root.expanduser().resolve()
-    output_root = output_root.expanduser().resolve()
-    task_groups = collect_rmbench_task_groups(source_root)
-    if not task_groups:
-        raise RuntimeError(f"No RMBench task directories were discovered under {source_root}.")
-
-    if output_root.exists():
-        if not overwrite:
-            raise FileExistsError(
-                f"Output directory already exists: {output_root}. "
-                "Pass `--overwrite` to replace it."
-            )
-        shutil.rmtree(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    total_episodes = sum(len(episodes) for episodes in task_groups.values())
-    print(
-        "Converting RMBench task collection: "
-        f"source={source_root}, task_datasets={len(task_groups)}, episodes={total_episodes}, "
-        f"dataset_id={dataset_id}, output={output_root}"
-    )
-
-    for task_name, episodes in sorted(task_groups.items()):
-        task_output_root = output_root / task_name
-        task_dataset_id = f"{dataset_id}/{task_name}"
-        convert_rmbench_task_dataset(
-            source_root=source_root,
-            task_name=task_name,
-            episodes=episodes,
-            dataset_id=task_dataset_id,
-            output_root=task_output_root,
-            fps=fps,
-            train_ratio=train_ratio,
-            overwrite=False,
-            workers=workers,
-            video_encoder=video_encoder,
+    if error_messages:
+        (meta_dir / "conversion_issues.log").write_text(
+            "\n".join(error_messages) + "\n",
+            encoding="utf-8",
         )
 
-    write_rmbench_collection_manifest(
-        output_root=output_root,
-        source_root=source_root,
-        dataset_id=dataset_id,
-        task_groups=task_groups,
-    )
     print(
-        "Generated RMBench task collection at: "
+        "Generated LeRobot v3 dataset at: "
         f"{output_root.resolve()} "
-        f"(task_datasets={len(task_groups)}, episodes={total_episodes})"
+        f"(episodes={saved_episodes}, frames={global_frame_index}, "
+        f"skipped={skipped_episodes}, errors={error_episodes})"
     )
     return output_root
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert external datasets into local LeRobot v3.0 datasets."
+        description="Convert ROS `.bag` files into a local LeRobot v3 dataset."
     )
     parser.add_argument(
         "source_path",
         type=Path,
-        help="Path to the source dataset root, for example `/path/to/RMBench/data`.",
-    )
-    parser.add_argument(
-        "--convert",
-        choices=SUPPORTED_CONVERTERS,
-        required=True,
-        help="Source dataset format to convert.",
+        help="Path to a `.bag` file or a directory containing bag files.",
     )
     parser.add_argument(
         "--dataset-id",
         type=str,
         required=True,
-        help="Logical dataset id used to name the local output dataset.",
+        help="Logical dataset id written into LeRobot metadata.",
     )
     parser.add_argument(
         "--output-dir",
@@ -1318,35 +1721,123 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional explicit output directory. Defaults to `main/data/<dataset-id>`.",
     )
     parser.add_argument(
+        "--task-label",
+        type=str,
+        default="pick",
+        help="Task text written into the dataset task table.",
+    )
+    parser.add_argument(
+        "--robot-type",
+        type=str,
+        default="zeno",
+        help="Robot type written into LeRobot metadata.",
+    )
+    parser.add_argument(
         "--fps",
         type=int,
         default=DEFAULT_FPS,
-        help="Target FPS for the converted LeRobot videos.",
+        help="Target FPS for resampling and encoded videos.",
     )
     parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=DEFAULT_TRAIN_RATIO,
-        help="Fraction of episodes assigned to the contiguous `train` split.",
+        "--image-width",
+        type=int,
+        default=DEFAULT_IMAGE_WIDTH,
+        help="Target image width for encoded videos.",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=DEFAULT_IMAGE_HEIGHT,
+        help="Target image height for encoded videos.",
+    )
+    parser.add_argument(
+        "--arm-dof",
+        type=int,
+        default=DEFAULT_ARM_DOF,
+        help="Arm degrees of freedom used for left/right state and action vectors.",
+    )
+    parser.add_argument(
+        "--bag-glob",
+        type=str,
+        default="*.bag",
+        help="Glob used when `source_path` is a directory.",
     )
     parser.add_argument(
         "--workers",
         type=str,
         default=DEFAULT_WORKERS,
-        help='Episode conversion parallelism. Pass a positive integer or "auto".',
+        help='Parallel worker count. Pass a positive integer or "auto".',
     )
     parser.add_argument(
         "--video-encoder",
         type=str,
         default=DEFAULT_VIDEO_ENCODER,
-        help='ffmpeg video encoder. Use "auto", "gpu", "cpu", or an exact encoder name.',
+        help='ffmpeg encoder. Use "auto", "gpu", "cpu", or an exact encoder name.',
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace the output directory if it already exists.",
     )
+    parser.add_argument(
+        "--camera-top-topic",
+        type=str,
+        default=DEFAULT_CAMERA_TOP_TOPIC,
+        help="ROS topic for the top camera compressed image stream.",
+    )
+    parser.add_argument(
+        "--camera-left-topic",
+        type=str,
+        default=DEFAULT_CAMERA_LEFT_TOPIC,
+        help="ROS topic for the left camera compressed image stream.",
+    )
+    parser.add_argument(
+        "--camera-right-topic",
+        type=str,
+        default=DEFAULT_CAMERA_RIGHT_TOPIC,
+        help="ROS topic for the right camera compressed image stream.",
+    )
+    parser.add_argument(
+        "--state-left-topic",
+        type=str,
+        default=DEFAULT_STATE_LEFT_TOPIC,
+        help="ROS topic for the left arm state stream.",
+    )
+    parser.add_argument(
+        "--state-right-topic",
+        type=str,
+        default=DEFAULT_STATE_RIGHT_TOPIC,
+        help="ROS topic for the right arm state stream.",
+    )
+    parser.add_argument(
+        "--action-left-topic",
+        type=str,
+        default=DEFAULT_ACTION_LEFT_TOPIC,
+        help="ROS topic for the left arm teleop action stream.",
+    )
+    parser.add_argument(
+        "--action-right-topic",
+        type=str,
+        default=DEFAULT_ACTION_RIGHT_TOPIC,
+        help="ROS topic for the right arm teleop action stream.",
+    )
+    parser.add_argument(
+        "--odom-topic",
+        type=str,
+        default=DEFAULT_ODOM_TOPIC,
+        help='ROS topic for base odometry. Pass "none" to disable odom ingestion.',
+    )
     return parser
+
+
+def parse_workers_arg(value: str) -> int | str:
+    text = str(value).strip().lower()
+    if text == DEFAULT_WORKERS:
+        return text
+    parsed = int(text)
+    if parsed <= 0:
+        raise ValueError("`--workers` must be a positive integer or `auto`.")
+    return parsed
 
 
 def main() -> None:
@@ -1359,20 +1850,33 @@ def main() -> None:
         else DEFAULT_OUTPUT_ROOT / args.dataset_id.replace("/", "_")
     )
 
-    if args.convert == "rmbench":
-        convert_rmbench_dataset(
-            source_root=args.source_path,
-            dataset_id=args.dataset_id,
-            output_root=output_dir,
-            fps=int(args.fps),
-            train_ratio=float(args.train_ratio),
-            overwrite=bool(args.overwrite),
-            workers=args.workers,
-            video_encoder=str(args.video_encoder),
-        )
-        return
+    topics = RosbagTopics(
+        camera_top_topic=str(args.camera_top_topic),
+        camera_left_topic=str(args.camera_left_topic),
+        camera_right_topic=str(args.camera_right_topic),
+        state_left_topic=str(args.state_left_topic),
+        state_right_topic=str(args.state_right_topic),
+        action_left_topic=str(args.action_left_topic),
+        action_right_topic=str(args.action_right_topic),
+        odom_topic=normalize_optional_topic(args.odom_topic),
+    )
 
-    raise ValueError(f"Unsupported converter: {args.convert}")
+    convert_dataset(
+        source_path=args.source_path,
+        dataset_id=str(args.dataset_id),
+        output_root=output_dir,
+        task_label=str(args.task_label),
+        robot_type=str(args.robot_type),
+        fps=int(args.fps),
+        image_width=int(args.image_width),
+        image_height=int(args.image_height),
+        arm_dof=int(args.arm_dof),
+        bag_glob=str(args.bag_glob),
+        workers=parse_workers_arg(args.workers),
+        video_encoder=str(args.video_encoder),
+        overwrite=bool(args.overwrite),
+        topics=topics,
+    )
 
 
 if __name__ == "__main__":

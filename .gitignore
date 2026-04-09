@@ -1,6 +1,8 @@
 outputs/
 data/*
 !data/*.py
+!data/README.md
+!data/hfd.sh
 **/__pycache__/
 *.npz
 .cache
