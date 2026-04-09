@@ -55,4 +55,4 @@ dependencies:
       - uvicorn[standard]>=0.30,<1.0
       - wandb>=0.24,<0.25
       - -e ./depends/signatory
-      - -e ./policy/lerobot_policy_streaming_act
+      - -e ./policy/lerobot_policy_streaming_act --no-build-isolation
