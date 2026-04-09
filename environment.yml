@@ -1,0 +1,58 @@
+# Curated from static-import scanning under `main/` and versions already
+# validated in the local `corl-py312` environment on 2026-04-09.
+#
+# Scope:
+# - training / eval
+# - dataset download / conversion / processing
+# - deploy bridge + policy runtime
+# - monitor web UI
+#
+# Notes:
+# - Run `conda env create -f main/environment.corl-py312.yml` from the repo root
+#   so the editable local policy package path resolves correctly.
+# - The ROS1 adapter still requires a sourced system ROS1 installation.
+#   `rospy`, `sensor_msgs`, `nav_msgs`, `trajectory_msgs`, and
+#   `geometry_msgs` are not reliably provided by Conda, so they are not
+#   declared here.
+# - If you do not use `signature_backend=signatory` or
+#   `video_backend=torchcodec`, you can remove `signatory` / `torchcodec`
+#   to simplify installation.
+
+name: sism-py312
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pip>=26
+  - ffmpeg=4.4.*
+  - numpy>=2.2,<2.3
+  - pandas>=3.0,<3.1
+  - pyarrow>=23,<24
+  - matplotlib>=3.10,<3.11
+  - scikit-learn>=1.8,<1.9
+  - pyyaml>=6,<7
+  - pyzmq>=26,<27
+  - pip:
+      - accelerate>=1.13,<2
+      - datasets>=4.7,<5
+      - einops>=0.8,<0.9
+      - fastapi>=0.115,<1.0
+      - fsspec>=2026.2,<2027
+      - gymnasium>=0.29,<0.30
+      - huggingface-hub>=1.9,<2
+      - jinja2>=3.1,<4.0
+      - lerobot==0.5.0
+      - metaworld>=3.0,<3.1
+      - mujoco>=3.6,<3.7
+      - opencv-python-headless>=4.11,<4.13
+      - robot-descriptions>=1.23,<2
+      - rosbags>=0.11,<0.12
+      - signatory==1.2.7
+      - torch==2.9.1
+      - torchcodec>=0.9,<0.10
+      - torchvision==0.24.1
+      - tqdm>=4.67,<5
+      - uvicorn[standard]>=0.30,<1.0
+      - wandb>=0.24,<0.25
+      - -e ./policy/lerobot_policy_streaming_act
