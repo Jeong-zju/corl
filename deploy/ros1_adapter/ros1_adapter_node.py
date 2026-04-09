@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from deploy.bridge.protocol import RobotCommandPacket, SensorPacket, decode_packet
-from deploy.ros1_adapter.ros_publishers import BaseTwistPublisher, JointTrajectoryCommandPublisher
+from deploy.ros1_adapter.ros_publishers import ArmCommandPublisher, BaseTwistPublisher
 from deploy.ros1_adapter.ros_topics import (
     ImageTopicConfig,
     JointStateTopicConfig,
@@ -107,8 +107,8 @@ class Ros1BridgeAdapter:
             rcv_hwm=16,
         )
 
-        self._left_arm_publisher = JointTrajectoryCommandPublisher(self.config.left_arm_command)
-        self._right_arm_publisher = JointTrajectoryCommandPublisher(self.config.right_arm_command)
+        self._left_arm_publisher = ArmCommandPublisher(self.config.left_arm_command)
+        self._right_arm_publisher = ArmCommandPublisher(self.config.right_arm_command)
         self._base_publisher = (
             BaseTwistPublisher(self.config.base_command)
             if self.config.base_command.enabled

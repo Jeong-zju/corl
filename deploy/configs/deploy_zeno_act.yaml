@@ -4,10 +4,10 @@ bridge:
   control_bind: "tcp://*:5559"
   policy_endpoint: "tcp://127.0.0.1:5555"
   policy_control_endpoint: "tcp://127.0.0.1:5558"
-  policy_type: "streaming_act"
+  policy_type: "act"
   control_rate_hz: 30.0
   policy_request_timeout_ms: 80
-  signature_backend: "signatory"
+  signature_backend: "auto"
   signature_depth: 3
   max_skew_ms: 150
   left_arm_dim: 7
