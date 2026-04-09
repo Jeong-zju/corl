@@ -24,12 +24,12 @@ bridge:
     observation.images.realsense_left: "realsense_left"
     observation.images.realsense_right: "realsense_right"
   freshness_ms:
-    odom: 20
-    left_arm_joint_state: 20
-    right_arm_joint_state: 20
-    realsense_top: 50
-    realsense_left: 50
-    realsense_right: 50
+    odom: 100
+    left_arm_joint_state: 100
+    right_arm_joint_state: 100
+    realsense_top: 100
+    realsense_left: 100
+    realsense_right: 100
 
 ros1:
   node_name: "policy_bridge_ros1_adapter"
