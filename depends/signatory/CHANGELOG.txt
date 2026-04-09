@@ -1,0 +1,125 @@
+1.2.7
+-----
+Added support for PyTorch 1.10.0, 1.10.1, 1.11.0
+Dropped support for Python 3.6
+Dropped support for Pytorch < 1.10.0
+
+1.2.6
+-----
+Added support for PyTorch 1.8.0, 1.8.1, 1.9.0 and Python 3.9.
+
+1.2.5
+-----
+Added signature inversion
+
+1.2.4
+-----
+Added support for PyTorch 1.7.0, 1.7.1
+Dropped support for Python 2.7, 3.5
+Dropped support for PyTorch <1.6.0
+Dropped support for MacOS
+
+1.2.3
+-----
+Added support for PyTorch 1.6.0
+
+1.2.2
+-----
+Added support for PyTorch 1.5.1
+Fixed a bug that was introduced due to a backwards incompatibility introduced in PyTorch 1.5.0.
+
+1.2.1
+-----
+Added support for Python 3.8
+Added support for PyTorch 1.5.0
+Added support for copying, shuffling, slicing and indexing Path.
+
+1.2.0
+-----
+Added support for PyTorch 1.4.0
+Added 'scalar_term' argument to the 'signature' function (and by extension many other functions that take signatures as arguments.)
+Fixed certain cases for using Signatory on GPUs other than the default one.
+Made SignatureToLogSignature and LogSignature classes deepcopyable.
+Fixed the repr for LogSignature and SignatureToLogSignature.
+Fixed some parallelism to achieve even greater speedups.
+Released the Global Interpreter Lock during execution of Signatory's functions.
+Bumped the minor version because frankly we've changed a lot since the 1.1.0 release!
+
+1.1.6
+-----
+Added support for PyTorch 1.3.1
+Added a proper reference to our arXiv paper. Very exciting!
+Worked around a PyTorch bug (19213) affecting time benchmarking. (It caused the CPU parallelisation to sometimes be on when it should be off, and vice versa.)
+
+1.1.5
+-----
+Added a logo! (Very exciting!)
+Slightly improved the speed of forward signature computations on the CPU.
+Moderately improved the speed of backward signature computations on the CPU.
+Added the 'remember_path' option to Path.
+Deprecated the max_parallelism function. It was a bad idea.
+Added the 'parallel' and 'save' options to the benchmarks.
+
+1.1.4
+-----
+Dramatically improved the speed of several calculations.
+Added logsignature calculations to Path.
+Added the signature_to_logsignature function.
+Added the multi_signature_combine function.
+Added the max_parallelism function.
+Improved speed and stability of the backwards operation through Path.
+Added (fixed) memory benchmarking
+
+1.1.3
+-----
+Tweaks to be able to compile on different platforms.
+Prebuilt wheels are now available via PyPI! (Making PyPI happy is the real reason this is a whole 'nother release.)
+
+1.1.2
+-----
+Added signature_combine
+Added the new optional argument 'initial' to signature and Signature.
+Expanded the functionality of Path, in particular to allow updating it, and to be able give the signature of the whole
+path cleanly.
+Updated documentation with more examples, a clearer layout, and a few custom pieces of CSS to aid clarity.
+
+1.1.1
+-----
+Speed improvements to signature and logsignature both forwards and backwards.
+Added the all_words function
+Added the Path class
+signature and logsignature functions and classes now accept an 'inverse' option to calculate the inverse-signature or log-inverse-signature.
+
+1.1.0
+-----
+Should now typically run even faster on typical batch sizes.
+Worked around a major memory leak due to PyTorch bug 25340.
+Worked around a minor issue (backwards operations silently failing if in-place operations are applied to the output of signature or logsignature), which was caused due to PyTorch bug 24413.
+Added speed benchmarks.
+
+1.0.0
+-----
+Added logsignatures. (No small feat!)
+Added to the documentation.
+Added utilities for computing Lyndon words and Lyndon brackets.
+
+0.2.0
+-----
+Rewrote to compute the signature exactly, rather than its Riemann approximation.
+Added better documentation, examples, and tests.
+
+0.1.2
+-----
+Added support for Python 2.7.
+New documentation: examples, and using py2annotate to generate type annotations.
+Added lots of testing with the very poor man's makefile-equivalent of CI.
+
+0.1.1
+-----
+Bugfixes for edge cases.
+Some documentation fixes.
+Added tests.
+
+0.1.0
+-----
+Initial release!

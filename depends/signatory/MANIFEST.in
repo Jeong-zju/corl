@@ -1,0 +1,7 @@
+# The sdist includes only the minimum amount of files required to build (but not test) from source
+# Get it from GitHub, not PyPI, if that's what's desired.
+include LICENSE
+include metadata.py
+recursive-include src *.hpp
+recursive-include src *.inl
+prune test

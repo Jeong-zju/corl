@@ -1,0 +1,123 @@
+# Builds and tests a pull request
+
+name: Build and test
+
+# Arguments:
+# event_name: pull_request
+# event_cond: true
+# trigger: -not-available-  # not available via repository_dispatch (we'd need a way to specify which pull request we want tested; not obvious if that's possible)
+
+
+<<on>>
+    branches:
+      - master
+
+jobs:
+  check_version:
+    <<strategy_single>>
+    steps:
+    - <<checkout_code>>
+
+    - <<install_python>>
+
+    - name: Check version
+      <<if_>>
+      run: |
+        python -c "import itertools as it
+        import re
+        import subprocess
+        import sys
+        import metadata
+        version_msg = subprocess.run('pip install --use-deprecated=legacy-resolver signatory==', shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print('Version msg: ', version_msg)
+        version_re = re.compile(rb'from versions: ([0-9\. ,]*)\)')
+        last_version = version_re.search(version_msg.stderr).group(1).split(b', ')[-1]
+        print('(Raw) last version: ', last_version)
+        print('(Raw) this version: ', metadata.version)
+        last_version_ = [int(i) for i in last_version.split(b'.')]
+        this_version_ = [int(i) for i in metadata.version.split('.')]
+        print('(As int) last version: ', last_version_)
+        print('(As int) this version: ', this_version_)
+        last_version__ = tuple(l for t, l in it.zip_longest(this_version_, last_version_, fillvalue=0))
+        this_version__ = tuple(t for t, l in it.zip_longest(this_version_, last_version_, fillvalue=0))
+        print('(Final) last version: ', last_version__)
+        print('(Final) this version: ', this_version__)
+        sys.exit(this_version__ <= last_version__)
+        "
+
+
+  check_readme:
+    <<strategy_single>>
+    steps:
+    - <<checkout_code>>
+
+    - <<install_python>>
+
+    - name: Compare READMEs
+      <<if_>>
+      run: |
+        cp README.rst README.rst.old
+        python command.py readme
+        python -c "import io
+        import sys
+        readme = io.open('README.rst', 'r', encoding='utf-8')
+        readme_old = io.open('README.rst.old', 'r', encoding='utf-8')
+        sys.exit(readme.read() != readme_old.read())
+        "
+
+  check_workflows:
+      <<strategy_single>>
+      steps:
+      - <<checkout_code>>
+
+      - <<install_python>>
+
+      - name: Compare Workflows
+        <<if_>>
+        run: |
+          cp .github/workflows/build.yml .github/workflows/build.yml.old
+          cp .github/workflows/deploy.yml .github/workflows/deploy.yml.old
+          cp .github/workflows/log_dispatch.yml .github/workflows/log_dispatch.yml.old
+          cp .github/workflows/test_deployed.yml .github/workflows/test_deployed.yml.old
+          python command.py workflows
+          python -c "import io
+          import sys
+          build = io.open('.github/workflows/build.yml', 'r', encoding='utf-8')
+          build_old = io.open('.github/workflows/build.yml.old', 'r', encoding='utf-8')
+          deploy = io.open('.github/workflows/deploy.yml', 'r', encoding='utf-8')
+          deploy_old = io.open('.github/workflows/deploy.yml.old', 'r', encoding='utf-8')
+          log_dispatch = io.open('.github/workflows/log_dispatch.yml', 'r', encoding='utf-8')
+          log_dispatch_old = io.open('.github/workflows/log_dispatch.yml.old', 'r', encoding='utf-8')
+          test_deployed = io.open('.github/workflows/test_deployed.yml', 'r', encoding='utf-8')
+          test_deployed_old = io.open('.github/workflows/test_deployed.yml.old', 'r', encoding='utf-8')
+          result = (build.read() == build_old.read()) and (deploy.read() == deploy_old.read()) and (log_dispatch.read() == log_dispatch_old.read()) and (test_deployed.read() == test_deployed_old.read())
+          sys.exit(not result)
+          "
+
+  build:
+    <<strategy>>
+    needs: [check_version, check_readme, check_workflows]
+    steps:
+    - <<checkout_code>>
+      
+    - <<install_python>>
+
+    - <<setup_windows>>
+      <<build_windows>>
+      <<install_local_windows>>
+      <<test_windows>>
+      <<terminate_windows>>
+
+    - <<setup_linux>>
+      <<build_linux>>
+      <<install_local_linux>>
+      <<test_linux>>
+      <<terminate_linux>>
+
+# TODO: re-enable mac support
+#    - <#<setup_mac>>
+#      <#<build_mac>>
+#      <#<install_local_mac>>
+#      <#<test_mac>>
+#      <#<terminate_mac>>
+
