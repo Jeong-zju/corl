@@ -62,6 +62,87 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
   --config main/deploy/configs/deploy_zeno_act.yaml
 ```
 
+## 双路对比模式
+
+如果你想同时启动 `act` 和 `streaming_act` 做 bag 回放对比，直接使用这两份并行配置：
+
+- `main/deploy/configs/deploy_zeno_compare_act.yaml`
+- `main/deploy/configs/deploy_zeno_compare_streaming_act.yaml`
+
+它们已经做了这些隔离：
+
+- 不同的 ZeroMQ 端口
+- 不同的 ROS node name
+- 不同的输出 topic 命名空间
+
+默认输出 topic 是安全的对比命名空间，不会直接写到真实控制口：
+
+- `act`: `/compare/act/left_arm_joint_states`, `/compare/act/right_arm_joint_states`, `/compare/act/cmd_vel`
+- `streaming_act`: `/compare/streaming_act/left_arm_joint_states`, `/compare/streaming_act/right_arm_joint_states`, `/compare/streaming_act/cmd_vel`
+
+示例启动命令：
+
+```bash
+python3 main/deploy/policy_runtime/server.py \
+  --policy-type act \
+  --policy-path <act_ckpt> \
+  --device cuda \
+  --bind tcp://*:5565 \
+  --control-bind tcp://*:5568
+```
+
+```bash
+python3 main/deploy/bridge/bridge_core.py \
+  --config main/deploy/configs/deploy_zeno_compare_act.yaml
+```
+
+```bash
+python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
+  --config main/deploy/configs/deploy_zeno_compare_act.yaml
+```
+
+```bash
+python3 main/deploy/policy_runtime/server.py \
+  --policy-type streaming_act \
+  --policy-path <streaming_act_ckpt> \
+  --device cuda \
+  --bind tcp://*:5575 \
+  --control-bind tcp://*:5578
+```
+
+```bash
+python3 main/deploy/bridge/bridge_core.py \
+  --config main/deploy/configs/deploy_zeno_compare_streaming_act.yaml
+```
+
+```bash
+python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
+  --config main/deploy/configs/deploy_zeno_compare_streaming_act.yaml
+```
+
+也可以直接用一键启动脚本：
+
+```bash
+bash main/bash/start_deploy_compare.sh \
+  --act-policy-path <act_ckpt> \
+  --streaming-act-policy-path <streaming_act_ckpt>
+```
+
+常用可选参数：
+
+- `--act-device cuda`
+- `--streaming-act-device cuda`
+- `--act-n-action-steps 1`
+- `--streaming-act-n-action-steps 1`
+- `--log-dir /tmp/corl_deploy_compare`
+
+脚本会自动：
+
+- 从对比版 YAML 读取端口
+- 拉起 6 个进程
+- 把日志分别写到 `--log-dir`
+- 在任一进程退出时统一停掉整套对比链路
+
 ## 当前默认动作映射
 
 - `action[0:3]`: 底盘
