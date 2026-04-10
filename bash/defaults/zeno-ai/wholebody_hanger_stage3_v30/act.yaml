@@ -9,8 +9,8 @@ train:
   use_amp: true
   amp_dtype: "auto"
   steps: 200000
-  batch_size: 32
-  num_workers: 24
+  batch_size: 64
+  num_workers: 2
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   video_backend: "torchcodec"
@@ -20,7 +20,7 @@ train:
   filtered_hf_cache_root: ".cache/hf_datasets"
   refresh_filtered_hf_cache: false
   seed: 42
-  log_freq: 200
+  log_freq: 2000
   save_freq: 50000
   eval_freq: -1
   test_ratio: 0.2
