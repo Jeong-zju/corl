@@ -8,3 +8,5 @@ data/*
 .cache
 **/.hf_home
 **/*.egg-info/
+depends/signatory/build/
+*.so
