@@ -48,6 +48,7 @@ DEFAULT_COPY_SUFFIX = "_processed"
 DEFAULT_LOCAL_DATA_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DEFAULT_EPISODES_PATH = "meta/episodes/chunk-000/file-000.parquet"
+SKIPPED_ROOT_COPY_NAMES = frozenset({".cache", "__pycache__"})
 
 
 def require_pyarrow_dependencies():
@@ -62,6 +63,17 @@ def require_pyarrow_dependencies():
     return pa, pq
 
 
+def require_hf_image_dependencies():
+    try:
+        import datasets
+    except Exception as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "Embedding decoded video frames into parquet image columns requires "
+            "`datasets` from Hugging Face. Install it in the current environment first."
+        ) from exc
+    return datasets
+
+
 def maybe_import_snapshot_download():
     try:
         from huggingface_hub import snapshot_download
@@ -73,44 +85,119 @@ def maybe_import_snapshot_download():
     return snapshot_download
 
 
+def require_binary(binary_name: str) -> None:
+    if shutil.which(binary_name) is None:
+        raise RuntimeError(
+            f"Required binary `{binary_name}` was not found in PATH. "
+            "Install it before running this dataset processing mode."
+        )
+
+
+def maybe_import_tqdm():
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        return None
+    return tqdm
+
+
+class SimpleProgressBar:
+    def __init__(
+        self,
+        total: int,
+        *,
+        desc: str,
+        unit: str = "item",
+        width: int = 28,
+    ) -> None:
+        self.total = max(0, int(total))
+        self.desc = str(desc)
+        self.unit = str(unit)
+        self.width = max(10, int(width))
+        self.count = 0
+        self._closed = False
+        self._render()
+
+    def _format_bar(self) -> str:
+        if self.total <= 0:
+            return "[" + ("-" * self.width) + "]"
+        filled = min(
+            self.width,
+            int(round((self.count / max(self.total, 1)) * self.width)),
+        )
+        return "[" + ("#" * filled) + ("-" * (self.width - filled)) + "]"
+
+    def _render(self) -> None:
+        if self._closed:
+            return
+        if self.total > 0:
+            progress = min(self.count, self.total)
+            percent = (100.0 * progress) / self.total
+            suffix = (
+                f"{self._format_bar()} {progress}/{self.total} "
+                f"{self.unit} ({percent:5.1f}%)"
+            )
+        else:
+            suffix = f"{self._format_bar()} 0/0 {self.unit}"
+        end = "\n" if self.total > 0 and self.count >= self.total else ""
+        print(f"\r{self.desc}: {suffix}", end=end, flush=True)
+
+    def update(self, n: int = 1) -> None:
+        if self._closed:
+            return
+        self.count += int(n)
+        self._render()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self.total > 0 and self.count < self.total:
+            self.count = self.total
+            self._render()
+        elif self.total <= 0:
+            print("", flush=True)
+        self._closed = True
+
+    def __enter__(self) -> "SimpleProgressBar":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 def iter_with_progress(
     items: Sequence[Any],
     *,
     desc: str,
+    unit: str = "item",
 ) -> Iterator[Any]:
     total = len(items)
-    try:
-        from tqdm.auto import tqdm
-    except Exception:
-        tqdm = None
+    tqdm = maybe_import_tqdm()
 
     if tqdm is not None:
-        yield from tqdm(items, total=total, desc=desc)
+        yield from tqdm(items, total=total, desc=desc, unit=unit, dynamic_ncols=True)
         return
 
     if total == 0:
         return
 
-    step = max(1, total // 20)
-    for idx, item in enumerate(items, start=1):
-        if idx == 1 or idx == total or idx % step == 0:
-            print(f"[{desc}] {idx}/{total}")
-        yield item
+    with SimpleProgressBar(total, desc=desc, unit=unit) as progress:
+        for item in items:
+            yield item
+            progress.update(1)
 
 
 def iter_completed_futures(
     futures: Sequence[cf.Future],
     *,
     desc: str,
+    unit: str = "item",
 ) -> Iterator[cf.Future]:
     total = len(futures)
-    try:
-        from tqdm.auto import tqdm
-    except Exception:
-        tqdm = None
+    tqdm = maybe_import_tqdm()
 
     if tqdm is not None:
-        with tqdm(total=total, desc=desc) as progress:
+        with tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True) as progress:
             for future in cf.as_completed(futures):
                 progress.update(1)
                 yield future
@@ -119,11 +206,10 @@ def iter_completed_futures(
     if total == 0:
         return
 
-    step = max(1, total // 20)
-    for idx, future in enumerate(cf.as_completed(futures), start=1):
-        if idx == 1 or idx == total or idx % step == 0:
-            print(f"[{desc}] {idx}/{total}")
-        yield future
+    with SimpleProgressBar(total, desc=desc, unit=unit) as progress:
+        for future in cf.as_completed(futures):
+            progress.update(1)
+            yield future
 
 
 def is_lerobot_dataset_root(path: Path) -> bool:
@@ -204,11 +290,35 @@ def copy_dataset_without_data(
     include_videos: bool,
 ) -> None:
     target_root.mkdir(parents=True, exist_ok=True)
-    for child in source_root.iterdir():
+    children_to_copy: list[Path] = []
+    skipped_children: list[str] = []
+    for child in sorted(source_root.iterdir(), key=lambda path: path.name):
         if child.name == "data":
+            skipped_children.append(child.name)
             continue
         if child.name == "videos" and not include_videos:
+            skipped_children.append(child.name)
             continue
+        if child.name in SKIPPED_ROOT_COPY_NAMES:
+            skipped_children.append(child.name)
+            continue
+        children_to_copy.append(child)
+
+    print(
+        "Preparing output root: "
+        f"copying {len(children_to_copy)} entries from {source_root}"
+    )
+    if skipped_children:
+        print(
+            "Skipping source root entries that are regenerated or cache-only: "
+            + ", ".join(skipped_children)
+        )
+
+    for child in iter_with_progress(
+        children_to_copy,
+        desc="Setup",
+        unit="entry",
+    ):
         destination = target_root / child.name
         if child.is_dir():
             shutil.copytree(child, destination)
@@ -569,8 +679,13 @@ class NumericStatsAccumulator:
 def update_numeric_accumulators(
     accumulators: dict[str, NumericStatsAccumulator],
     frame_columns: dict[str, list[Any]],
+    feature_specs: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     for key, values in frame_columns.items():
+        if feature_specs is not None:
+            spec = feature_specs.get(key)
+            if isinstance(spec, dict) and spec.get("dtype") in {"image", "video"}:
+                continue
         batch = normalize_numeric_batch(values)
         if batch is None:
             continue
@@ -947,9 +1062,18 @@ def build_signature_plan(
     elif split_requested and (source_has_path or source_has_delta):
         window_size = int(source_path_meta.get("window_size", DEFAULT_SIGNATURE_WINDOW_SIZE))
         depth = int(source_path_meta.get("sig_depth", DEFAULT_SIGNATURE_DEPTH))
-        backend = resolve_signature_backend(
-            str(source_path_meta.get("backend", DEFAULT_SIGNATURE_BACKEND))
+        source_backend = str(
+            source_path_meta.get("backend", DEFAULT_SIGNATURE_BACKEND)
         )
+        if requested_backend != DEFAULT_SIGNATURE_BACKEND:
+            backend_request = requested_backend
+        elif source_backend == "signatory":
+            # Keep split-only processing usable on machines where signatory is
+            # unavailable or broken by letting auto-fallback pick `simple`.
+            backend_request = DEFAULT_SIGNATURE_BACKEND
+        else:
+            backend_request = source_backend
+        backend = resolve_signature_backend(backend_request)
     else:
         return None
 
@@ -1058,6 +1182,152 @@ def build_arrow_table(
     return pa_module.Table.from_arrays(arrays, names=names)
 
 
+def get_hf_features_from_lerobot_features(feature_specs: dict[str, dict[str, Any]]):
+    datasets = require_hf_image_dependencies()
+    hf_features = {}
+    for key, spec in feature_specs.items():
+        dtype = str(spec["dtype"])
+        shape = tuple(spec.get("shape", ()))
+        if dtype == "video":
+            continue
+        if dtype == "image":
+            hf_features[key] = datasets.Image()
+        elif shape == (1,):
+            hf_features[key] = datasets.Value(dtype=dtype)
+        elif len(shape) == 1:
+            hf_features[key] = datasets.Sequence(
+                length=int(shape[0]),
+                feature=datasets.Value(dtype=dtype),
+            )
+        elif len(shape) == 2:
+            hf_features[key] = datasets.Array2D(shape=shape, dtype=dtype)
+        elif len(shape) == 3:
+            hf_features[key] = datasets.Array3D(shape=shape, dtype=dtype)
+        elif len(shape) == 4:
+            hf_features[key] = datasets.Array4D(shape=shape, dtype=dtype)
+        elif len(shape) == 5:
+            hf_features[key] = datasets.Array5D(shape=shape, dtype=dtype)
+        else:
+            raise ValueError(f"Unsupported feature spec for parquet writing: key={key}, spec={spec}")
+    return datasets.Features(hf_features)
+
+
+def write_frame_columns_with_hf_images(
+    *,
+    frame_columns: dict[str, list[Any]],
+    output_path: Path,
+    feature_specs: dict[str, dict[str, Any]],
+    column_order: Sequence[str],
+) -> None:
+    datasets = require_hf_image_dependencies()
+    ordered_columns = {
+        name: frame_columns[name]
+        for name in column_order
+        if name in frame_columns
+    }
+    ordered_features = {
+        name: feature_specs[name]
+        for name in ordered_columns
+        if name in feature_specs
+    }
+    hf_features = get_hf_features_from_lerobot_features(ordered_features)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset = datasets.Dataset.from_dict(
+        ordered_columns,
+        features=hf_features,
+        split="train",
+    )
+    dataset.to_parquet(str(output_path))
+
+
+def write_frame_columns(
+    *,
+    pa_module: Any,
+    pq_module: Any,
+    frame_columns: dict[str, list[Any]],
+    output_path: Path,
+    feature_specs: dict[str, dict[str, Any]],
+    column_order: Sequence[str],
+    field_types: dict[str, Any],
+) -> None:
+    has_image_feature = any(
+        name in frame_columns and feature_specs.get(name, {}).get("dtype") == "image"
+        for name in column_order
+    )
+    if has_image_feature:
+        write_frame_columns_with_hf_images(
+            frame_columns=frame_columns,
+            output_path=output_path,
+            feature_specs=feature_specs,
+            column_order=column_order,
+        )
+        return
+
+    output_table = build_arrow_table(
+        pa_module,
+        frame_columns=frame_columns,
+        column_order=column_order,
+        field_types=field_types,
+    )
+    pq_module.write_table(output_table, output_path, compression="snappy")
+
+
+def decode_video_segment_frames(
+    *,
+    source_video: Path,
+    start_frame: int,
+    num_frames: int,
+    video_info_cache: dict[Path, dict[str, Any]],
+) -> list[np.ndarray]:
+    if num_frames <= 0:
+        raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
+    if start_frame < 0:
+        raise ValueError(f"`start_frame` must be non-negative, got {start_frame}.")
+
+    video_info = video_info_cache.get(source_video)
+    if video_info is None:
+        video_info = ffprobe_video_info(source_video)
+        video_info_cache[source_video] = video_info
+
+    width = int(video_info["width"])
+    height = int(video_info["height"])
+    end_frame = int(start_frame + num_frames)
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-i",
+        str(source_video),
+        "-vf",
+        f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
+        "-an",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+    )
+    frame_bytes = width * height * 3
+    raw = completed.stdout
+    if len(raw) != num_frames * frame_bytes:
+        actual_frames = 0 if frame_bytes == 0 else len(raw) // frame_bytes
+        raise RuntimeError(
+            "Decoded frame count mismatch while embedding video frames into parquet. "
+            f"Expected {num_frames}, got {actual_frames} for {source_video}."
+        )
+
+    frames = np.frombuffer(raw, dtype=np.uint8).reshape(num_frames, height, width, 3)
+    return [np.ascontiguousarray(frame) for frame in frames]
+
+
 def write_episodes_table(
     pa_module: Any,
     pq_module: Any,
@@ -1132,6 +1402,13 @@ def write_episodes_table(
 def process_dataset(args: argparse.Namespace) -> Path:
     pa, pq = require_pyarrow_dependencies()
     split_requested = "split" in args.operations
+    decode_videos_to_images = bool(args.decode_videos_to_images)
+
+    if split_requested or decode_videos_to_images:
+        require_binary("ffmpeg")
+        require_binary("ffprobe")
+    if decode_videos_to_images:
+        require_hf_image_dependencies()
 
     source_root = resolve_source_dataset_root(
         args.dataset_id,
@@ -1156,7 +1433,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
             output_dir=args.output_dir,
             copy_suffix=args.copy_suffix,
             overwrite_output=args.overwrite_output,
-            include_videos=not split_requested,
+            include_videos=(not split_requested) and (not decode_videos_to_images),
         )
     clear_processing_outputs(target_root)
 
@@ -1232,13 +1509,13 @@ def process_dataset(args: argparse.Namespace) -> Path:
         for key, value in output_features.items()
         if isinstance(value, dict) and value.get("dtype") == "video"
     ]
-    video_keys, missing_video_paths_by_key = inspect_available_video_keys(
+    source_video_keys, missing_video_paths_by_key = inspect_available_video_keys(
         source_root=source_root,
         video_path_pattern=video_path_pattern,
         source_episodes_meta=source_episodes_meta,
         video_keys=declared_video_keys,
     )
-    unavailable_video_keys = [key for key in declared_video_keys if key not in video_keys]
+    unavailable_video_keys = [key for key in declared_video_keys if key not in source_video_keys]
     if unavailable_video_keys:
         print("Warning: some declared video features are missing local mp4 files and will be dropped:")
         for video_key in unavailable_video_keys:
@@ -1249,13 +1526,34 @@ def process_dataset(args: argparse.Namespace) -> Path:
             output_features.pop(video_key, None)
             output_stats.pop(video_key, None)
 
+    output_video_keys = list(source_video_keys)
+    if decode_videos_to_images and source_video_keys:
+        print(
+            "Embedding source video features into parquet image columns: "
+            + ", ".join(source_video_keys)
+        )
+        output_video_keys = []
+        for video_key in source_video_keys:
+            feature_spec = output_features.get(video_key)
+            if isinstance(feature_spec, dict):
+                feature_spec["dtype"] = "image"
+                feature_spec.pop("info", None)
+
+    for feature_key, feature_spec in output_features.items():
+        if (
+            isinstance(feature_spec, dict)
+            and feature_spec.get("dtype") == "image"
+            and feature_key not in output_column_order
+        ):
+            output_column_order.append(feature_key)
+
     planning_cache = EpisodeDataCache(pq)
     episode_tasks: list[dict[str, Any]] = []
     output_split_assignments: list[str] = []
     next_output_episode_index = 0
     next_global_index = 0
     for source_episode_index, source_episode_meta in enumerate(
-        iter_with_progress(source_episodes_meta, desc="Planning")
+        iter_with_progress(source_episodes_meta, desc="Planning", unit="episode")
     ):
         data_file = build_data_file_path(
             source_root,
@@ -1326,6 +1624,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
 
     def process_episode_task(task: dict[str, Any]) -> dict[str, Any]:
         local_cache = EpisodeDataCache(pq)
+        local_video_info_cache: dict[Path, dict[str, Any]] = {}
         source_episode_meta = dict(task["source_episode_meta"])
         source_episode_columns, _ = extract_episode_columns(
             local_cache,
@@ -1425,22 +1724,57 @@ def process_dataset(args: argparse.Namespace) -> Path:
                 elif signature_plan.delta_key in segment_columns:
                     del segment_columns[signature_plan.delta_key]
 
+            if decode_videos_to_images:
+                for video_key in source_video_keys:
+                    source_video_from, _ = compute_segment_video_timestamps(
+                        source_episode_meta=source_episode_meta,
+                        source_episode_columns=source_episode_columns,
+                        segment_start=segment_start,
+                        segment_length=segment_length,
+                        video_key=video_key,
+                        fps=fps,
+                    )
+                    source_video_chunk_index = int(
+                        source_episode_meta[f"videos/{video_key}/chunk_index"]
+                    )
+                    source_video_file_index = int(
+                        source_episode_meta[f"videos/{video_key}/file_index"]
+                    )
+                    source_video_file = build_video_file_path(
+                        source_root,
+                        video_path_pattern,
+                        video_key=video_key,
+                        chunk_index=source_video_chunk_index,
+                        file_index=source_video_file_index,
+                    )
+                    segment_columns[video_key] = decode_video_segment_frames(
+                        source_video=source_video_file,
+                        start_frame=int(round(source_video_from * fps)),
+                        num_frames=segment_length,
+                        video_info_cache=local_video_info_cache,
+                    )
+
             target_data_file = build_data_file_path(
                 target_root,
                 DEFAULT_DATA_PATH,
                 chunk_index=data_chunk_index,
                 file_index=data_file_index,
             )
-            target_data_file.parent.mkdir(parents=True, exist_ok=True)
-            output_table = build_arrow_table(
-                pa,
+            write_frame_columns(
+                pa_module=pa,
+                pq_module=pq,
                 frame_columns=segment_columns,
+                output_path=target_data_file,
+                feature_specs=output_features,
                 column_order=output_column_order,
                 field_types=local_field_types,
             )
-            pq.write_table(output_table, target_data_file, compression="snappy")
             local_written_data_files.append(target_data_file)
-            update_numeric_accumulators(local_numeric_accumulators, segment_columns)
+            update_numeric_accumulators(
+                local_numeric_accumulators,
+                segment_columns,
+                feature_specs=output_features,
+            )
 
             episode_meta = {
                 "episode_index": new_episode_index,
@@ -1453,7 +1787,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
                 "meta/episodes/chunk_index": 0,
                 "meta/episodes/file_index": 0,
             }
-            for video_key in video_keys:
+            for video_key in output_video_keys:
                 if split_requested:
                     source_video_from, _ = compute_segment_video_timestamps(
                         source_episode_meta=source_episode_meta,
@@ -1563,7 +1897,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
                 )
 
     if max_workers == 1 or len(episode_tasks) <= 1:
-        for task in iter_with_progress(episode_tasks, desc="Episodes"):
+        for task in iter_with_progress(episode_tasks, desc="Episodes", unit="episode"):
             merge_result(process_episode_task(task))
     else:
         with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1571,7 +1905,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
                 executor.submit(process_episode_task, task)
                 for task in episode_tasks
             ]
-            for future in iter_completed_futures(futures, desc="Episodes"):
+            for future in iter_completed_futures(futures, desc="Episodes", unit="episode"):
                 merge_result(future.result())
 
     output_episodes_meta.sort(key=lambda episode: int(episode["episode_index"]))
@@ -1629,9 +1963,10 @@ def process_dataset(args: argparse.Namespace) -> Path:
             output_features.pop(signature_plan.delta_key, None)
             output_info.pop("delta_signature", None)
 
-    for video_key in video_keys:
+    for video_key in source_video_keys:
         if video_key in source_stats:
             output_stats[video_key] = source_stats[video_key]
+    for video_key in output_video_keys:
         if split_requested and video_key in first_output_video_info_by_key:
             video_info = first_output_video_info_by_key[video_key]
             if video_key in output_features and isinstance(output_features[video_key], dict):
@@ -1667,13 +2002,18 @@ def process_dataset(args: argparse.Namespace) -> Path:
         output_info["fps"] = int(fps)
     output_info["splits"] = output_splits
     output_info["data_path"] = DEFAULT_DATA_PATH
+    output_info["video_path"] = video_path_pattern if output_video_keys else None
     output_info["data_files_size_in_mb"] = estimate_total_size_mb(written_data_files)
-    output_info["video_files_size_in_mb"] = estimate_total_size_mb(
-        written_video_files
-        if split_requested
-        else sorted(
-            ((source_root if args.in_place else target_root) / "videos").rglob("*.mp4")
+    output_info["video_files_size_in_mb"] = (
+        estimate_total_size_mb(
+            written_video_files
+            if split_requested
+            else sorted(
+                ((source_root if args.in_place else target_root) / "videos").rglob("*.mp4")
+            )
         )
+        if output_video_keys
+        else 0
     )
 
     target_episodes_path = target_root / DEFAULT_EPISODES_PATH
@@ -1682,7 +2022,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
         pq,
         episodes_meta=output_episodes_meta,
         output_path=target_episodes_path,
-        video_keys=video_keys,
+        video_keys=output_video_keys,
     )
 
     (target_root / "meta").mkdir(parents=True, exist_ok=True)
@@ -1700,7 +2040,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
         copy_processed_outputs_back(
             target_root,
             source_root,
-            include_videos=split_requested,
+            include_videos=split_requested and bool(output_video_keys),
         )
         shutil.rmtree(target_root)
         final_root = source_root
@@ -1796,6 +2136,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Number of parallel workers used for episode processing. "
             "Defaults to min(8, cpu_count). Use 1 to disable parallelism."
+        ),
+    )
+    parser.add_argument(
+        "--decode-videos-to-images",
+        action="store_true",
+        help=(
+            "Decode source mp4 visual features into parquet-embedded `image` columns. "
+            "This removes runtime video decoding at training time, but increases "
+            "dataset size and processing time."
         ),
     )
     parser.add_argument(

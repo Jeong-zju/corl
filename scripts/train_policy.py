@@ -774,6 +774,18 @@ def resolve_use_imagenet_stats(
     return True
 
 
+def summarize_visual_storage_modes(dataset_root: Path) -> dict[str, int]:
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    counts = {"image": 0, "video": 0}
+    for spec in info.get("features", {}).values():
+        if not isinstance(spec, dict):
+            continue
+        dtype = spec.get("dtype")
+        if dtype in counts:
+            counts[str(dtype)] += 1
+    return counts
+
+
 def resolve_signature_dim(
     dataset_root: Path,
     use_path_signature: bool,
@@ -1887,6 +1899,7 @@ def main(argv: list[str] | None = None) -> None:
         dataset_root=dataset_root,
         use_imagenet_stats=args.use_imagenet_stats,
     )
+    visual_storage_modes = summarize_visual_storage_modes(dataset_root)
     filtered_hf_cache_root = resolve_filtered_hf_cache_root(
         dataset_root=dataset_root,
         filtered_hf_cache_root=args.filtered_hf_cache_root,
@@ -1902,9 +1915,10 @@ def main(argv: list[str] | None = None) -> None:
         persistent_workers=bool(args.dataloader_persistent_workers),
         prefetch_factor=int(args.dataloader_prefetch_factor),
     )
-    install_torchcodec_decoder_cache_patch(
-        max_cached_decoders=int(args.torchcodec_decoder_cache_size)
-    )
+    if int(visual_storage_modes.get("video", 0)) > 0:
+        install_torchcodec_decoder_cache_patch(
+            max_cached_decoders=int(args.torchcodec_decoder_cache_size)
+        )
     install_lerobot_dataset_load_patch(
         dataset_root=dataset_root,
         filtered_hf_cache_root=filtered_hf_cache_root,
@@ -2151,11 +2165,22 @@ def main(argv: list[str] | None = None) -> None:
         f"persistent_workers={bool(args.dataloader_persistent_workers)}, "
         f"prefetch_factor={int(args.dataloader_prefetch_factor)}"
     )
-    print(f"- video_backend: {args.video_backend or 'lerobot-default'}")
     print(
-        "- torchcodec_decoder_cache_size: "
-        f"{int(args.torchcodec_decoder_cache_size)}"
+        "- visual_storage: "
+        f"images={int(visual_storage_modes.get('image', 0))}, "
+        f"videos={int(visual_storage_modes.get('video', 0))}"
     )
+    if int(visual_storage_modes.get("video", 0)) > 0:
+        print(f"- video_backend: {args.video_backend or 'lerobot-default'}")
+        print(
+            "- torchcodec_decoder_cache_size: "
+            f"{int(args.torchcodec_decoder_cache_size)}"
+        )
+    else:
+        print(
+            "- video_backend: ignored "
+            "(dataset stores visual observations directly in parquet image columns)"
+        )
     print(
         "- filtered_hf_cache: "
         f"enable={bool(args.use_filtered_hf_cache)}, "
