@@ -1,0 +1,37 @@
+train:
+  dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
+  dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
+  output_root: "outputs/train/braidedhub/diffusion"
+  job_name: "diffusion"
+  wandb_project: "braidedhub"
+  wandb_mode: "online"
+  device: "cuda"
+  steps: 50000
+  batch_size: 32
+  num_workers: 4
+  seed: 42
+  log_freq: 50
+  save_freq: 10000
+  eval_freq: -1
+  n_obs_steps: 2
+  horizon: 56
+  n_action_steps: 50
+  drop_n_last_frames: 5
+  use_first_frame_anchor: false
+  use_imagenet_stats: false
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/braidedhub/diffusion"
+  output_dir: "outputs/eval/braidedhub/diffusion/{run_tag}"
+  num_rollouts: 50
+  max_steps: 240
+  fps: 20
+  seed: 42
+  device: "cuda"
+  n_action_steps: 5
+  max_action_step: 2.5
+  collision_mode: "detect"
+  enable_randomize: true

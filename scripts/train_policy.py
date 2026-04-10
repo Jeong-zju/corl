@@ -34,6 +34,8 @@ warnings.filterwarnings(
 )
 
 FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
+RAW_IMAGE_ARRAY_STORAGE_ENCODING = "raw_uint8_array"
+RAW_IMAGE_ARRAY_STORAGE_DTYPE = "uint8"
 
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
@@ -304,6 +306,73 @@ def install_torchcodec_decoder_cache_patch(max_cached_decoders: int) -> None:
     video_utils.decode_video_frames_torchcodec = decode_video_frames_torchcodec_fast
 
 
+def install_episode_aware_sampler_patch() -> None:
+    import lerobot.datasets.sampler as sampler_module
+    import lerobot.scripts.lerobot_train as lerobot_train_module
+    import torch
+
+    if getattr(sampler_module, "_corl_relative_index_patch_installed", False):
+        return
+
+    class RelativeEpisodeAwareSampler:
+        def __init__(
+            self,
+            dataset_from_indices: list[int],
+            dataset_to_indices: list[int],
+            episode_indices_to_use: list | None = None,
+            drop_n_first_frames: int = 0,
+            drop_n_last_frames: int = 0,
+            shuffle: bool = False,
+        ):
+            selected_episode_indices = (
+                None
+                if episode_indices_to_use is None
+                else {int(ep) for ep in episode_indices_to_use}
+            )
+            resolved_drop_n_first_frames = max(0, int(drop_n_first_frames))
+            resolved_drop_n_last_frames = max(0, int(drop_n_last_frames))
+
+            indices: list[int] = []
+            relative_episode_start = 0
+            for episode_idx, (start_index, end_index) in enumerate(
+                zip(dataset_from_indices, dataset_to_indices, strict=True)
+            ):
+                start_index = int(start_index)
+                end_index = int(end_index)
+                episode_length = max(0, end_index - start_index)
+
+                if (
+                    selected_episode_indices is not None
+                    and episode_idx not in selected_episode_indices
+                ):
+                    continue
+
+                relative_episode_end = relative_episode_start + episode_length
+                sample_start = relative_episode_start + resolved_drop_n_first_frames
+                sample_end = relative_episode_end - resolved_drop_n_last_frames
+                if sample_end > sample_start:
+                    indices.extend(range(sample_start, sample_end))
+                relative_episode_start = relative_episode_end
+
+            self.indices = indices
+            self.shuffle = bool(shuffle)
+
+        def __iter__(self):
+            if self.shuffle:
+                for i in torch.randperm(len(self.indices)):
+                    yield self.indices[int(i)]
+            else:
+                for i in self.indices:
+                    yield i
+
+        def __len__(self) -> int:
+            return len(self.indices)
+
+    sampler_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
+    lerobot_train_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
+    sampler_module._corl_relative_index_patch_installed = True
+
+
 def resolve_filtered_hf_cache_root(
     dataset_root: Path,
     filtered_hf_cache_root: Path | None,
@@ -389,6 +458,130 @@ def install_lerobot_dataset_load_patch(
 
     original_load_metadata = LeRobotDatasetMetadata.load_metadata
     original_cache_check = LeRobotDataset._check_cached_episodes_sufficient
+
+    def is_raw_array_image_feature(feature_spec: dict | None) -> bool:
+        return bool(
+            isinstance(feature_spec, dict)
+            and feature_spec.get("dtype") == "image"
+            and feature_spec.get("storage_encoding") == RAW_IMAGE_ARRAY_STORAGE_ENCODING
+        )
+
+    def build_hf_array_feature(*, shape: list[int] | tuple[int, ...], dtype: str):
+        resolved_shape = tuple(int(dim) for dim in shape)
+        if resolved_shape == (1,):
+            return datasets.Value(dtype=dtype)
+        if len(resolved_shape) == 1:
+            return datasets.Sequence(
+                length=int(resolved_shape[0]),
+                feature=datasets.Value(dtype=dtype),
+            )
+        if len(resolved_shape) == 2:
+            return datasets.Array2D(shape=resolved_shape, dtype=dtype)
+        if len(resolved_shape) == 3:
+            return datasets.Array3D(shape=resolved_shape, dtype=dtype)
+        if len(resolved_shape) == 4:
+            return datasets.Array4D(shape=resolved_shape, dtype=dtype)
+        if len(resolved_shape) == 5:
+            return datasets.Array5D(shape=resolved_shape, dtype=dtype)
+        raise ValueError(
+            f"Unsupported HF array feature shape: shape={resolved_shape}, dtype={dtype}"
+        )
+
+    def get_hf_features_from_features_with_raw_images(features: dict) -> datasets.Features:
+        hf_features = {}
+        for key, feature_spec in features.items():
+            dtype = feature_spec["dtype"]
+            shape = tuple(feature_spec.get("shape", ()))
+            if dtype == "video":
+                continue
+            if dtype == "image":
+                if is_raw_array_image_feature(feature_spec):
+                    storage_dtype = str(
+                        feature_spec.get(
+                            "storage_dtype",
+                            RAW_IMAGE_ARRAY_STORAGE_DTYPE,
+                        )
+                    )
+                    hf_features[key] = build_hf_array_feature(
+                        shape=shape,
+                        dtype=storage_dtype,
+                    )
+                else:
+                    hf_features[key] = datasets.Image()
+                continue
+            hf_features[key] = build_hf_array_feature(shape=shape, dtype=dtype)
+        return datasets.Features(hf_features)
+
+    def convert_raw_image_tensor_to_chw_float(
+        value: torch.Tensor | np.ndarray | list,
+        *,
+        key: str,
+        storage_dtype: str,
+    ) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        else:
+            np_value = np.asarray(value, dtype=np.dtype(storage_dtype))
+            tensor = torch.from_numpy(np_value)
+
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"Raw array image feature `{key}` must have rank 3 (H, W, C). "
+                f"Got shape={tuple(tensor.shape)}."
+            )
+
+        if tensor.shape[-1] in (1, 3, 4):
+            tensor = tensor.permute(2, 0, 1)
+        elif tensor.shape[0] not in (1, 3, 4):
+            raise ValueError(
+                f"Raw array image feature `{key}` has ambiguous shape={tuple(tensor.shape)}. "
+                "Expected HWC with 1/3/4 channels."
+            )
+
+        tensor = tensor.contiguous().to(dtype=torch.float32)
+        if tensor.numel() > 0 and float(tensor.max().item()) > 1.0:
+            tensor = tensor / 255.0
+        return tensor
+
+    def build_hf_transform_to_torch(feature_specs: dict):
+        raw_image_storage_dtype_by_key = {
+            key: str(
+                feature_spec.get(
+                    "storage_dtype",
+                    RAW_IMAGE_ARRAY_STORAGE_DTYPE,
+                )
+            )
+            for key, feature_spec in feature_specs.items()
+            if is_raw_array_image_feature(feature_spec)
+        }
+        if not raw_image_storage_dtype_by_key:
+            return hf_transform_to_torch
+
+        def transform(items_dict: dict[str, list[object]]) -> dict[str, list[object]]:
+            raw_items = {
+                key: items_dict[key]
+                for key in raw_image_storage_dtype_by_key
+                if key in items_dict
+            }
+            non_raw_items = {
+                key: value
+                for key, value in items_dict.items()
+                if key not in raw_image_storage_dtype_by_key
+            }
+
+            converted = hf_transform_to_torch(non_raw_items)
+            for key, values in raw_items.items():
+                converted[key] = [
+                    convert_raw_image_tensor_to_chw_float(
+                        value,
+                        key=key,
+                        storage_dtype=raw_image_storage_dtype_by_key[key],
+                    )
+                    for value in values
+                ]
+            return converted
+
+        return transform
 
     def _install_compact_relative_index_layout(self):
         layout_start_s = time.perf_counter()
@@ -573,6 +766,7 @@ def install_lerobot_dataset_load_patch(
     def load_hf_dataset_with_timing(self):
         patch_cfg = LeRobotDataset._custom_dataset_load_patch_config
         resolved_root = self.root.resolve()
+        hf_transform = build_hf_transform_to_torch(self.features)
         cache_info = {
             "status": "disabled",
             "path": None,
@@ -599,7 +793,7 @@ def install_lerobot_dataset_load_patch(
             if cache_dir.exists():
                 try:
                     hf_dataset = datasets.load_from_disk(str(cache_dir))
-                    hf_dataset.set_transform(hf_transform_to_torch)
+                    hf_dataset.set_transform(hf_transform)
                     load_elapsed_s = time.perf_counter() - load_start_s
                     cache_info["status"] = "filtered_cache_hit"
                     self._custom_hf_dataset_cache_info = cache_info
@@ -616,7 +810,7 @@ def install_lerobot_dataset_load_patch(
                     )
                     shutil.rmtree(cache_dir, ignore_errors=True)
 
-            features = get_hf_features_from_features(self.features)
+            features = get_hf_features_from_features_with_raw_images(self.features)
             hf_dataset = load_nested_dataset(
                 self.root / "data",
                 features=features,
@@ -663,16 +857,16 @@ def install_lerobot_dataset_load_patch(
                     f"{cache_dir}: {exc}"
                 )
 
-            hf_dataset.set_transform(hf_transform_to_torch)
+            hf_dataset.set_transform(hf_transform)
             self._custom_hf_dataset_cache_info = cache_info
             return hf_dataset
 
         hf_dataset = load_nested_dataset(
             self.root / "data",
-            features=get_hf_features_from_features(self.features),
+            features=get_hf_features_from_features_with_raw_images(self.features),
             episodes=self.episodes,
         )
-        hf_dataset.set_transform(hf_transform_to_torch)
+        hf_dataset.set_transform(hf_transform)
         load_elapsed_s = time.perf_counter() - load_start_s
         cache_reason = "full_dataset_or_disabled"
         if not patch_cfg["enable_filtered_hf_cache"]:
@@ -1171,12 +1365,62 @@ def default_wandb_project_name(
     return candidate or "dataset"
 
 
+def resolve_diffusion_drop_n_last_frames(
+    *,
+    n_obs_steps: int,
+    horizon: int,
+    n_action_steps: int,
+    drop_n_last_frames: int | None,
+) -> int:
+    if n_obs_steps <= 0:
+        raise ValueError(f"`--n-obs-steps` must be positive, got {n_obs_steps}.")
+    if horizon <= 0:
+        raise ValueError(f"`--horizon` must be positive, got {horizon}.")
+    if n_action_steps <= 0:
+        raise ValueError(
+            f"`--n-action-steps` must be positive, got {n_action_steps}."
+        )
+
+    max_n_action_steps = horizon - n_obs_steps + 1
+    if max_n_action_steps <= 0:
+        raise ValueError(
+            "Diffusion policy requires `horizon >= n_obs_steps`. "
+            f"Got horizon={horizon}, n_obs_steps={n_obs_steps}."
+        )
+    if n_action_steps > max_n_action_steps:
+        raise ValueError(
+            "Diffusion policy requires `n_action_steps <= horizon - n_obs_steps + 1`. "
+            f"Got n_action_steps={n_action_steps}, horizon={horizon}, "
+            f"n_obs_steps={n_obs_steps}, max={max_n_action_steps}."
+        )
+
+    max_drop_n_last_frames = max_n_action_steps - n_action_steps
+    if drop_n_last_frames is None:
+        return max_drop_n_last_frames
+
+    resolved_drop_n_last_frames = int(drop_n_last_frames)
+    if resolved_drop_n_last_frames < 0:
+        raise ValueError(
+            "`--drop-n-last-frames` must be non-negative when provided. "
+            f"Got {resolved_drop_n_last_frames}."
+        )
+    if resolved_drop_n_last_frames > max_drop_n_last_frames:
+        raise ValueError(
+            "Diffusion policy `drop_n_last_frames` is too large for the requested "
+            "observation/action horizon. "
+            f"Got drop_n_last_frames={resolved_drop_n_last_frames}, "
+            f"max={max_drop_n_last_frames} for horizon={horizon}, "
+            f"n_obs_steps={n_obs_steps}, n_action_steps={n_action_steps}."
+        )
+    return resolved_drop_n_last_frames
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "streaming_act"],
+        choices=["act", "diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -1189,11 +1433,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         )
 
     parser = argparse.ArgumentParser(
-        description="Train LeRobot ACT or Streaming ACT on a local LeRobot dataset."
+        description=(
+            "Train LeRobot ACT, Diffusion, or Streaming ACT on a local "
+            "LeRobot dataset."
+        )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "streaming_act"],
+        choices=["act", "diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -1431,12 +1678,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=defaults.get("chunk_size", 5),
-        help="ACT action chunk size.",
-    )
-    parser.add_argument(
         "--n-action-steps",
         type=int,
         default=defaults.get("n_action_steps", 1),
@@ -1445,6 +1686,42 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning."
         ),
     )
+    if known_args.policy == "diffusion":
+        parser.add_argument(
+            "--n-obs-steps",
+            type=int,
+            default=defaults.get("n_obs_steps", 2),
+            help=(
+                "Number of observation steps passed to the diffusion policy "
+                "at each decision."
+            ),
+        )
+        parser.add_argument(
+            "--horizon",
+            type=int,
+            default=defaults.get("horizon", 16),
+            help=(
+                "Diffusion action prediction horizon. This should be an integer "
+                "multiple of the U-Net downsampling factor."
+            ),
+        )
+        parser.add_argument(
+            "--drop-n-last-frames",
+            type=int,
+            default=defaults.get("drop_n_last_frames"),
+            help=(
+                "Number of tail frames skipped when sampling training windows for "
+                "diffusion. If omitted, it is derived from horizon, n_obs_steps, "
+                "and n_action_steps."
+            ),
+        )
+    else:
+        parser.add_argument(
+            "--chunk-size",
+            type=int,
+            default=defaults.get("chunk_size", 5),
+            help="ACT-style action chunk size.",
+        )
     anchor_group = parser.add_mutually_exclusive_group()
     anchor_group.add_argument(
         "--enable-first-frame-anchor",
@@ -1893,7 +2170,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.policy != "streaming_act" and use_first_frame_anchor:
         raise NotImplementedError(
             "`--enable-first-frame-anchor` is only supported by the local "
-            "`streaming_act` implementation. Official `act` should be run without it."
+            "`streaming_act` implementation. Other current policies, including "
+            "`act` and `diffusion`, should be run without it."
         )
     use_imagenet_stats = resolve_use_imagenet_stats(
         dataset_root=dataset_root,
@@ -1906,6 +2184,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
     if args.policy == "streaming_act":
         from lerobot_policy_streaming_act.configuration_streaming_act import (
@@ -1925,6 +2204,7 @@ def main(argv: list[str] | None = None) -> None:
         enable_filtered_hf_cache=bool(args.use_filtered_hf_cache),
         refresh_filtered_hf_cache=bool(args.refresh_filtered_hf_cache),
     )
+    install_episode_aware_sampler_patch()
 
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
@@ -1968,6 +2248,17 @@ def main(argv: list[str] | None = None) -> None:
         use_visual_prefix_memory = False
         resolved_history_length = 0
         signature_dim = 0
+
+    resolved_diffusion_drop_n_last_frames = None
+    if args.policy == "diffusion":
+        resolved_diffusion_drop_n_last_frames = (
+            resolve_diffusion_drop_n_last_frames(
+                n_obs_steps=int(args.n_obs_steps),
+                horizon=int(args.horizon),
+                n_action_steps=int(args.n_action_steps),
+                drop_n_last_frames=args.drop_n_last_frames,
+            )
+        )
 
     if use_prefix_sequence_training:
         install_prefix_sequence_dataset_patch()
@@ -2081,6 +2372,16 @@ def main(argv: list[str] | None = None) -> None:
             input_features=input_features_override,
             output_features=output_features_override,
         )
+    elif args.policy == "diffusion":
+        policy_cfg = DiffusionConfig(
+            device=args.device,
+            use_amp=bool(args.use_amp),
+            push_to_hub=False,
+            n_obs_steps=int(args.n_obs_steps),
+            horizon=int(args.horizon),
+            n_action_steps=int(args.n_action_steps),
+            drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
+        )
     else:
         policy_cfg = ACTConfig(
             device=args.device,
@@ -2187,10 +2488,20 @@ def main(argv: list[str] | None = None) -> None:
         f"root={filtered_hf_cache_root}, "
         f"refresh={bool(args.refresh_filtered_hf_cache)}"
     )
-    print(
-        f"- action_execution: chunk_size={args.chunk_size}, "
-        f"n_action_steps={args.n_action_steps}"
-    )
+    if args.policy == "diffusion":
+        print(
+            "- action_execution: "
+            f"n_obs_steps={int(args.n_obs_steps)}, "
+            f"horizon={int(args.horizon)}, "
+            f"n_action_steps={int(args.n_action_steps)}, "
+            "drop_n_last_frames="
+            f"{int(resolved_diffusion_drop_n_last_frames)}"
+        )
+    else:
+        print(
+            f"- action_execution: chunk_size={args.chunk_size}, "
+            f"n_action_steps={args.n_action_steps}"
+        )
     print(f"- use_imagenet_stats: {use_imagenet_stats}")
     print(f"- use_first_frame_anchor: {use_first_frame_anchor}")
     if args.policy == "streaming_act":
@@ -2236,6 +2547,14 @@ def main(argv: list[str] | None = None) -> None:
                     "consistency_loss_coef="
                     f"{float(args.slot_memory_consistency_loss_coef)}"
                 )
+    elif args.policy == "diffusion":
+        print(
+            "- diffusion: "
+            f"n_obs_steps={int(args.n_obs_steps)}, "
+            f"horizon={int(args.horizon)}, "
+            "drop_n_last_frames="
+            f"{int(resolved_diffusion_drop_n_last_frames)}"
+        )
     print(
         f"- wandb: enable={wandb_enable}, project={resolved_wandb_project}, mode={args.wandb_mode}"
     )

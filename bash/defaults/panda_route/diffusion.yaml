@@ -1,0 +1,35 @@
+train:
+  dataset_root: "data/zeno-ai/panda_route_onebit_cue_v30"
+  dataset_repo_id: "zeno-ai/panda_route_onebit_cue_v30"
+  output_root: "outputs/train/panda_route/diffusion"
+  job_name: "diffusion"
+  wandb_project: "panda_route"
+  wandb_mode: "online"
+  device: "cuda"
+  steps: 50000
+  batch_size: 32
+  num_workers: 4
+  seed: 42
+  log_freq: 50
+  save_freq: 10000
+  eval_freq: -1
+  n_obs_steps: 2
+  horizon: 8
+  n_action_steps: 5
+  drop_n_last_frames: 2
+  use_imagenet_stats: false
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/panda_route/diffusion"
+  output_dir: "outputs/eval/panda_route/diffusion/{run_tag}"
+  num_rollouts: 50
+  max_steps: 500
+  fps: 20
+  seed: 42
+  device: "cuda"
+  n_action_steps: 5
+  max_action_step: 0.02
+  enable_randomize: false

@@ -7,7 +7,9 @@ cd "${REPO_ROOT}"
 
 # Example:
 #   bash main/bash/train_policy.sh --env braidedhub --policy streaming_act
+#   bash main/bash/train_policy.sh --env braidedhub --policy diffusion
 #   bash main/bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1 --policy act
+#   bash main/bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy diffusion
 #   bash main/bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --steps 20000
 #   bash main/bash/train_policy.sh --dataset metaworld_mt50 --policy act
 #   bash main/bash/train_policy.sh --dataset metaworld_mt50 --policy streaming_act

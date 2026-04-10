@@ -199,7 +199,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "streaming_act"],
+        choices=["act", "diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -230,13 +230,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a LeRobot ACT or Streaming ACT checkpoint either with env "
-            "rollouts (`--env`) or on a held-out dataset split (`--dataset`)."
+            "Evaluate a LeRobot ACT, Diffusion, or Streaming ACT checkpoint "
+            "either with env rollouts (`--env`) or on a held-out dataset split "
+            "(`--dataset`)."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "streaming_act"],
+        choices=["act", "diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -1236,6 +1237,10 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         policy_cls = StreamingACTPolicy
+    elif args.policy == "diffusion":
+        from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+
+        policy_cls = DiffusionPolicy
     else:
         from lerobot.policies.act.configuration_act import ACTConfig
         from lerobot.policies.act.modeling_act import ACTPolicy
@@ -1295,6 +1300,15 @@ def main(argv: list[str] | None = None) -> None:
                 "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
                 f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
             )
+        if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
+            max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
+            if cfg.n_action_steps > max_n_action_steps:
+                raise ValueError(
+                    "`--n-action-steps` cannot exceed the checkpoint diffusion "
+                    "execution window (`horizon - n_obs_steps + 1`). "
+                    f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
+                    f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
+                )
     if (
         args.policy == "streaming_act"
         and getattr(cfg, "use_visual_prefix_memory", False)
