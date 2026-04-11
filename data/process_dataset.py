@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Process LeRobot-style datasets by splitting trajectories and recomputing signatures.
+"""Process LeRobot-style datasets by splitting, merging, and recomputing signatures.
 
 Examples:
     python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations split
+    python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations merge
     python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations update-signatures
-    python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations split update-signatures
+    python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations split merge update-signatures
     python data/process_dataset.py zeno-ai/day3_5_Exp1 --operations split --in-place
 """
 
@@ -47,8 +48,10 @@ DEFAULT_SIGNATURE_BACKEND = "auto"
 DEFAULT_COPY_SUFFIX = "_processed"
 DEFAULT_LOCAL_DATA_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 DEFAULT_EPISODES_PATH = "meta/episodes/chunk-000/file-000.parquet"
-SKIPPED_ROOT_COPY_NAMES = frozenset({".cache", "__pycache__"})
+MERGE_TMP_DIRNAME = ".merge_tmp"
+SKIPPED_ROOT_COPY_NAMES = frozenset({".cache", "__pycache__", MERGE_TMP_DIRNAME})
 
 
 def require_pyarrow_dependencies():
@@ -216,7 +219,10 @@ def is_lerobot_dataset_root(path: Path) -> bool:
     return (
         path.is_dir()
         and (path / "meta/info.json").exists()
-        and (path / DEFAULT_EPISODES_PATH).exists()
+        and (
+            (path / DEFAULT_EPISODES_PATH).exists()
+            or (path / "meta" / "episodes.jsonl").exists()
+        )
     )
 
 
@@ -723,6 +729,124 @@ class EpisodeDataCache:
         return self._current_columns, self._current_schema
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL row in {path}:{line_number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected JSON object in {path}:{line_number}")
+            rows.append(row)
+    return rows
+
+
+def get_declared_video_keys(source_info: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key, value in dict(source_info.get("features", {})).items()
+        if isinstance(value, dict) and value.get("dtype") == "video"
+    ]
+
+
+def load_source_episodes_meta(
+    *,
+    pq_module: Any,
+    source_root: Path,
+    source_info: dict[str, Any],
+    fps: int,
+) -> list[dict[str, Any]]:
+    v3_episodes_path = source_root / DEFAULT_EPISODES_PATH
+    if v3_episodes_path.exists():
+        return pq_module.read_table(v3_episodes_path).to_pylist()
+
+    legacy_episodes_path = source_root / "meta" / "episodes.jsonl"
+    if not legacy_episodes_path.exists():
+        raise FileNotFoundError(
+            "Could not find episode metadata. Expected either "
+            f"{v3_episodes_path} or {legacy_episodes_path}."
+        )
+
+    chunks_size = int(source_info.get("chunks_size", 1000) or 1000)
+    video_keys = get_declared_video_keys(source_info)
+    legacy_rows = sorted(
+        read_jsonl(legacy_episodes_path),
+        key=lambda row: int(row["episode_index"]),
+    )
+    episodes_meta: list[dict[str, Any]] = []
+    dataset_cursor = 0
+    for row in legacy_rows:
+        episode_index = int(row["episode_index"])
+        length = int(row["length"])
+        episode_chunk = int(row.get("episode_chunk", episode_index // chunks_size))
+        episode_meta: dict[str, Any] = {
+            "episode_index": episode_index,
+            "tasks": normalize_tasks(row.get("tasks")),
+            "length": length,
+            "data/chunk_index": episode_chunk,
+            "data/file_index": episode_index,
+            "dataset_from_index": int(row.get("dataset_from_index", dataset_cursor)),
+            "dataset_to_index": int(
+                row.get("dataset_to_index", dataset_cursor + length)
+            ),
+            "meta/episodes/chunk_index": 0,
+            "meta/episodes/file_index": 0,
+        }
+        for video_key in video_keys:
+            episode_meta[f"videos/{video_key}/chunk_index"] = episode_chunk
+            episode_meta[f"videos/{video_key}/file_index"] = episode_index
+            episode_meta[f"videos/{video_key}/from_timestamp"] = 0.0
+            episode_meta[f"videos/{video_key}/to_timestamp"] = float(
+                length / max(int(fps), 1)
+            )
+
+        episodes_meta.append(episode_meta)
+        dataset_cursor = int(episode_meta["dataset_to_index"])
+
+    return episodes_meta
+
+
+def write_tasks_parquet_from_jsonl(
+    pa_module: Any,
+    pq_module: Any,
+    *,
+    source_root: Path,
+    target_root: Path,
+) -> None:
+    target_tasks_parquet = target_root / "meta" / "tasks.parquet"
+    if target_tasks_parquet.exists():
+        return
+
+    source_tasks_jsonl = source_root / "meta" / "tasks.jsonl"
+    if not source_tasks_jsonl.exists():
+        return
+
+    rows = sorted(
+        read_jsonl(source_tasks_jsonl),
+        key=lambda row: int(row.get("task_index", 0)),
+    )
+    if not rows:
+        return
+
+    target_tasks_parquet.parent.mkdir(parents=True, exist_ok=True)
+    table = pa_module.Table.from_arrays(
+        [
+            pa_module.array(
+                [int(row["task_index"]) for row in rows],
+                type=pa_module.int64(),
+            ),
+            pa_module.array([str(row.get("task", "")) for row in rows]),
+        ],
+        names=["task_index", "task"],
+    )
+    pq_module.write_table(table, target_tasks_parquet, compression="snappy")
+
+
 def build_data_file_path(
     dataset_root: Path,
     data_path_pattern: str,
@@ -733,6 +857,8 @@ def build_data_file_path(
     return dataset_root / data_path_pattern.format(
         chunk_index=int(chunk_index),
         file_index=int(file_index),
+        episode_chunk=int(chunk_index),
+        episode_index=int(file_index),
     )
 
 
@@ -748,6 +874,8 @@ def build_video_file_path(
         video_key=video_key,
         chunk_index=int(chunk_index),
         file_index=int(file_index),
+        episode_chunk=int(chunk_index),
+        episode_index=int(file_index),
     )
 
 
@@ -1269,6 +1397,7 @@ def write_frame_columns(
         column_order=column_order,
         field_types=field_types,
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     pq_module.write_table(output_table, output_path, compression="snappy")
 
 
@@ -1399,9 +1528,339 @@ def write_episodes_table(
     pq_module.write_table(episodes_table, output_path, compression="snappy")
 
 
+def quote_ffconcat_path(path: Path) -> str:
+    escaped = str(path).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def safe_merge_component(value: str) -> str:
+    safe = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in value
+    )
+    return safe or "video"
+
+
+def concatenate_video_segments(
+    *,
+    segment_paths: Sequence[Path],
+    target_video: Path,
+    list_path: Path,
+) -> None:
+    if not segment_paths:
+        raise ValueError("Cannot concatenate an empty video segment list.")
+
+    list_path.parent.mkdir(parents=True, exist_ok=True)
+    list_lines = ["ffconcat version 1.0\n"]
+    list_lines.extend(
+        f"file {quote_ffconcat_path(segment_path.resolve())}\n"
+        for segment_path in segment_paths
+    )
+    list_path.write_text("".join(list_lines), encoding="utf-8")
+
+    target_video.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_path),
+        "-an",
+        "-c",
+        "copy",
+        str(target_video),
+    ]
+    subprocess.run(command, check=True)
+
+
+def resolve_merge_episodes_per_file(
+    requested_episodes_per_file: int | None,
+    total_episodes: int,
+) -> int:
+    if requested_episodes_per_file is None:
+        return max(int(total_episodes), 1)
+
+    resolved = int(requested_episodes_per_file)
+    if resolved <= 0:
+        raise ValueError("`merge_episodes_per_file` must be positive.")
+    return resolved
+
+
+def build_merge_episode_groups(
+    episodes_meta: Sequence[dict[str, Any]],
+    *,
+    episodes_per_file: int,
+) -> list[list[dict[str, Any]]]:
+    if episodes_per_file <= 0:
+        raise ValueError("`episodes_per_file` must be positive.")
+    return [
+        list(episodes_meta[start : start + episodes_per_file])
+        for start in range(0, len(episodes_meta), episodes_per_file)
+    ]
+
+
+def merge_data_files(
+    *,
+    pq_module: Any,
+    dataset_root: Path,
+    episodes_meta: Sequence[dict[str, Any]],
+    tmp_root: Path,
+    total_frames: int,
+    episodes_per_file: int,
+    files_per_chunk: int,
+) -> list[Path]:
+    if not episodes_meta:
+        raise ValueError("Cannot merge parquet files without episodes.")
+
+    episode_groups = build_merge_episode_groups(
+        episodes_meta,
+        episodes_per_file=episodes_per_file,
+    )
+    temp_to_final_paths: list[tuple[Path, Path]] = []
+    schema = None
+    merged_rows_total = 0
+
+    for group_index, episode_group in enumerate(
+        iter_with_progress(
+            episode_groups,
+            desc="Merging parquet",
+            unit="file",
+        )
+    ):
+        chunk_index, file_index = get_chunk_and_file_index(
+            group_index,
+            files_per_chunk,
+        )
+        final_data_file = build_data_file_path(
+            dataset_root,
+            DEFAULT_DATA_PATH,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
+        tmp_data_file = build_data_file_path(
+            tmp_root,
+            DEFAULT_DATA_PATH,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
+        tmp_data_file.parent.mkdir(parents=True, exist_ok=True)
+
+        writer = None
+        group_rows = 0
+        try:
+            for episode in episode_group:
+                source_data_file = build_data_file_path(
+                    dataset_root,
+                    DEFAULT_DATA_PATH,
+                    chunk_index=int(episode["data/chunk_index"]),
+                    file_index=int(episode["data/file_index"]),
+                )
+                if not source_data_file.exists():
+                    raise FileNotFoundError(
+                        f"Missing parquet file to merge: {source_data_file}"
+                    )
+
+                table = pq_module.read_table(source_data_file)
+                if schema is None:
+                    schema = table.schema
+                elif table.schema != schema:
+                    table = table.cast(schema)
+
+                if writer is None:
+                    writer = pq_module.ParquetWriter(
+                        tmp_data_file,
+                        schema,
+                        compression="snappy",
+                    )
+                writer.write_table(table)
+                group_rows += int(table.num_rows)
+        finally:
+            if writer is not None:
+                writer.close()
+
+        expected_group_rows = sum(int(episode["length"]) for episode in episode_group)
+        if int(group_rows) != int(expected_group_rows):
+            raise RuntimeError(
+                "Merged parquet row count mismatch for output file. "
+                f"chunk={chunk_index}, file={file_index}, "
+                f"expected={expected_group_rows}, got={group_rows}."
+            )
+
+        for episode in episode_group:
+            episode["data/chunk_index"] = int(chunk_index)
+            episode["data/file_index"] = int(file_index)
+
+        merged_rows_total += group_rows
+        temp_to_final_paths.append((tmp_data_file, final_data_file))
+
+    if schema is None:
+        raise RuntimeError("No parquet tables were merged.")
+    if int(merged_rows_total) != int(total_frames):
+        raise RuntimeError(
+            "Merged parquet row count mismatch. "
+            f"Expected {total_frames}, got {merged_rows_total}."
+        )
+
+    data_dir = dataset_root / "data"
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+
+    merged_data_files: list[Path] = []
+    for tmp_data_file, final_data_file in temp_to_final_paths:
+        final_data_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp_data_file), str(final_data_file))
+        merged_data_files.append(final_data_file)
+
+    return merged_data_files
+
+
+def merge_video_files(
+    *,
+    dataset_root: Path,
+    source_video_root: Path,
+    source_video_path_pattern: str,
+    output_video_path_pattern: str,
+    episodes_meta: Sequence[dict[str, Any]],
+    video_keys: Sequence[str],
+    tmp_root: Path,
+    episodes_per_file: int,
+) -> tuple[list[Path], dict[str, dict[str, Any]]]:
+    if not video_keys:
+        return [], {}
+
+    episode_groups = build_merge_episode_groups(
+        episodes_meta,
+        episodes_per_file=episodes_per_file,
+    )
+    work_items = [
+        (video_key, group_index, episode_group)
+        for video_key in video_keys
+        for group_index, episode_group in enumerate(episode_groups)
+    ]
+    segment_tmp_root = tmp_root / "video_segments"
+    merged_output_tmp_root = tmp_root / "merged_videos"
+    source_video_info_cache: dict[Path, dict[str, Any]] = {}
+    temp_to_final_paths: list[tuple[Path, Path]] = []
+    merged_info_by_key: dict[str, dict[str, Any]] = {}
+
+    for video_key, group_index, episode_group in iter_with_progress(
+        work_items,
+        desc="Merging videos",
+        unit="file",
+    ):
+        key_tmp_dir = (
+            segment_tmp_root
+            / safe_merge_component(video_key)
+            / f"group-{group_index:06d}"
+        )
+        key_tmp_dir.mkdir(parents=True, exist_ok=True)
+        segment_paths: list[Path] = []
+        expected_frames = 0
+        output_fps: float | None = None
+        target_chunk_index = int(episode_group[0]["data/chunk_index"])
+        target_file_index = int(episode_group[0]["data/file_index"])
+
+        for episode in episode_group:
+            episode_index = int(episode["episode_index"])
+            episode_length = int(episode["length"])
+            source_chunk_index = int(episode[f"videos/{video_key}/chunk_index"])
+            source_file_index = int(episode[f"videos/{video_key}/file_index"])
+            source_video = build_video_file_path(
+                source_video_root,
+                source_video_path_pattern,
+                video_key=video_key,
+                chunk_index=source_chunk_index,
+                file_index=source_file_index,
+            )
+            if not source_video.exists():
+                raise FileNotFoundError(f"Missing video file to merge: {source_video}")
+
+            source_video_info = source_video_info_cache.get(source_video)
+            if source_video_info is None:
+                source_video_info = ffprobe_video_info(source_video)
+                source_video_info_cache[source_video] = source_video_info
+
+            source_video_from = float(episode[f"videos/{video_key}/from_timestamp"])
+            source_fps = max(float(source_video_info["fps"]), 1.0)
+            segment_path = key_tmp_dir / f"episode-{episode_index:06d}.mp4"
+            segment_info = slice_video_segment(
+                source_video=source_video,
+                target_video=segment_path,
+                start_frame=int(round(source_video_from * source_fps)),
+                num_frames=episode_length,
+            )
+            segment_fps = float(segment_info["fps"])
+            if output_fps is None:
+                output_fps = segment_fps
+            elif abs(output_fps - segment_fps) > 1e-3:
+                raise RuntimeError(
+                    "Cannot merge video segments with different FPS values. "
+                    f"video_key={video_key}, expected={output_fps}, got={segment_fps}."
+                )
+
+            assert output_fps is not None
+            segment_paths.append(segment_path)
+            episode[f"videos/{video_key}/chunk_index"] = target_chunk_index
+            episode[f"videos/{video_key}/file_index"] = target_file_index
+            episode[f"videos/{video_key}/from_timestamp"] = float(
+                expected_frames / max(output_fps, 1.0)
+            )
+            expected_frames += episode_length
+            episode[f"videos/{video_key}/to_timestamp"] = float(
+                expected_frames / max(output_fps, 1.0)
+            )
+
+        relative_output = Path(
+            output_video_path_pattern.format(
+                video_key=video_key,
+                chunk_index=target_chunk_index,
+                file_index=target_file_index,
+                episode_chunk=target_chunk_index,
+                episode_index=target_file_index,
+            )
+        )
+        temp_video = merged_output_tmp_root / relative_output
+        concatenate_video_segments(
+            segment_paths=segment_paths,
+            target_video=temp_video,
+            list_path=key_tmp_dir / "concat.txt",
+        )
+        merged_video_info = ffprobe_video_info(temp_video)
+        if int(merged_video_info["frames"]) != int(expected_frames):
+            raise RuntimeError(
+                "Merged video frame count mismatch. "
+                f"video_key={video_key}, expected={expected_frames}, "
+                f"got={merged_video_info['frames']}."
+            )
+
+        final_video = dataset_root / relative_output
+        temp_to_final_paths.append((temp_video, final_video))
+        merged_info_by_key.setdefault(video_key, merged_video_info)
+
+    videos_dir = dataset_root / "videos"
+    if videos_dir.exists():
+        shutil.rmtree(videos_dir)
+
+    merged_video_files: list[Path] = []
+    for temp_video, final_video in temp_to_final_paths:
+        final_video.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(temp_video), str(final_video))
+        merged_video_files.append(final_video)
+
+    return merged_video_files, merged_info_by_key
+
+
 def process_dataset(args: argparse.Namespace) -> Path:
     pa, pq = require_pyarrow_dependencies()
     split_requested = "split" in args.operations
+    merge_requested = "merge" in args.operations
     decode_videos_to_images = bool(args.decode_videos_to_images)
 
     if split_requested or decode_videos_to_images:
@@ -1417,6 +1876,8 @@ def process_dataset(args: argparse.Namespace) -> Path:
         cache_dir=args.cache_dir,
         repo_type=args.repo_type,
     )
+    if merge_requested and not args.in_place and args.output_dir is None:
+        args.output_dir = DEFAULT_LOCAL_DATA_ROOT / source_root.name
     if args.in_place:
         target_root = source_root.parent / f".{source_root.name}_processing_tmp"
         if target_root.exists():
@@ -1433,7 +1894,11 @@ def process_dataset(args: argparse.Namespace) -> Path:
             output_dir=args.output_dir,
             copy_suffix=args.copy_suffix,
             overwrite_output=args.overwrite_output,
-            include_videos=(not split_requested) and (not decode_videos_to_images),
+            include_videos=(
+                (not split_requested)
+                and (not merge_requested)
+                and (not decode_videos_to_images)
+            ),
         )
     clear_processing_outputs(target_root)
 
@@ -1447,14 +1912,18 @@ def process_dataset(args: argparse.Namespace) -> Path:
     )
 
     data_path_pattern = str(source_info.get("data_path", DEFAULT_DATA_PATH))
-    video_path_pattern = str(source_info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"))
+    video_path_pattern = str(source_info.get("video_path", DEFAULT_VIDEO_PATH))
     fps = int(source_info.get("fps", args.fps))
 
-    source_episodes_path = source_root / DEFAULT_EPISODES_PATH
-    source_episodes_table = pq.read_table(source_episodes_path)
-    source_episodes_meta = source_episodes_table.to_pylist()
+    source_is_legacy = not (source_root / DEFAULT_EPISODES_PATH).exists()
+    source_episodes_meta = load_source_episodes_meta(
+        pq_module=pq,
+        source_root=source_root,
+        source_info=source_info,
+        fps=fps,
+    )
     if not source_episodes_meta:
-        raise ValueError(f"No source episodes found in {source_episodes_path}")
+        raise ValueError(f"No source episodes found in {source_root / 'meta'}")
     episodes_per_chunk = resolve_episodes_per_chunk(
         requested_episodes_per_chunk=args.episodes_per_chunk,
         source_info=source_info,
@@ -1504,11 +1973,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
     output_features = copy.deepcopy(dict(source_info.get("features", {})))
     output_info = copy.deepcopy(source_info)
     output_stats = copy.deepcopy(source_stats)
-    declared_video_keys = [
-        key
-        for key, value in output_features.items()
-        if isinstance(value, dict) and value.get("dtype") == "video"
-    ]
+    declared_video_keys = get_declared_video_keys(source_info)
     source_video_keys, missing_video_paths_by_key = inspect_available_video_keys(
         source_root=source_root,
         video_path_pattern=video_path_pattern,
@@ -1538,6 +2003,10 @@ def process_dataset(args: argparse.Namespace) -> Path:
             if isinstance(feature_spec, dict):
                 feature_spec["dtype"] = "image"
                 feature_spec.pop("info", None)
+
+    if merge_requested and output_video_keys:
+        require_binary("ffmpeg")
+        require_binary("ffprobe")
 
     for feature_key, feature_spec in output_features.items():
         if (
@@ -1919,6 +2388,52 @@ def process_dataset(args: argparse.Namespace) -> Path:
         total_episodes,
     )
 
+    if merge_requested:
+        merge_episodes_per_file = resolve_merge_episodes_per_file(
+            args.merge_episodes_per_file,
+            total_episodes,
+        )
+        print(
+            "Merging output parquet files with at most "
+            f"{merge_episodes_per_file} episodes per file."
+        )
+        merge_tmp_root = target_root / MERGE_TMP_DIRNAME
+        if merge_tmp_root.exists():
+            shutil.rmtree(merge_tmp_root)
+        merge_tmp_root.mkdir(parents=True, exist_ok=True)
+        try:
+            merged_data_files = merge_data_files(
+                pq_module=pq,
+                dataset_root=target_root,
+                episodes_meta=output_episodes_meta,
+                tmp_root=merge_tmp_root,
+                total_frames=total_frames,
+                episodes_per_file=merge_episodes_per_file,
+                files_per_chunk=episodes_per_chunk,
+            )
+            written_data_files = merged_data_files
+
+            if output_video_keys:
+                print(
+                    "Merging output videos into matching grouped mp4 files: "
+                    + ", ".join(output_video_keys)
+                )
+                video_source_root = target_root if split_requested else source_root
+                merged_video_files, merged_video_info_by_key = merge_video_files(
+                    dataset_root=target_root,
+                    source_video_root=video_source_root,
+                    source_video_path_pattern=video_path_pattern,
+                    output_video_path_pattern=DEFAULT_VIDEO_PATH,
+                    episodes_meta=output_episodes_meta,
+                    video_keys=output_video_keys,
+                    tmp_root=merge_tmp_root,
+                    episodes_per_file=merge_episodes_per_file,
+                )
+                written_video_files = merged_video_files
+                first_output_video_info_by_key.update(merged_video_info_by_key)
+        finally:
+            shutil.rmtree(merge_tmp_root, ignore_errors=True)
+
     if signature_plan is not None:
         if path_signature_dim is None:
             raise RuntimeError("Failed to compute path-signature dimensions.")
@@ -1967,7 +2482,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
         if video_key in source_stats:
             output_stats[video_key] = source_stats[video_key]
     for video_key in output_video_keys:
-        if split_requested and video_key in first_output_video_info_by_key:
+        if (split_requested or merge_requested) and video_key in first_output_video_info_by_key:
             video_info = first_output_video_info_by_key[video_key]
             if video_key in output_features and isinstance(output_features[video_key], dict):
                 output_features[video_key]["shape"] = [
@@ -1995,19 +2510,25 @@ def process_dataset(args: argparse.Namespace) -> Path:
     output_info["total_frames"] = int(total_frames)
     output_info["total_tasks"] = int(output_info.get("total_tasks", 0) or 0)
     output_info["chunks_size"] = int(episodes_per_chunk)
-    if split_requested and first_output_video_info_by_key:
+    if (split_requested or merge_requested) and first_output_video_info_by_key:
         first_video_info = next(iter(first_output_video_info_by_key.values()))
         output_info["fps"] = int(round(float(first_video_info["fps"])))
     else:
         output_info["fps"] = int(fps)
     output_info["splits"] = output_splits
     output_info["data_path"] = DEFAULT_DATA_PATH
-    output_info["video_path"] = video_path_pattern if output_video_keys else None
+    output_info["video_path"] = (
+        DEFAULT_VIDEO_PATH
+        if merge_requested and output_video_keys
+        else video_path_pattern
+        if output_video_keys
+        else None
+    )
     output_info["data_files_size_in_mb"] = estimate_total_size_mb(written_data_files)
     output_info["video_files_size_in_mb"] = (
         estimate_total_size_mb(
             written_video_files
-            if split_requested
+            if split_requested or merge_requested
             else sorted(
                 ((source_root if args.in_place else target_root) / "videos").rglob("*.mp4")
             )
@@ -2015,6 +2536,14 @@ def process_dataset(args: argparse.Namespace) -> Path:
         if output_video_keys
         else 0
     )
+    if source_is_legacy and merge_requested:
+        output_info["codebase_version"] = "v3.0"
+        output_info["total_chunks"] = (
+            max(int(ep["data/chunk_index"]) for ep in output_episodes_meta) + 1
+            if output_episodes_meta
+            else 0
+        )
+        output_info["total_videos"] = len(written_video_files) if output_video_keys else 0
 
     target_episodes_path = target_root / DEFAULT_EPISODES_PATH
     write_episodes_table(
@@ -2024,6 +2553,13 @@ def process_dataset(args: argparse.Namespace) -> Path:
         output_path=target_episodes_path,
         video_keys=output_video_keys,
     )
+    if source_is_legacy:
+        write_tasks_parquet_from_jsonl(
+            pa,
+            pq,
+            source_root=source_root,
+            target_root=target_root,
+        )
 
     (target_root / "meta").mkdir(parents=True, exist_ok=True)
     (target_root / "meta" / "info.json").write_text(
@@ -2040,7 +2576,7 @@ def process_dataset(args: argparse.Namespace) -> Path:
         copy_processed_outputs_back(
             target_root,
             source_root,
-            include_videos=split_requested and bool(output_video_keys),
+            include_videos=(split_requested or merge_requested) and bool(output_video_keys),
         )
         shutil.rmtree(target_root)
         final_root = source_root
@@ -2053,8 +2589,8 @@ def process_dataset(args: argparse.Namespace) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Process LeRobot datasets by splitting nested trajectories and "
-            "recomputing path/delta signatures."
+            "Process LeRobot datasets by splitting nested trajectories, merging "
+            "fragmented files, and recomputing path/delta signatures."
         )
     )
     parser.add_argument(
@@ -2068,9 +2604,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--operations",
         nargs="+",
-        choices=["split", "update-signatures"],
+        choices=["split", "merge", "update-signatures"],
         required=True,
-        help="One or both operations to run. If both are provided, split happens first.",
+        help=(
+            "Operations to run. Split is applied before signature updates; merge "
+            "packs the rewritten output into grouped parquet/mp4 files."
+        ),
     )
     parser.add_argument(
         "--split-strategy",
@@ -2127,7 +2666,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--episodes-per-chunk",
         type=int,
         default=None,
-        help="Number of episode files per chunk in the rewritten dataset.",
+        help="Number of output parquet/video files per chunk in the rewritten dataset.",
+    )
+    parser.add_argument(
+        "--merge-episodes-per-file",
+        "--merge-trajectories-per-file",
+        dest="merge_episodes_per_file",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of episodes/trajectories stored in each merged parquet "
+            "and its matching mp4 files. Defaults to all episodes in one file."
+        ),
     )
     parser.add_argument(
         "--workers",

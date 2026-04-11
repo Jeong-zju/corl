@@ -168,12 +168,13 @@ python data/download_dataset.py --help
 
 `process_dataset.py` 用来处理已经存在的 LeRobot 数据集，不负责从 bag 解码。
 
-它支持两类操作：
+它支持三类操作：
 
 - `split`：把一条原始 episode 里嵌套的多段轨迹重新切开。
+- `merge`：把分散的 parquet 和视频文件按 episode 分组合并；默认全部合成一个 parquet，每个 video feature 对应一个 `file-000.mp4`。
 - `update-signatures`：基于状态向量重新计算 `path signature` 和 `delta signature`。
 
-如果两个操作同时传入，会先 `split`，再 `update-signatures`。
+如果多个操作同时传入，会先 `split`/重算数据列，再在最后 `merge` 输出文件布局。
 
 ### 输入数据
 
@@ -182,6 +183,8 @@ python data/download_dataset.py --help
 - 本地数据集路径
 - 相对 `main/data/` 的数据集 id，比如 `zeno-ai/wholebody_hanger_stage3_v30`
 - Hugging Face 数据集 id；如果本地没有，可以配合 `--download-if-missing`
+
+脚本也能读取 LeRobot v2.1 legacy 目录：`meta/episodes.jsonl` + `data/chunk-*/episode_*.parquet` + `videos/chunk-*/*/episode_*.mp4`。做 `merge` 时输出会整理成 v3 的 `chunk/file` 布局。
 
 ### 常见用法
 
@@ -203,11 +206,39 @@ python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
   --overwrite-output
 ```
 
+只整理文件布局，把分散的数据和视频合并：
+
+```bash
+python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
+  --operations merge \
+  --output-dir data/zeno-ai/wholebody_hanger_stage3_v30_merged \
+  --overwrite-output
+```
+
+限制每个合并文件最多容纳 20 条轨迹：
+
+```bash
+python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
+  --operations merge \
+  --merge-episodes-per-file 20 \
+  --output-dir data/zeno-ai/wholebody_hanger_stage3_v30_merged \
+  --overwrite-output
+```
+
 先切分，再更新 signatures：
 
 ```bash
 python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
   --operations split update-signatures \
+  --output-dir data/zeno-ai/wholebody_hanger_stage3_v30_processed \
+  --overwrite-output
+```
+
+切分后直接合并成紧凑布局：
+
+```bash
+python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
+  --operations split merge update-signatures \
   --output-dir data/zeno-ai/wholebody_hanger_stage3_v30_processed \
   --overwrite-output
 ```
@@ -227,6 +258,7 @@ python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
 - 传 `--in-place` 时，会先写到一个临时目录，完成后再覆盖回源数据集。
 - 仅做 `split` 时，会同步重写视频切片，使视频和新 episode 对齐。
 - 仅做 `update-signatures` 时，不会重新切视频。
+- 传 `merge` 时，最终数据会按组写到 `data/chunk-*/file-*.parquet`，视频会按同一组的 chunk/file 写到 `videos/<video_key>/chunk-*/file-*.mp4`，并更新 `meta/episodes` 里的 `from_timestamp`/`to_timestamp`。不传 `--merge-episodes-per-file` 时，默认全部 episode 放进一组。
 
 ### 常用参数
 
@@ -239,7 +271,8 @@ python data/process_dataset.py zeno-ai/wholebody_hanger_stage3_v30 \
 - `--path-signature-window-size`：`0` 表示用完整前缀，`>0` 表示滑动窗口。
 - `--path-signature-depth`：signature depth，默认 `3`。
 - `--signature-backend auto|simple|signatory`：signature 计算后端。
-- `--episodes-per-chunk`：重写后的每个 chunk 放多少个 episode 文件；不传时会优先沿用源数据集配置，如果元数据和实际文件布局不一致，会自动按现有布局推断。
+- `--episodes-per-chunk`：重写后的每个 chunk 放多少个 parquet/video 文件；不传时会优先沿用源数据集配置，如果元数据和实际文件布局不一致，会自动按现有布局推断。
+- `--merge-episodes-per-file` / `--merge-trajectories-per-file`：`merge` 时每个 parquet 及其对应 mp4 最多容纳多少条轨迹；不传表示全部放入一个合并文件。
 - `--workers`：并行处理 episode 的 worker 数；默认是 `min(8, cpu_count)`。
 
 ### 查看帮助
