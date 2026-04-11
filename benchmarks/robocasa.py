@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import subprocess
 import sys
@@ -11,15 +13,16 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from PIL import Image
 
 
 DEFAULT_ROBOCASA_TASK = "PickPlaceCounterToSink"
 ROBOCASA_ACTION_COMPONENTS: tuple[tuple[str, int], ...] = (
-    ("action.gripper_close", 1),
-    ("action.end_effector_position", 3),
-    ("action.end_effector_rotation", 3),
     ("action.base_motion", 4),
     ("action.control_mode", 1),
+    ("action.end_effector_position", 3),
+    ("action.end_effector_rotation", 3),
+    ("action.gripper_close", 1),
 )
 ROBOCASA_IMAGE_KEY_PREFIX = "video."
 ROBOCASA_STATE_KEY_PREFIX = "state."
@@ -172,10 +175,15 @@ def _summarize_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
 
 def _transport_encode(value: Any) -> Any:
     if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        # Avoid ndarray.tolist() for RoboCasa images: expanding three RGB
+        # frames into huge Python lists perturbed later offscreen renders.
         return {
             "__transport_type__": "ndarray",
-            "dtype": str(value.dtype),
-            "data": value.tolist(),
+            "encoding": "base64",
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+            "data": base64.b64encode(array.tobytes()).decode("ascii"),
         }
     if isinstance(value, np.generic):
         return value.item()
@@ -195,7 +203,11 @@ def _transport_decode(value: Any) -> Any:
         return [_transport_decode(item) for item in value]
     if isinstance(value, dict):
         if value.get("__transport_type__") == "ndarray":
-            return np.asarray(value["data"], dtype=np.dtype(value["dtype"]))
+            dtype = np.dtype(value["dtype"])
+            if value.get("encoding") == "base64":
+                raw = base64.b64decode(str(value["data"]).encode("ascii"))
+                return np.frombuffer(raw, dtype=dtype).reshape(value["shape"]).copy()
+            return np.asarray(value["data"], dtype=dtype)
         return {str(key): _transport_decode(item) for key, item in value.items()}
     return value
 
@@ -323,18 +335,18 @@ def _write_json(output_path: Path, payload: Mapping[str, Any]) -> Path:
 
 def start_ffmpeg_raw_writer(output_path: Path, width: int, height: int, fps: int):
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # `rawvideo` over stdin corrupted later RoboCasa frames in practice. Feed
+    # PNG frames and encode to yuv420p H.264 for broad player compatibility.
     cmd = [
         "ffmpeg",
         "-y",
         "-loglevel",
         "error",
         "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "-framerate",
         str(fps),
         "-i",
         "-",
@@ -343,10 +355,16 @@ def start_ffmpeg_raw_writer(output_path: Path, width: int, height: int, fps: int
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-crf",
+        "18",
+        "-preset",
+        "veryfast",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
     try:
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
     except FileNotFoundError as exc:  # pragma: no cover
         raise RuntimeError("ffmpeg is required to export RoboCasa playback videos.") from exc
 
@@ -360,6 +378,16 @@ def _normalize_video_frame(frame: np.ndarray | Any) -> np.ndarray:
     if array.dtype != np.uint8:
         array = np.clip(array, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(array)
+
+
+def _write_video_frame(writer, frame: np.ndarray | Any) -> None:
+    if writer is None or writer.stdin is None:
+        raise RuntimeError("Failed to open ffmpeg stdin for RoboCasa video writing.")
+    normalized = _normalize_video_frame(frame)
+    with io.BytesIO() as buffer:
+        Image.fromarray(normalized, mode="RGB").save(buffer, format="PNG")
+        writer.stdin.write(buffer.getvalue())
+        writer.stdin.flush()
 
 
 def _close_video_writer(writer, *, output_path: Path) -> None:
@@ -424,7 +452,7 @@ def _run_rollout_with_env_api(
                 raise RuntimeError(
                     "Failed to open ffmpeg stdin for RoboCasa rollout video writing."
                 )
-        writer.stdin.write(frame.tobytes())
+        _write_video_frame(writer, frame)
 
     try:
         initial_observation, initial_info = env.reset(

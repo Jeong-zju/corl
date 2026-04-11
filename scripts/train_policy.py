@@ -20,6 +20,7 @@ import warnings
 from dataset_utils import (
     DEFAULT_LOCAL_DATA_ROOT,
     build_dataset_split,
+    ensure_lerobot_dataset_v30_compat,
     infer_dataset_repo_id,
     resolve_dataset_root,
     save_dataset_split,
@@ -1301,6 +1302,27 @@ def default_train_output_root(policy_name: str) -> Path:
     )
 
 
+def ensure_writable_hf_cache_env(repo_root: Path) -> None:
+    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+    hf_home = cache_root / "home"
+    hf_datasets_cache = cache_root / "datasets"
+    xdg_cache_home = cache_root / "xdg"
+    torch_home = cache_root / "torch"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    hf_datasets_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache_home.mkdir(parents=True, exist_ok=True)
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_datasets_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache_home))
+    if "TORCH_HOME" not in os.environ:
+        cached_torch_home = Path.home() / ".cache" / "torch"
+        if (cached_torch_home / "hub" / "checkpoints").exists():
+            os.environ["TORCH_HOME"] = str(cached_torch_home)
+        else:
+            os.environ["TORCH_HOME"] = str(torch_home)
+
+
 def default_policy_series_name(policy_name: str) -> str:
     return str(policy_name).replace("_", "-")
 
@@ -1451,7 +1473,9 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         help=(
             "Dataset ID or path under main/data. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
-            "Examples: zeno-ai/day3_5_Exp1_processed, ./main/data/zeno-ai/day3_5_Exp1."
+            "Examples: zeno-ai/day3_5_Exp1_processed, "
+            "robocasa/composite/ArrangeBreadBasket, "
+            "./main/data/zeno-ai/day3_5_Exp1."
         ),
     )
     parser.add_argument(
@@ -2115,6 +2139,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
+    ensure_writable_hf_cache_env(repo_root)
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)
 
@@ -2134,29 +2159,34 @@ def main(argv: list[str] | None = None) -> None:
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
     try:
-        dataset_root = resolve_dataset_root(
+        source_dataset_root = resolve_dataset_root(
             args.dataset,
             local_data_root=args.local_data_root.resolve(),
         )
     except FileNotFoundError:
         if not defaults_dataset_root:
             raise
-        dataset_root = resolve_dataset_root(
+        source_dataset_root = resolve_dataset_root(
             defaults_dataset_root,
             local_data_root=args.local_data_root.resolve(),
         )
-    validate_dataset_root(dataset_root)
     dataset_repo_id = (
         str(args.dataset_repo_id)
         if args.dataset_repo_id
         else infer_dataset_repo_id(
-            dataset_root,
+            source_dataset_root,
             local_data_root=args.local_data_root.resolve(),
         )
     )
+    dataset_root = ensure_lerobot_dataset_v30_compat(
+        source_dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        local_data_root=args.local_data_root.resolve(),
+    )
+    validate_dataset_root(dataset_root)
     split_spec = build_dataset_split(
         dataset_arg=args.dataset,
-        dataset_root=dataset_root,
+        dataset_root=source_dataset_root,
         dataset_repo_id=dataset_repo_id,
         test_ratio=float(args.test_ratio),
         split_seed=int(args.split_seed),
@@ -2439,7 +2469,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"- defaults_file: {args._policy_defaults_path}")
     print(f"- policy: {args.policy}")
     print(f"- dataset: {args.dataset}")
-    print(f"- dataset_root: {dataset_root}")
+    if dataset_root == source_dataset_root:
+        print(f"- dataset_root: {dataset_root}")
+    else:
+        print(f"- dataset_root_source: {source_dataset_root}")
+        print(f"- dataset_root_runtime: {dataset_root}")
     print(f"- dataset_repo_id: {dataset_repo_id}")
     if args.task:
         print(f"- task: {args.task}")

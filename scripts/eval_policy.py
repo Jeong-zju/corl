@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import re
 import sys
 import time
@@ -134,6 +135,27 @@ def normalize_output_path_part(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
     normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
     return normalized or "item"
+
+
+def ensure_writable_hf_cache_env(repo_root: Path) -> None:
+    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+    hf_home = cache_root / "home"
+    hf_datasets_cache = cache_root / "datasets"
+    xdg_cache_home = cache_root / "xdg"
+    torch_home = cache_root / "torch"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    hf_datasets_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache_home.mkdir(parents=True, exist_ok=True)
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_datasets_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache_home))
+    if "TORCH_HOME" not in os.environ:
+        cached_torch_home = Path.home() / ".cache" / "torch"
+        if (cached_torch_home / "hub" / "checkpoints").exists():
+            os.environ["TORCH_HOME"] = str(cached_torch_home)
+        else:
+            os.environ["TORCH_HOME"] = str(torch_home)
 
 
 def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
@@ -411,8 +433,20 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=str,
         default=defaults.get("task", defaults.get("cil")),
         help=(
-            "Optional Meta-World task subset for env mode. Use a comma-separated "
-            "task list such as `assembly-v3,dial-turn-v3,handle-press-side-v3`."
+            "Optional env task spec. For Meta-World, use a comma-separated task list "
+            "such as `assembly-v3,dial-turn-v3,handle-press-side-v3`. For RoboCasa, "
+            "pass one task or a comma-separated task list such as "
+            "`ArrangeBreadBasket,PickPlaceCounterToSink`."
+        ),
+    )
+    parser.add_argument(
+        "--tasks",
+        dest="task",
+        type=str,
+        default=argparse.SUPPRESS,
+        help=(
+            "Alias of --task. Useful for RoboCasa multi-task eval, for example "
+            "`--tasks ArrangeBreadBasket,PickPlaceCounterToSink`."
         ),
     )
     parser.add_argument(
@@ -429,6 +463,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         help=(
             "Maximum number of rollout videos to save per task in env mode when "
             "supported by the environment evaluator."
+        ),
+    )
+    parser.add_argument(
+        "--robocasa-conda-env",
+        type=str,
+        default=defaults.get("robocasa_conda_env", "robocasa"),
+        help=(
+            "Conda env used to launch RoboCasa when `--env robocasa` is selected. "
+            "Use an empty string only if RoboCasa is importable in the current env."
         ),
     )
     parser.add_argument(
@@ -1215,6 +1258,7 @@ def main(argv: list[str] | None = None) -> None:
     import torch
 
     repo_root = Path(__file__).resolve().parents[2]
+    ensure_writable_hf_cache_env(repo_root)
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)
 

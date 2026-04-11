@@ -12,5 +12,7 @@ cd "${REPO_ROOT}"
 #   bash main/bash/eval_policy.sh --policy diffusion --policy-path <ckpt_dir> --dataset zeno-ai/day3_5_Exp1_processed
 #   bash main/bash/eval_policy.sh --env metaworld --policy act
 #   bash main/bash/eval_policy.sh --env metaworld --policy streaming_act
+#   bash main/bash/eval_policy.sh --env robocasa --policy act --dataset robocasa/composite/ArrangeBreadBasket --task ArrangeBreadBasket
+#   bash main/bash/eval_policy.sh --env robocasa --policy act --policy-path <ckpt_dir> --tasks ArrangeBreadBasket,PickPlaceCounterToSink
 
 python3 scripts/eval_policy.py "$@"

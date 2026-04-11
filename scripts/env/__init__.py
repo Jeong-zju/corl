@@ -8,6 +8,7 @@ _ENV_MODULES = {
     "braidedhub": "env.braidedhub_env",
     "panda_route": "env.panda_route_env",
     "metaworld": "env.metaworld_env",
+    "robocasa": "env.robocasa_env",
 }
 
 

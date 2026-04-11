@@ -113,8 +113,22 @@ def resolve_dataset_defaults_path(
                 _normalize_dataset_selector_candidates(str(dataset_repo_id))
             )
 
-        if selector_candidate_set.intersection(yaml_candidates):
+        yaml_candidate_set = set(yaml_candidates)
+        if selector_candidate_set.intersection(yaml_candidate_set):
             return yaml_path
+
+        for selector_candidate in selector_candidate_set:
+            normalized_selector = str(selector_candidate).strip().replace("\\", "/")
+            if not normalized_selector:
+                continue
+            for yaml_candidate in yaml_candidate_set:
+                normalized_yaml_candidate = (
+                    str(yaml_candidate).strip().replace("\\", "/").rstrip("/")
+                )
+                if not normalized_yaml_candidate or "/" not in normalized_yaml_candidate:
+                    continue
+                if normalized_selector.startswith(f"{normalized_yaml_candidate}/"):
+                    return yaml_path
     return None
 
 

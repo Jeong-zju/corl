@@ -13,6 +13,7 @@ cd "${REPO_ROOT}"
 #   bash main/bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --steps 20000
 #   bash main/bash/train_policy.sh --dataset metaworld_mt50 --policy act
 #   bash main/bash/train_policy.sh --dataset metaworld_mt50 --policy streaming_act
+#   bash main/bash/train_policy.sh --dataset robocasa/composite/ArrangeBreadBasket --policy act
 
 policy_name="act"
 env_name=""
