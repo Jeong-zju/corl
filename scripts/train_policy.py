@@ -281,11 +281,15 @@ def install_torchcodec_decoder_cache_patch(max_cached_decoders: int) -> None:
                 f"number of queried timestamps ({len(query_ts)})"
             )
 
+        # Use at least one frame interval as tolerance so that frame-grid
+        # quantization and float32 precision loss at high timestamps (e.g.
+        # 0.019s deviation at t≈6125s) do not trigger spurious errors.
+        effective_tolerance = max(float(tolerance_s), 1.0 / max(float(average_fps), 1.0))
         min_ = torch.abs(query_ts - loaded_ts)
-        is_within_tol = min_ < tolerance_s
+        is_within_tol = min_ < effective_tolerance
         if not is_within_tol.all():
             raise video_utils.FrameTimestampError(
-                f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+                f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {effective_tolerance} [original={tolerance_s}])."
                 " It means that the closest frame that can be loaded from the video is too far away in time."
                 " This might be due to synchronization issues with timestamps during data collection."
                 " To be safe, we advise to ignore this item during training."

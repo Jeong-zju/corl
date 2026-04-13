@@ -275,6 +275,20 @@ def _normalize_conda_env_name(raw_value: str | None) -> str | None:
     return value
 
 
+def _normalize_robocasa_split(raw_value: str | None) -> str:
+    if raw_value is None:
+        return "target"
+    value = str(raw_value).strip().lower()
+    if value in {"", "none", "null"}:
+        return "target"
+    if value not in {"target", "pretrain", "all"}:
+        raise ValueError(
+            "`--robocasa-split` must be one of {'target', 'pretrain', 'all'}, "
+            f"got {raw_value!r}."
+        )
+    return value
+
+
 def _parse_tasks(task_arg: str | None) -> list[str]:
     raw = "" if task_arg is None else str(task_arg)
     tasks: list[str] = []
@@ -863,10 +877,13 @@ def evaluate_policy(
     conda_env = _normalize_conda_env_name(
         getattr(args, "robocasa_conda_env", DEFAULT_ROBOCASA_CONDA_ENV)
     )
+    robocasa_split = _normalize_robocasa_split(
+        getattr(args, "robocasa_split", None)
+    )
 
     print(
         "[load] Validating RoboCasa tasks: "
-        f"tasks={tasks}, conda_env={conda_env or '<current>'}"
+        f"tasks={tasks}, split={robocasa_split}, conda_env={conda_env or '<current>'}"
     )
     available_tasks = list_available_robocasa_tasks(conda_env=conda_env)
     missing_tasks = [task_name for task_name in tasks if task_name not in available_tasks]
@@ -956,6 +973,7 @@ def evaluate_policy(
                 camera_width=camera_width,
                 camera_height=camera_height,
                 enable_render=enable_render,
+                split=robocasa_split,
             )
             task_start_s = time.perf_counter()
             try:
@@ -1125,6 +1143,7 @@ def evaluate_policy(
         "seed": None if getattr(args, "seed", None) is None else int(args.seed),
         "fps": int(args.fps),
         "robocasa_conda_env": conda_env,
+        "robocasa_split": robocasa_split,
         "camera_names": camera_names,
         "camera_width": int(camera_width),
         "camera_height": int(camera_height),
