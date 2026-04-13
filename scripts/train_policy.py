@@ -34,6 +34,104 @@ warnings.filterwarnings(
 FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 RAW_IMAGE_ARRAY_STORAGE_ENCODING = "raw_uint8_array"
 RAW_IMAGE_ARRAY_STORAGE_DTYPE = "uint8"
+SIGNATURE_CACHE_LAYOUT_VERSION = 1
+
+
+def _sanitize_signature_cache_path_part(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "item"
+
+
+def resolve_signature_cache_dir(
+    dataset_root: Path,
+    *,
+    dataset_repo_id: str,
+    cache_root: Path | None,
+) -> Path:
+    root = (
+        dataset_root / ".signature_cache" / _sanitize_signature_cache_path_part(dataset_repo_id)
+        if cache_root is None
+        else Path(cache_root).resolve()
+    )
+    return root / f"signature_cache_v{SIGNATURE_CACHE_LAYOUT_VERSION}"
+
+
+def load_signature_cache_metadata(
+    dataset_root: Path,
+    *,
+    dataset_repo_id: str,
+    cache_root: Path | None,
+) -> dict | None:
+    metadata_path = (
+        resolve_signature_cache_dir(
+            dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            cache_root=cache_root,
+        )
+        / "metadata.json"
+    )
+    if not metadata_path.exists():
+        return None
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def _signature_feature_spec_from_cache_metadata(
+    metadata: dict | None,
+    *,
+    key: str,
+) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    feature_shapes = metadata.get("feature_shapes", {})
+    shape = feature_shapes.get(key) if isinstance(feature_shapes, dict) else None
+    if not isinstance(shape, (list, tuple)) or len(shape) != 1:
+        return None
+    feature_dim = int(shape[0])
+    if feature_dim <= 0:
+        return None
+
+    prefix = "path_sig" if key.endswith("path_signature") else "delta_path_sig"
+    return {
+        "dtype": "float32",
+        "shape": [feature_dim],
+        "names": [f"{prefix}_{index}" for index in range(feature_dim)],
+    }
+
+
+def _identity_signature_stats(feature_dim: int) -> dict[str, list[float] | list[int]]:
+    zeros = [0.0] * int(feature_dim)
+    ones = [1.0] * int(feature_dim)
+    return {
+        "min": zeros,
+        "max": zeros,
+        "mean": zeros,
+        "std": ones,
+        "count": [0],
+    }
+
+
+def augment_dataset_metadata_with_signature_cache(
+    *,
+    info: dict,
+    stats: dict,
+    cache_metadata: dict | None,
+    feature_keys: tuple[str, ...],
+) -> tuple[dict, dict]:
+    if not isinstance(cache_metadata, dict):
+        return info, stats
+
+    feature_specs = info.setdefault("features", {})
+    for key in feature_keys:
+        if key in feature_specs:
+            continue
+        cache_spec = _signature_feature_spec_from_cache_metadata(cache_metadata, key=key)
+        if cache_spec is None:
+            continue
+        feature_specs[key] = cache_spec
+        if key not in stats:
+            stats[key] = _identity_signature_stats(int(cache_spec["shape"][0]))
+    return info, stats
 
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
@@ -268,6 +366,7 @@ def install_episode_aware_sampler_patch() -> None:
 
 def install_lerobot_dataset_load_patch() -> None:
     import datasets
+    import pyarrow.dataset as pa_ds
     import torch
     import lerobot.datasets.lerobot_dataset as lerobot_dataset_module
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -277,11 +376,27 @@ def install_lerobot_dataset_load_patch() -> None:
         hf_transform_to_torch,
         load_nested_dataset,
     )
+    try:
+        from lerobot_policy_streaming_act.signature_cache import (
+            get_signature_cache_reader_for_dataset,
+            get_signature_cache_runtime,
+            signature_cache_feature_keys_for_dataset,
+        )
+    except ModuleNotFoundError:
+        def signature_cache_feature_keys_for_dataset(_dataset_root: Path) -> tuple[str, ...]:
+            return ()
+
+        def get_signature_cache_reader_for_dataset(_dataset_root: Path):
+            return None
+
+        def get_signature_cache_runtime():
+            return None
 
     if getattr(LeRobotDataset, "_custom_dataset_load_patch_installed", False):
         return
 
     original_load_metadata = LeRobotDatasetMetadata.load_metadata
+    original_getitem = LeRobotDataset.__getitem__
 
     def is_raw_array_image_feature(feature_spec: dict | None) -> bool:
         return bool(
@@ -571,6 +686,14 @@ def install_lerobot_dataset_load_patch() -> None:
             self.hf_dataset = self.load_hf_dataset()
 
         _install_compact_relative_index_layout(self)
+        self._signature_cache_reader = get_signature_cache_reader_for_dataset(
+            self.root
+        )
+        if self._signature_cache_reader is not None:
+            print(
+                "[INFO] signature_cache: attached "
+                f"(keys={list(self._signature_cache_reader.feature_keys)}, mode={self._signature_cache_reader.mode})"
+            )
 
         if self.delta_timestamps is not None:
             lerobot_dataset_module.check_delta_timestamps(
@@ -595,6 +718,23 @@ def install_lerobot_dataset_load_patch() -> None:
     def load_metadata_with_timing(self):
         start_s = time.perf_counter()
         original_load_metadata(self)
+        runtime = get_signature_cache_runtime()
+        if (
+            runtime is not None
+            and getattr(runtime, "enabled", False)
+            and Path(self.root).resolve() == Path(runtime.dataset_root).resolve()
+        ):
+            cache_metadata = load_signature_cache_metadata(
+                Path(self.root),
+                dataset_repo_id=str(runtime.dataset_repo_id),
+                cache_root=runtime.cache_root,
+            )
+            self.info, self.stats = augment_dataset_metadata_with_signature_cache(
+                info=self.info,
+                stats=self.stats,
+                cache_metadata=cache_metadata,
+                feature_keys=tuple(str(key) for key in runtime.feature_keys),
+            )
         elapsed_s = time.perf_counter() - start_s
         print(
             f"[INFO] dataset.load_metadata: {elapsed_s:.1f}s "
@@ -603,11 +743,38 @@ def install_lerobot_dataset_load_patch() -> None:
 
     def load_hf_dataset_with_timing(self):
         load_start_s = time.perf_counter()
-        hf_transform = build_hf_transform_to_torch(self.features)
-        hf_dataset = load_nested_dataset(
-            self.root / "data",
-            features=get_hf_features_from_features_with_raw_images(self.features),
-            episodes=self.episodes,
+        cached_feature_keys = set(signature_cache_feature_keys_for_dataset(self.root))
+        load_feature_specs = {
+            key: feature_spec
+            for key, feature_spec in self.features.items()
+            if key not in cached_feature_keys
+        }
+        if cached_feature_keys:
+            print(
+                "[INFO] signature_cache: excluding cached parquet columns from HF load: "
+                f"{sorted(cached_feature_keys)}"
+            )
+        hf_transform = build_hf_transform_to_torch(load_feature_specs)
+        parquet_paths = sorted((self.root / "data").glob("*/*.parquet"))
+        if not parquet_paths:
+            raise FileNotFoundError(
+                f"Provided directory does not contain any parquet file: {self.root / 'data'}"
+            )
+        filters = (
+            pa_ds.field("episode_index").isin(self.episodes)
+            if self.episodes is not None
+            else None
+        )
+        load_columns = [
+            key
+            for key, feature_spec in load_feature_specs.items()
+            if feature_spec.get("dtype") != "video"
+        ]
+        hf_dataset = datasets.Dataset.from_parquet(
+            [str(path) for path in parquet_paths],
+            columns=load_columns,
+            filters=filters,
+            features=get_hf_features_from_features_with_raw_images(load_feature_specs),
         )
         hf_dataset.set_transform(hf_transform)
         load_elapsed_s = time.perf_counter() - load_start_s
@@ -725,8 +892,16 @@ def install_lerobot_dataset_load_patch() -> None:
         self, query_indices: dict[str, list[int]]
     ) -> dict:
         result: dict = {}
+        signature_cache_reader = getattr(self, "_signature_cache_reader", None)
         for key, q_idx in query_indices.items():
             if key in self.meta.video_keys:
+                continue
+            if signature_cache_reader is not None and signature_cache_reader.has_key(key):
+                absolute_indices = [
+                    idx.item() if isinstance(idx, torch.Tensor) else int(idx)
+                    for idx in q_idx
+                ]
+                result[key] = signature_cache_reader.get_many(key, absolute_indices)
                 continue
             relative_indices = _map_absolute_indices_to_relative(self, q_idx)
             try:
@@ -735,7 +910,21 @@ def install_lerobot_dataset_load_patch() -> None:
                 result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
 
+    def getitem_with_signature_cache(self, idx):
+        item = original_getitem(self, idx)
+        signature_cache_reader = getattr(self, "_signature_cache_reader", None)
+        if signature_cache_reader is None:
+            return item
+        absolute_index = int(
+            item["index"].item() if isinstance(item["index"], torch.Tensor) else item["index"]
+        )
+        for key in signature_cache_reader.feature_keys:
+            if key not in item:
+                item[key] = signature_cache_reader.get(key, absolute_index)
+        return item
+
     LeRobotDataset.__init__ = init_with_compact_relative_index_layout
+    LeRobotDataset.__getitem__ = getitem_with_signature_cache
     LeRobotDatasetMetadata.load_metadata = load_metadata_with_timing
     LeRobotDataset.load_hf_dataset = load_hf_dataset_with_timing
     LeRobotDataset._get_query_timestamps = (
@@ -787,6 +976,9 @@ def summarize_visual_storage_modes(dataset_root: Path) -> dict[str, int]:
 
 def resolve_signature_dim(
     dataset_root: Path,
+    *,
+    dataset_repo_id: str,
+    signature_cache_root: Path | None,
     use_path_signature: bool,
     signature_dim: int,
 ) -> int:
@@ -797,8 +989,19 @@ def resolve_signature_dim(
     sig_key = "observation.path_signature"
     sig_spec = info.get("features", {}).get(sig_key)
     if sig_spec is None:
+        cache_metadata = load_signature_cache_metadata(
+            dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            cache_root=signature_cache_root,
+        )
+        sig_spec = _signature_feature_spec_from_cache_metadata(
+            cache_metadata,
+            key=sig_key,
+        )
+    if sig_spec is None:
         raise KeyError(
-            f"Dataset feature '{sig_key}' not found in {dataset_root / 'meta/info.json'}. "
+            f"Dataset feature '{sig_key}' not found in {dataset_root / 'meta/info.json'}, "
+            "and no compatible entry was found in .signature_cache metadata. "
             "Please run path-signature preprocessing first or disable path signature."
         )
 
@@ -884,6 +1087,8 @@ def validate_first_frame_anchor_dataset(
 def validate_delta_signature_dataset(
     dataset_root: Path,
     *,
+    dataset_repo_id: str,
+    signature_cache_root: Path | None,
     use_delta_signature: bool,
 ) -> None:
     if not use_delta_signature:
@@ -895,8 +1100,19 @@ def validate_delta_signature_dataset(
     delta_sig_key = "observation.delta_signature"
     delta_sig_spec = features.get(delta_sig_key)
     if delta_sig_spec is None:
+        cache_metadata = load_signature_cache_metadata(
+            dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            cache_root=signature_cache_root,
+        )
+        delta_sig_spec = _signature_feature_spec_from_cache_metadata(
+            cache_metadata,
+            key=delta_sig_key,
+        )
+    if delta_sig_spec is None:
         raise KeyError(
-            f"Dataset feature `{delta_sig_key}` not found in {dataset_root / 'meta/info.json'}. "
+            f"Dataset feature `{delta_sig_key}` not found in {dataset_root / 'meta/info.json'}, "
+            "and no compatible entry was found in .signature_cache metadata. "
             "Regenerate the dataset with delta-signature export enabled."
         )
     shape = delta_sig_spec.get("shape")
@@ -905,10 +1121,29 @@ def validate_delta_signature_dataset(
             f"Invalid shape for `{delta_sig_key}` in dataset info: {shape}. "
             "Expected [signature_dim]."
         )
-    if delta_sig_key not in stats:
+    if delta_sig_key not in stats and delta_sig_key in features:
         raise KeyError(
             f"Dataset stats for `{delta_sig_key}` are missing from {dataset_root / 'meta/stats.json'}."
         )
+
+
+def parquet_has_columns(dataset_root: Path, required_keys: list[str]) -> bool:
+    if not required_keys:
+        return True
+    data_files = sorted((dataset_root / "data").glob("chunk-*/*.parquet"))
+    if not data_files:
+        raise FileNotFoundError(
+            f"No parquet files were found under {dataset_root / 'data'}."
+        )
+    try:
+        import pyarrow.parquet as pq
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "`pyarrow` is required to inspect parquet schema for signature storage."
+        ) from exc
+    schema = pq.read_schema(data_files[0])
+    schema_names = set(schema.names)
+    return all(key in schema_names for key in required_keys)
 
 
 def default_train_output_root(policy_name: str) -> Path:
@@ -1449,6 +1684,40 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         parser.set_defaults(
             use_delta_signature=defaults.get("use_delta_signature", False),
         )
+        parser.add_argument(
+            "--signature-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("signature_cache_mode", "off"),
+            help=(
+                "Fast path for path/delta signature loading. `memmap` reads from a "
+                "disk-backed contiguous cache, `ram` preloads that cache once into "
+                "shared memory, and `off` falls back to parquet columns."
+            ),
+        )
+        parser.add_argument(
+            "--signature-cache-dtype",
+            choices=["float16", "float32"],
+            default=defaults.get("signature_cache_dtype", "float16"),
+            help=(
+                "Storage dtype used by the signature cache. The cache always keeps "
+                "the same normalized semantics as runtime normalization."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-signature-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_signature_cache", False)),
+            help="Force a signature cache rebuild before training starts.",
+        )
+        parser.add_argument(
+            "--signature-cache-root",
+            type=Path,
+            default=defaults.get("signature_cache_root"),
+            help=(
+                "Optional cache directory override. Defaults to a hidden cache "
+                "folder under the dataset root."
+            ),
+        )
     parser.set_defaults(
         _policy_defaults_path=(None if defaults_path is None else str(defaults_path)),
         _policy_defaults_dataset_root=defaults.get("dataset_root"),
@@ -1463,6 +1732,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.local_data_root = Path(args.local_data_root)
     if not isinstance(args.output_root, Path):
         args.output_root = Path(args.output_root)
+    if getattr(args, "signature_cache_root", None) is not None and not isinstance(
+        args.signature_cache_root, Path
+    ):
+        args.signature_cache_root = Path(args.signature_cache_root)
     return args
 
 
@@ -1544,8 +1817,18 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.policy == "streaming_act":
         from lerobot_policy_streaming_act.configuration_streaming_act import (
+            DELTA_SIGNATURE_KEY,
+            PATH_SIGNATURE_KEY,
             StreamingACTConfig,
         )
+        from lerobot_policy_streaming_act.signature_cache import (
+            SignatureCacheRuntimeConfig,
+            configure_signature_cache_runtime,
+            prepare_signature_cache_runtime,
+        )
+    else:
+        configure_signature_cache_runtime = None
+        prepare_signature_cache_runtime = None
     install_torch_dataloader_patch(
         persistent_workers=bool(args.dataloader_persistent_workers),
         prefetch_factor=int(args.dataloader_prefetch_factor),
@@ -1556,19 +1839,41 @@ def main(argv: list[str] | None = None) -> None:
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
         use_delta_signature = bool(args.use_delta_signature)
+        required_signature_parquet_keys = [
+            key
+            for key, enabled in (
+                ("observation.path_signature", bool(use_path_signature)),
+                ("observation.delta_signature", bool(use_delta_signature)),
+            )
+            if enabled
+        ]
         resolved_history_length = resolve_history_length(
             dataset_root=dataset_root,
             history_length=args.history_length,
         )
         signature_dim = resolve_signature_dim(
             dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
             use_path_signature=use_path_signature,
             signature_dim=args.signature_dim,
         )
         validate_delta_signature_dataset(
             dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
             use_delta_signature=use_delta_signature,
         )
+        if (
+            required_signature_parquet_keys
+            and str(args.signature_cache_mode) == "off"
+            and not parquet_has_columns(dataset_root, required_signature_parquet_keys)
+        ):
+            raise ValueError(
+                "This dataset does not store the requested signature features as parquet columns. "
+                "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
+                "so the training loader materializes signatures from the dataset cache."
+            )
     else:
         use_path_signature = False
         use_delta_signature = False
@@ -1634,7 +1939,51 @@ def main(argv: list[str] | None = None) -> None:
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
             n_action_steps=args.n_action_steps,
+            use_path_signature=bool(use_path_signature),
+            use_delta_signature=bool(use_delta_signature),
+            history_length=int(resolved_history_length),
+            signature_dim=int(signature_dim),
+            signature_depth=int(args.signature_depth),
+            signature_hidden_dim=int(args.signature_hidden_dim),
+            signature_dropout=float(args.signature_dropout),
         )
+        active_signature_keys = tuple(
+            key
+            for key, enabled in (
+                (PATH_SIGNATURE_KEY, bool(use_path_signature)),
+                (DELTA_SIGNATURE_KEY, bool(use_delta_signature)),
+            )
+            if enabled
+        )
+        configure_signature_cache_runtime(
+            SignatureCacheRuntimeConfig(
+                dataset_root=dataset_root,
+                dataset_repo_id=dataset_repo_id,
+                mode=str(args.signature_cache_mode),
+                cache_dtype=str(args.signature_cache_dtype),
+                feature_keys=active_signature_keys,
+                normalization_mode=policy_cfg.normalization_mapping.get(
+                    "STATE", "mean_std"
+                ),
+                refresh=bool(args.refresh_signature_cache),
+                cache_root=args.signature_cache_root,
+            )
+        )
+        signature_cache_reader = prepare_signature_cache_runtime()
+        if signature_cache_reader is None and required_signature_parquet_keys and not parquet_has_columns(
+            dataset_root,
+            required_signature_parquet_keys,
+        ):
+            raise RuntimeError(
+                "Signature cache is required for this dataset because the parquet files "
+                "do not contain the requested signature columns, but the cache could not be prepared."
+            )
+        if signature_cache_reader is not None and signature_cache_reader.pre_normalized:
+            policy_cfg.pre_normalized_observation_keys = tuple(
+                signature_cache_reader.feature_keys
+            )
+        else:
+            policy_cfg.pre_normalized_observation_keys = ()
     elif args.policy == "diffusion":
         policy_cfg = DiffusionConfig(
             device=args.device,
@@ -1646,6 +1995,8 @@ def main(argv: list[str] | None = None) -> None:
             drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
         )
     else:
+        if configure_signature_cache_runtime is not None:
+            configure_signature_cache_runtime(None)
         policy_cfg = ACTConfig(
             device=args.device,
             use_amp=bool(args.use_amp),
@@ -1770,6 +2121,16 @@ def main(argv: list[str] | None = None) -> None:
                 f"dropout={args.signature_dropout}"
             )
         print(f"- use_delta_signature: {use_delta_signature}")
+        print(
+            "- signature_cache: "
+            f"mode={args.signature_cache_mode}, dtype={args.signature_cache_dtype}, "
+            f"root={args.signature_cache_root or (dataset_root / '.signature_cache')}, "
+            f"refresh={bool(args.refresh_signature_cache)}"
+        )
+        print(
+            "- signature_runtime_normalization: "
+            f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
+        )
     elif args.policy == "diffusion":
         print(
             "- diffusion: "

@@ -17,8 +17,6 @@ train:
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
   enable_filtered_hf_cache: true
-  filtered_hf_cache_root: ".cache/hf_datasets"
-  refresh_filtered_hf_cache: false
   seed: 42
   log_freq: 200
   save_freq: 10000

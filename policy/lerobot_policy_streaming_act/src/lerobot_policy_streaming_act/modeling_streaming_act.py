@@ -34,7 +34,11 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 # from lerobot.policies.act.configuration_act import ACTConfig
-from .configuration_streaming_act import StreamingACTConfig
+from .configuration_streaming_act import (
+    DELTA_SIGNATURE_KEY,
+    PATH_SIGNATURE_KEY,
+    StreamingACTConfig,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
@@ -325,6 +329,27 @@ class StreamingACT(nn.Module):
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
+        self.use_path_signature = bool(config.use_path_signature)
+        self.use_delta_signature = bool(config.use_delta_signature)
+
+        if self.use_path_signature:
+            self.signature_proj = nn.Sequential(
+                nn.Linear(config.signature_dim, config.signature_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.signature_dropout),
+                nn.Linear(config.signature_hidden_dim, config.dim_model),
+            )
+        else:
+            self.signature_proj = None
+        if self.use_delta_signature:
+            self.delta_signature_proj = nn.Sequential(
+                nn.Linear(config.signature_dim, config.signature_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.signature_dropout),
+                nn.Linear(config.signature_hidden_dim, config.dim_model),
+            )
+        else:
+            self.delta_signature_proj = None
 
         if self.config.use_vae:
             self.vae_encoder = StreamingACTEncoder(config, is_vae_encoder=True)
@@ -421,6 +446,50 @@ class StreamingACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def _project_signature_tensor(
+        self,
+        signature: Tensor,
+        *,
+        context: str,
+    ) -> Tensor:
+        if self.signature_proj is None:
+            raise RuntimeError(
+                f"{context} requires `self.signature_proj` to be initialized."
+            )
+        if signature.ndim != 2:
+            raise ValueError(
+                f"{context} must have shape (B, D_sig). Got {tuple(signature.shape)}."
+            )
+        if signature.shape[-1] != self.config.signature_dim:
+            raise ValueError(
+                f"{context} last dim must equal `signature_dim={self.config.signature_dim}`. "
+                f"Got {signature.shape[-1]}."
+            )
+        dtype = self.signature_proj[0].weight.dtype
+        return self.signature_proj(signature.to(dtype=dtype))
+
+    def _project_delta_signature_tensor(
+        self,
+        delta_signature: Tensor,
+        *,
+        context: str,
+    ) -> Tensor:
+        if self.delta_signature_proj is None:
+            raise RuntimeError(
+                f"{context} requires `self.delta_signature_proj` to be initialized."
+            )
+        if delta_signature.ndim != 2:
+            raise ValueError(
+                f"{context} must have shape (B, D_sig). Got {tuple(delta_signature.shape)}."
+            )
+        if delta_signature.shape[-1] != self.config.signature_dim:
+            raise ValueError(
+                f"{context} last dim must equal `signature_dim={self.config.signature_dim}`. "
+                f"Got {delta_signature.shape[-1]}."
+            )
+        dtype = self.delta_signature_proj[0].weight.dtype
+        return self.delta_signature_proj(delta_signature.to(dtype=dtype))
+
     def forward(
         self, batch: dict[str, Tensor]
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
@@ -450,8 +519,59 @@ class StreamingACT(nn.Module):
         batch_size = (
             batch[OBS_IMAGES][0].shape[0]
             if OBS_IMAGES in batch
-            else batch[OBS_ENV_STATE].shape[0]
+            else (
+                batch[OBS_ENV_STATE].shape[0]
+                if OBS_ENV_STATE in batch
+                else batch[OBS_STATE].shape[0]
+            )
         )
+        model_device = (
+            batch[OBS_STATE].device
+            if OBS_STATE in batch
+            else (
+                batch[OBS_ENV_STATE].device
+                if OBS_ENV_STATE in batch
+                else batch[OBS_IMAGES][0].device
+            )
+        )
+
+        signature_embed = None
+        if self.use_path_signature:
+            assert PATH_SIGNATURE_KEY in batch, (
+                f"`{PATH_SIGNATURE_KEY}` is required when `use_path_signature=True`."
+            )
+            path_signature = batch[PATH_SIGNATURE_KEY]
+            assert path_signature.ndim == 2, (
+                f"`{PATH_SIGNATURE_KEY}` must have shape (batch_size, signature_dim). "
+                f"Got ndim={path_signature.ndim}, shape={tuple(path_signature.shape)}."
+            )
+            assert path_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{PATH_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {path_signature.shape[0]}."
+            )
+            signature_embed = self._project_signature_tensor(
+                path_signature,
+                context="Current path signature",
+            ).unsqueeze(1)
+
+        delta_signature_embed = None
+        if self.use_delta_signature:
+            assert DELTA_SIGNATURE_KEY in batch, (
+                f"`{DELTA_SIGNATURE_KEY}` is required when `use_delta_signature=True`."
+            )
+            delta_signature = batch[DELTA_SIGNATURE_KEY]
+            assert delta_signature.ndim == 2, (
+                f"`{DELTA_SIGNATURE_KEY}` must have shape (batch_size, signature_dim). "
+                f"Got ndim={delta_signature.ndim}, shape={tuple(delta_signature.shape)}."
+            )
+            assert delta_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{DELTA_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {delta_signature.shape[0]}."
+            )
+            delta_signature_embed = self._project_delta_signature_tensor(
+                delta_signature,
+                context="Current delta signature",
+            ).unsqueeze(1)
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -488,7 +608,7 @@ class StreamingACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=model_device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -515,7 +635,7 @@ class StreamingACT(nn.Module):
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
             latent_sample = torch.zeros(
                 [batch_size, self.config.latent_dim], dtype=torch.float32
-            ).to(batch[OBS_STATE].device)
+            ).to(model_device)
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
@@ -559,6 +679,42 @@ class StreamingACT(nn.Module):
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+
+        extra_memory_tokens = []
+        extra_memory_pos_embed = []
+        if self.use_path_signature:
+            assert signature_embed is not None
+            extra_memory_tokens.append(
+                signature_embed.transpose(0, 1).to(
+                    device=encoder_out.device, dtype=encoder_out.dtype
+                )
+            )
+            extra_memory_pos_embed.append(
+                torch.zeros(
+                    (1, 1, self.config.dim_model),
+                    dtype=encoder_in_pos_embed.dtype,
+                    device=encoder_in_pos_embed.device,
+                )
+            )
+        if self.use_delta_signature:
+            assert delta_signature_embed is not None
+            extra_memory_tokens.append(
+                delta_signature_embed.transpose(0, 1).to(
+                    device=encoder_out.device, dtype=encoder_out.dtype
+                )
+            )
+            extra_memory_pos_embed.append(
+                torch.zeros(
+                    (1, 1, self.config.dim_model),
+                    dtype=encoder_in_pos_embed.dtype,
+                    device=encoder_in_pos_embed.device,
+                )
+            )
+        if extra_memory_tokens:
+            encoder_out = torch.cat([*extra_memory_tokens, encoder_out], dim=0)
+            encoder_in_pos_embed = torch.cat(
+                [*extra_memory_pos_embed, encoder_in_pos_embed], dim=0
+            )
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),

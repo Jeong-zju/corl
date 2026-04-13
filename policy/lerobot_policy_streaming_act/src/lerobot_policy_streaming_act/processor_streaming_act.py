@@ -52,6 +52,10 @@ def make_streaming_act_pre_post_processors(
         tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
         pre-processor pipeline and the post-processor pipeline.
     """
+    pre_normalized_keys = set(getattr(config, "pre_normalized_observation_keys", ()))
+    normalize_observation_keys = {
+        key for key in config.input_features if key not in pre_normalized_keys
+    }
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -62,6 +66,7 @@ def make_streaming_act_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
             device=config.device,
+            normalize_observation_keys=normalize_observation_keys,
         ),
     ]
     output_steps = [

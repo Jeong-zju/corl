@@ -19,6 +19,9 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
+PATH_SIGNATURE_KEY = "observation.path_signature"
+DELTA_SIGNATURE_KEY = "observation.delta_signature"
+
 
 @PreTrainedConfig.register_subclass("streaming_act")
 @dataclass
@@ -72,6 +75,15 @@ class StreamingACTConfig(PreTrainedConfig):
             documentation in the policy class).
         latent_dim: The VAE's latent dimension.
         n_vae_encoder_layers: The number of transformer layers to use for the VAE's encoder.
+        use_path_signature: Whether to inject `observation.path_signature` as a numeric token.
+        use_delta_signature: Whether to inject `observation.delta_signature` as a numeric token.
+        history_length: History window size used when exporting path signatures.
+        signature_dim: Signature feature dimension.
+        signature_depth: Signature truncation depth used during dataset export/eval.
+        signature_hidden_dim: Hidden dimension of the signature projection MLP.
+        signature_dropout: Dropout applied in the signature projection MLP.
+        pre_normalized_observation_keys: Observation keys that are already normalized upstream
+            and should therefore skip runtime normalization in the processor fast path.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
             ensembling. Defaults to None which means temporal ensembling is not used. `n_action_steps` must be
             1 when using this feature, as inference needs to happen at every step to form an ensemble. For
@@ -115,6 +127,16 @@ class StreamingACTConfig(PreTrainedConfig):
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
+    # Signature inputs.
+    use_path_signature: bool = False
+    use_delta_signature: bool = False
+    history_length: int = 10
+    signature_dim: int = 0
+    signature_depth: int = 3
+    signature_hidden_dim: int = 512
+    signature_dropout: float = 0.1
+    pre_normalized_observation_keys: tuple[str, ...] = field(default_factory=tuple)
+
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
@@ -150,6 +172,29 @@ class StreamingACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.use_path_signature:
+            if self.history_length <= 0:
+                raise ValueError(
+                    f"`history_length` must be > 0 when using path signatures. Got {self.history_length}."
+                )
+            if self.signature_dim <= 0:
+                raise ValueError(
+                    f"`signature_dim` must be > 0 when using path signatures. Got {self.signature_dim}."
+                )
+            if self.signature_hidden_dim <= 0:
+                raise ValueError(
+                    "`signature_hidden_dim` must be > 0 when using path signatures. "
+                    f"Got {self.signature_hidden_dim}."
+                )
+            if not (0.0 <= self.signature_dropout <= 1.0):
+                raise ValueError(
+                    f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
+                )
+        if self.use_delta_signature and not self.use_path_signature:
+            raise ValueError(
+                "`use_delta_signature=True` requires `use_path_signature=True` "
+                "because delta signatures are defined from path signatures."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -165,6 +210,30 @@ class StreamingACTConfig(PreTrainedConfig):
             raise ValueError(
                 "You must provide at least one image or the environment state among the inputs."
             )
+        if self.use_path_signature:
+            path_signature_feature = self.path_signature_feature
+            if path_signature_feature is None:
+                raise ValueError(
+                    f"`use_path_signature=True` requires input feature `{PATH_SIGNATURE_KEY}`."
+                )
+            expected_signature_shape = (self.signature_dim,)
+            if tuple(path_signature_feature.shape) != expected_signature_shape:
+                raise ValueError(
+                    "Path-signature feature shape mismatch. "
+                    f"Expected {expected_signature_shape}, got {tuple(path_signature_feature.shape)}."
+                )
+        if self.use_delta_signature:
+            delta_signature_feature = self.delta_signature_feature
+            if delta_signature_feature is None:
+                raise ValueError(
+                    f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
+                )
+            expected_signature_shape = (self.signature_dim,)
+            if tuple(delta_signature_feature.shape) != expected_signature_shape:
+                raise ValueError(
+                    "Delta-signature feature shape mismatch. "
+                    f"Expected {expected_signature_shape}, got {tuple(delta_signature_feature.shape)}."
+                )
 
     @property
     def observation_delta_indices(self) -> None:
@@ -177,3 +246,15 @@ class StreamingACTConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def path_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(PATH_SIGNATURE_KEY)
+
+    @property
+    def delta_signature_feature(self):
+        if not self.input_features:
+            return None
+        return self.input_features.get(DELTA_SIGNATURE_KEY)
