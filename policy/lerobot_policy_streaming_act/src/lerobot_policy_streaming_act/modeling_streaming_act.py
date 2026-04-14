@@ -33,11 +33,14 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-# from lerobot.policies.act.configuration_act import ACTConfig
-from .configuration_streaming_act import (
+from .configuration_streaming_act import FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
+from .prefix_sequence import (
     DELTA_SIGNATURE_KEY,
     PATH_SIGNATURE_KEY,
-    StreamingACTConfig,
+    PREFIX_DELTA_SIGNATURE_KEY,
+    PREFIX_MASK_KEY,
+    PREFIX_PATH_SIGNATURE_KEY,
+    PREFIX_STATE_KEY,
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -69,9 +72,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
         self.model = StreamingACT(config)
 
         if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = StreamingACTTemporalEnsembler(
-                config.temporal_ensemble_coeff, config.chunk_size
-            )
+            self.temporal_ensembler = StreamingACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         self.reset()
 
@@ -102,6 +103,30 @@ class StreamingACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._visual_prefix_memory_state = None
+        self._visual_prefix_memory_update_count = 0
+        self._visual_prefix_memory_last_state_norm = 0.0
+
+    def _prepare_observation_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if not self.config.visual_observation_features:
+            return batch
+        batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+        batch[OBS_IMAGES] = [batch[key] for key in self.config.visual_observation_features]
+        return batch
+
+    def _update_online_visual_prefix_memory(self, batch: dict[str, Tensor]) -> Tensor | None:
+        if not self.config.use_visual_prefix_memory:
+            return None
+        memory_token, memory_state = self.model.compute_online_visual_prefix_memory_token(
+            batch,
+            previous_state=self._visual_prefix_memory_state,
+        )
+        self._visual_prefix_memory_state = memory_state.detach()
+        self._visual_prefix_memory_update_count += 1
+        self._visual_prefix_memory_last_state_norm = float(
+            self._visual_prefix_memory_state.norm(dim=-1).mean().detach().cpu().item()
+        )
+        return memory_token
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -112,16 +137,21 @@ class StreamingACTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
+        batch = self._prepare_observation_batch(batch)
+        memory_token = self._update_online_visual_prefix_memory(batch)
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
+            actions = self.predict_action_chunk(batch, visual_prefix_memory_token=memory_token)
             action = self.temporal_ensembler.update(actions)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(
+                batch,
+                visual_prefix_memory_token=memory_token,
+            )[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -129,32 +159,55 @@ class StreamingACTPolicy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        visual_prefix_memory_token: Tensor | None = None,
+    ) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
+        batch = self._prepare_observation_batch(batch)
 
-        if self.config.image_features:
-            batch = dict(
-                batch
-            )  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
-
-        actions = self.model(batch)[0]
+        if self.config.use_visual_prefix_memory:
+            if visual_prefix_memory_token is None:
+                visual_prefix_memory_token = self._update_online_visual_prefix_memory(batch)
+            actions = self.model(
+                batch,
+                visual_prefix_memory_token=visual_prefix_memory_token,
+                skip_prefix_sequence_validation=True,
+            )[0]
+        else:
+            actions = self.model(batch)[0]
         return actions
+
+    def get_visual_prefix_memory_debug_stats(self) -> dict[str, float | int | bool]:
+        state = self._visual_prefix_memory_state
+        return {
+            "enabled": bool(self.config.use_visual_prefix_memory),
+            "initialized": state is not None,
+            "num_slots": int(self.config.active_visual_prefix_memory_num_slots),
+            "signature_indexed_slot_memory": bool(
+                getattr(self.config, "use_signature_indexed_slot_memory", False)
+            ),
+            "signature_conditioned": bool(
+                getattr(self.config, "use_signature_conditioned_visual_prefix_memory", False)
+            ),
+            "uses_delta_signature": bool(getattr(self.config, "use_delta_signature", False)),
+            "update_count": int(self._visual_prefix_memory_update_count),
+            "state_norm": float(self._visual_prefix_memory_last_state_norm),
+        }
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
-            batch = dict(
-                batch
-            )  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        if self.config.visual_observation_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.visual_observation_features]
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
         l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-            * ~batch["action_is_pad"].unsqueeze(-1)
+            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
@@ -164,17 +217,28 @@ class StreamingACTPolicy(PreTrainedPolicy):
             # KL-divergence per batch element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
             mean_kld = (
-                (
-                    -0.5
-                    * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())
-                )
-                .sum(-1)
-                .mean()
+                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        aux_losses = self.model.get_visual_prefix_memory_aux_losses()
+        if "slot_memory_balance_loss" in aux_losses:
+            balance_raw = aux_losses["slot_memory_balance_loss"]
+            balance_weighted = balance_raw * self.config.slot_memory_balance_loss_coef
+            loss = loss + balance_weighted
+            loss_dict["slot_memory_balance_loss"] = balance_raw.item()
+            loss_dict["slot_memory_balance_loss_weighted"] = balance_weighted.item()
+        if "slot_memory_consistency_loss" in aux_losses:
+            consistency_raw = aux_losses["slot_memory_consistency_loss"]
+            consistency_weighted = (
+                consistency_raw * self.config.slot_memory_consistency_loss_coef
+            )
+            loss = loss + consistency_weighted
+            loss_dict["slot_memory_consistency_loss"] = consistency_raw.item()
+            loss_dict["slot_memory_consistency_loss_weighted"] = consistency_weighted.item()
 
         return loss, loss_dict
 
@@ -223,9 +287,7 @@ class StreamingACTTemporalEnsembler:
         ```
         """
         self.chunk_size = chunk_size
-        self.ensemble_weights = torch.exp(
-            -temporal_ensemble_coeff * torch.arange(chunk_size)
-        )
+        self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
         self.reset()
 
@@ -241,9 +303,7 @@ class StreamingACTTemporalEnsembler:
         time steps, and pop/return the next batch of actions in the sequence.
         """
         self.ensemble_weights = self.ensemble_weights.to(device=actions.device)
-        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(
-            device=actions.device
-        )
+        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(device=actions.device)
         if self.ensembled_actions is None:
             # Initializes `self._ensembled_action` to the sequence of actions predicted during the first
             # time step of the episode.
@@ -251,34 +311,19 @@ class StreamingACTTemporalEnsembler:
             # Note: The last dimension is unsqueeze to make sure we can broadcast properly for tensor
             # operations later.
             self.ensembled_actions_count = torch.ones(
-                (self.chunk_size, 1),
-                dtype=torch.long,
-                device=self.ensembled_actions.device,
+                (self.chunk_size, 1), dtype=torch.long, device=self.ensembled_actions.device
             )
         else:
             # self.ensembled_actions will have shape (batch_size, chunk_size - 1, action_dim). Compute
             # the online update for those entries.
-            self.ensembled_actions *= self.ensemble_weights_cumsum[
-                self.ensembled_actions_count - 1
-            ]
-            self.ensembled_actions += (
-                actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
-            )
-            self.ensembled_actions /= self.ensemble_weights_cumsum[
-                self.ensembled_actions_count
-            ]
-            self.ensembled_actions_count = torch.clamp(
-                self.ensembled_actions_count + 1, max=self.chunk_size
-            )
+            self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
+            self.ensembled_actions += actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
+            self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count]
+            self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.chunk_size)
             # The last action, which has no prior online average, needs to get concatenated onto the end.
-            self.ensembled_actions = torch.cat(
-                [self.ensembled_actions, actions[:, -1:]], dim=1
-            )
+            self.ensembled_actions = torch.cat([self.ensembled_actions, actions[:, -1:]], dim=1)
             self.ensembled_actions_count = torch.cat(
-                [
-                    self.ensembled_actions_count,
-                    torch.ones_like(self.ensembled_actions_count[-1:]),
-                ]
+                [self.ensembled_actions_count, torch.ones_like(self.ensembled_actions_count[-1:])]
             )
         # "Consume" the first action.
         action, self.ensembled_actions, self.ensembled_actions_count = (
@@ -329,10 +374,23 @@ class StreamingACT(nn.Module):
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
-        self.use_path_signature = bool(config.use_path_signature)
-        self.use_delta_signature = bool(config.use_delta_signature)
+        self.use_path_signature = config.use_path_signature
+        self.use_delta_signature = config.use_delta_signature
+        self.use_first_frame_anchor = config.use_first_frame_anchor
+        self.use_visual_prefix_memory = config.use_visual_prefix_memory
+        self.use_signature_conditioned_visual_prefix_memory = (
+            config.use_signature_conditioned_visual_prefix_memory
+        )
+        self.use_signature_indexed_slot_memory = config.use_signature_indexed_slot_memory
+        self.use_memory_conditioned_encoder_film = config.use_memory_conditioned_encoder_film
+        self.active_memory_num_slots = config.active_visual_prefix_memory_num_slots
+        self._last_visual_prefix_memory_aux_losses: dict[str, Tensor] = {}
 
         if self.use_path_signature:
+            assert config.signature_dim > 0, (
+                "`signature_dim` must be > 0 when `use_path_signature=True` so that "
+                "`self.signature_proj` can be initialized."
+            )
             self.signature_proj = nn.Sequential(
                 nn.Linear(config.signature_dim, config.signature_hidden_dim),
                 nn.GELU(),
@@ -342,6 +400,10 @@ class StreamingACT(nn.Module):
         else:
             self.signature_proj = None
         if self.use_delta_signature:
+            assert config.signature_dim > 0, (
+                "`signature_dim` must be > 0 when `use_delta_signature=True` so that "
+                "`self.delta_signature_proj` can be initialized."
+            )
             self.delta_signature_proj = nn.Sequential(
                 nn.Linear(config.signature_dim, config.signature_hidden_dim),
                 nn.GELU(),
@@ -365,9 +427,7 @@ class StreamingACT(nn.Module):
                 config.dim_model,
             )
             # Projection layer from the VAE encoder's output to the latent distribution's parameter space.
-            self.vae_encoder_latent_output_proj = nn.Linear(
-                config.dim_model, config.latent_dim * 2
-            )
+            self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
             # Fixed sinusoidal positional embedding for the input to the VAE encoder. Unsqueeze for batch
             # dimension.
             num_input_token_encoder = 1 + config.chunk_size
@@ -375,28 +435,20 @@ class StreamingACT(nn.Module):
                 num_input_token_encoder += 1
             self.register_buffer(
                 "vae_encoder_pos_enc",
-                create_sinusoidal_pos_embedding(
-                    num_input_token_encoder, config.dim_model
-                ).unsqueeze(0),
+                create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
         # Backbone for image feature extraction.
         if self.config.image_features:
             backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[
-                    False,
-                    False,
-                    config.replace_final_stride_with_dilation,
-                ],
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(
-                backbone_model, return_layers={"layer4": "feature_map"}
-            )
+            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = StreamingACTEncoder(config)
@@ -417,6 +469,104 @@ class StreamingACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+        if self.use_first_frame_anchor:
+            self.anchor_token_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.anchor_token_proj = nn.Linear(config.dim_model, config.dim_model)
+        if self.use_visual_prefix_memory:
+            self.visual_prefix_memory_pool = nn.AdaptiveAvgPool2d((1, 1))
+            if self.use_signature_indexed_slot_memory:
+                slot_route_input_dim = config.dim_model * (
+                    1 + int(config.slot_memory_use_delta_routing)
+                )
+                slot_write_input_dim = config.dim_model * (
+                    3 + int(config.slot_memory_use_delta_routing)
+                )
+                slot_state_input_dim = (
+                    config.dim_model * 2 + config.slot_memory_routing_hidden_dim
+                )
+                slot_read_query_input_dim = (
+                    config.dim_model * 2 + config.slot_memory_routing_hidden_dim
+                )
+                self.slot_memory_route_proj = nn.Sequential(
+                    nn.Linear(
+                        slot_route_input_dim,
+                        config.slot_memory_routing_hidden_dim,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        config.slot_memory_routing_hidden_dim,
+                        config.slot_memory_routing_hidden_dim,
+                    ),
+                )
+                self.slot_memory_route_query_proj = nn.Linear(
+                    config.slot_memory_routing_hidden_dim,
+                    config.slot_memory_routing_hidden_dim,
+                    bias=False,
+                )
+                self.slot_memory_route_key_proj = nn.Linear(
+                    config.dim_model,
+                    config.slot_memory_routing_hidden_dim,
+                    bias=False,
+                )
+                self.slot_memory_write_proj = nn.Sequential(
+                    nn.Linear(slot_write_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_candidate_proj = nn.Sequential(
+                    nn.Linear(slot_state_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_gate_proj = nn.Sequential(
+                    nn.Linear(slot_state_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, 1),
+                )
+                self.slot_memory_read_query_proj = nn.Sequential(
+                    nn.Linear(slot_read_query_input_dim, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model),
+                )
+                self.slot_memory_read_key_proj = nn.Linear(
+                    config.dim_model,
+                    config.dim_model,
+                    bias=False,
+                )
+                self.slot_memory_read_value_proj = nn.Linear(
+                    config.dim_model,
+                    config.dim_model,
+                    bias=False,
+                )
+            else:
+                visual_prefix_memory_input_dim = config.dim_model * (
+                    2
+                    + int(self.use_signature_conditioned_visual_prefix_memory)
+                    + int(self.use_delta_signature)
+                )
+                self.visual_prefix_memory_update = nn.GRUCell(
+                    input_size=visual_prefix_memory_input_dim,
+                    hidden_size=config.dim_model,
+                )
+                self.visual_prefix_memory_extra_updates = nn.ModuleList(
+                    nn.GRUCell(
+                        input_size=visual_prefix_memory_input_dim,
+                        hidden_size=config.dim_model,
+                    )
+                    for _ in range(config.num_memory_slots - 1)
+                )
+            if self.use_memory_conditioned_encoder_film:
+                self.visual_prefix_memory_encoder_film = nn.Sequential(
+                    nn.Linear(config.dim_model, config.dim_model),
+                    nn.GELU(),
+                    nn.Linear(config.dim_model, config.dim_model * 2),
+                )
+                # Start from the identity transform so existing training dynamics stay unchanged
+                # until the model learns to use memory-conditioned modulation.
+                nn.init.zeros_(self.visual_prefix_memory_encoder_film[-1].weight)
+                nn.init.zeros_(self.visual_prefix_memory_encoder_film[-1].bias)
+            else:
+                self.visual_prefix_memory_encoder_film = None
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
@@ -425,18 +575,14 @@ class StreamingACT(nn.Module):
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
-            self.encoder_cam_feat_pos_embed = StreamingACTSinusoidalPositionEmbedding2d(
-                config.dim_model // 2
-            )
+            self.encoder_cam_feat_pos_embed = StreamingACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         # Transformer decoder.
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
-        self.action_head = nn.Linear(
-            config.dim_model, self.config.action_feature.shape[0]
-        )
+        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
 
@@ -446,6 +592,337 @@ class StreamingACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def get_visual_prefix_memory_aux_losses(self) -> dict[str, Tensor]:
+        return dict(self._last_visual_prefix_memory_aux_losses)
+
+    def _validate_prefix_sequence_inputs(self, batch: dict[str, Tensor], batch_size: int) -> None:
+        if not self.config.use_prefix_sequence_training:
+            return
+
+        prefix_mask = batch.get(PREFIX_MASK_KEY)
+        assert prefix_mask is not None, (
+            f"`{PREFIX_MASK_KEY}` is required when `use_prefix_sequence_training=True`."
+        )
+        assert prefix_mask.ndim == 2, (
+            f"`{PREFIX_MASK_KEY}` must have shape (batch_size, T_prefix). "
+            f"Got ndim={prefix_mask.ndim}, shape={tuple(prefix_mask.shape)}."
+        )
+        assert prefix_mask.shape[0] == batch_size, (
+            f"Batch mismatch for `{PREFIX_MASK_KEY}`: expected {batch_size}, "
+            f"got {prefix_mask.shape[0]}."
+        )
+        assert prefix_mask.shape[1] == self.config.prefix_train_max_steps, (
+            f"`{PREFIX_MASK_KEY}` second dim must equal "
+            f"`prefix_train_max_steps={self.config.prefix_train_max_steps}`. "
+            f"Got {prefix_mask.shape[1]}."
+        )
+        prefix_mask = prefix_mask.to(dtype=torch.bool)
+        valid_lengths = prefix_mask.sum(dim=1)
+        assert torch.all(valid_lengths > 0), (
+            f"Every prefix row must contain at least one valid step in `{PREFIX_MASK_KEY}`."
+        )
+        monotonic_mask = prefix_mask[:, 1:] <= prefix_mask[:, :-1]
+        assert torch.all(monotonic_mask), (
+            f"`{PREFIX_MASK_KEY}` must use left-aligned valid steps with right padding only."
+        )
+        last_valid_positions = valid_lengths - 1
+        gathered_last_valid = prefix_mask.gather(1, last_valid_positions.unsqueeze(1)).squeeze(1)
+        assert torch.all(gathered_last_valid), (
+            f"`{PREFIX_MASK_KEY}` is missing the last valid prefix element for at least one batch row."
+        )
+
+        prefix_state = batch.get(PREFIX_STATE_KEY)
+        assert prefix_state is not None, (
+            f"`{PREFIX_STATE_KEY}` is required when `use_prefix_sequence_training=True`."
+        )
+        assert prefix_state.ndim == 3, (
+            f"`{PREFIX_STATE_KEY}` must have shape (batch_size, T_prefix, state_dim). "
+            f"Got ndim={prefix_state.ndim}, shape={tuple(prefix_state.shape)}."
+        )
+        assert prefix_state.shape[0] == batch_size, (
+            f"Batch mismatch for `{PREFIX_STATE_KEY}`: expected {batch_size}, "
+            f"got {prefix_state.shape[0]}."
+        )
+        assert prefix_state.shape[1] == prefix_mask.shape[1], (
+            f"`{PREFIX_STATE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+            f"Got state_time={prefix_state.shape[1]}, mask_time={prefix_mask.shape[1]}."
+        )
+        assert prefix_state.shape[2] == self.config.robot_state_feature.shape[0], (
+            f"`{PREFIX_STATE_KEY}` state dim must equal "
+            f"`observation.state` dim {self.config.robot_state_feature.shape[0]}. "
+            f"Got {prefix_state.shape[2]}."
+        )
+
+        if self.use_path_signature:
+            prefix_signature = batch.get(PREFIX_PATH_SIGNATURE_KEY)
+            assert prefix_signature is not None, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required when "
+                "`use_prefix_sequence_training=True`."
+            )
+            assert prefix_signature.ndim == 3, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` must have shape "
+                f"(batch_size, T_prefix, signature_dim). "
+                f"Got ndim={prefix_signature.ndim}, shape={tuple(prefix_signature.shape)}."
+            )
+            assert prefix_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{PREFIX_PATH_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {prefix_signature.shape[0]}."
+            )
+            assert prefix_signature.shape[1] == prefix_mask.shape[1], (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got sig_time={prefix_signature.shape[1]}, mask_time={prefix_mask.shape[1]}."
+            )
+            assert prefix_signature.shape[2] == self.config.signature_dim, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` signature dim must equal "
+                f"`signature_dim={self.config.signature_dim}`. Got {prefix_signature.shape[2]}."
+            )
+        if self.use_delta_signature:
+            prefix_delta_signature = batch.get(PREFIX_DELTA_SIGNATURE_KEY)
+            assert prefix_delta_signature is not None, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` is required when "
+                "`use_delta_signature=True` and `use_prefix_sequence_training=True`."
+            )
+            assert prefix_delta_signature.ndim == 3, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` must have shape "
+                f"(batch_size, T_prefix, signature_dim). "
+                f"Got ndim={prefix_delta_signature.ndim}, "
+                f"shape={tuple(prefix_delta_signature.shape)}."
+            )
+            assert prefix_delta_signature.shape[0] == batch_size, (
+                f"Batch mismatch for `{PREFIX_DELTA_SIGNATURE_KEY}`: expected {batch_size}, "
+                f"got {prefix_delta_signature.shape[0]}."
+            )
+            assert prefix_delta_signature.shape[1] == prefix_mask.shape[1], (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got delta_time={prefix_delta_signature.shape[1]}, "
+                f"mask_time={prefix_mask.shape[1]}."
+            )
+            assert prefix_delta_signature.shape[2] == self.config.signature_dim, (
+                f"`{PREFIX_DELTA_SIGNATURE_KEY}` signature dim must equal "
+                f"`signature_dim={self.config.signature_dim}`. "
+                f"Got {prefix_delta_signature.shape[2]}."
+            )
+
+        for prefix_image_key, prefix_image_feature in self.config.prefix_image_features.items():
+            assert prefix_image_key in batch, (
+                f"`{prefix_image_key}` is required when `use_prefix_sequence_training=True`."
+            )
+            prefix_images = batch[prefix_image_key]
+            assert prefix_images.ndim == 5, (
+                f"`{prefix_image_key}` must have shape (batch_size, T_prefix, C, H, W). "
+                f"Got ndim={prefix_images.ndim}, shape={tuple(prefix_images.shape)}."
+            )
+            assert prefix_images.shape[0] == batch_size, (
+                f"Batch mismatch for `{prefix_image_key}`: expected {batch_size}, "
+                f"got {prefix_images.shape[0]}."
+            )
+            assert prefix_images.shape[1] == prefix_mask.shape[1], (
+                f"`{prefix_image_key}` time dim must match `{PREFIX_MASK_KEY}`. "
+                f"Got image_time={prefix_images.shape[1]}, mask_time={prefix_mask.shape[1]}."
+            )
+            expected_image_shape = tuple(prefix_image_feature.shape[1:])
+            assert tuple(prefix_images.shape[2:]) == expected_image_shape, (
+                f"`{prefix_image_key}` trailing dims must equal {expected_image_shape}. "
+                f"Got {tuple(prefix_images.shape[2:])}."
+            )
+
+    def _build_zero_visual_prefix_memory_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return torch.zeros(
+            (batch_size, self.active_memory_num_slots, self.config.dim_model),
+            device=device,
+            dtype=dtype,
+        )
+
+    def _normalize_visual_prefix_memory_state(
+        self,
+        hidden: Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        context: str,
+    ) -> Tensor:
+        expected_shape = (batch_size, self.active_memory_num_slots, self.config.dim_model)
+        if hidden.ndim == 2:
+            if self.active_memory_num_slots != 1:
+                raise ValueError(
+                    f"{context} expects hidden state shape {expected_shape}. "
+                    f"Got legacy single-slot shape {tuple(hidden.shape)}."
+                )
+            if hidden.shape != (batch_size, self.config.dim_model):
+                raise ValueError(
+                    f"{context} shape mismatch. Expected {(batch_size, self.config.dim_model)}, "
+                    f"got {tuple(hidden.shape)}."
+                )
+            hidden = hidden.unsqueeze(1)
+        elif hidden.ndim != 3:
+            raise ValueError(
+                f"{context} must have shape {expected_shape}. Got {tuple(hidden.shape)}."
+            )
+        if tuple(hidden.shape) != expected_shape:
+            raise ValueError(
+                f"{context} shape mismatch. Expected {expected_shape}, got {tuple(hidden.shape)}."
+            )
+        return hidden.to(device=device, dtype=dtype)
+
+    def _iter_visual_prefix_memory_updates(self) -> list[nn.GRUCell]:
+        if self.use_signature_indexed_slot_memory:
+            raise RuntimeError(
+                "`_iter_visual_prefix_memory_updates` is only valid for the legacy "
+                "GRU-style visual prefix memory path."
+            )
+        updates = [self.visual_prefix_memory_update, *self.visual_prefix_memory_extra_updates]
+        assert len(updates) == self.config.num_memory_slots, (
+            "Number of visual prefix memory updaters must match `num_memory_slots`. "
+            f"Got updaters={len(updates)} vs slots={self.config.num_memory_slots}."
+        )
+        return updates
+
+    def _pool_visual_features_for_memory(self, features: Tensor) -> Tensor:
+        pooled = self.visual_prefix_memory_pool(features).flatten(1)
+        assert pooled.ndim == 2 and pooled.shape[1] == self.config.dim_model, (
+            "Visual prefix memory pooled features must have shape "
+            f"(batch_like, {self.config.dim_model}). Got {tuple(pooled.shape)}."
+        )
+        return pooled
+
+    def _flatten_camera_image_batch(
+        self,
+        camera_images: list[Tensor],
+        *,
+        context: str,
+    ) -> tuple[Tensor, int, int | None, int]:
+        if not camera_images:
+            raise ValueError(f"{context} requires at least one camera tensor.")
+
+        ref_shape = tuple(camera_images[0].shape)
+        ref_ndim = camera_images[0].ndim
+        if ref_ndim not in {4, 5}:
+            raise ValueError(
+                f"{context} camera tensors must have shape (B, C, H, W) or (B, T, C, H, W). "
+                f"Got ndim={ref_ndim}, shape={ref_shape}."
+            )
+
+        for camera_idx, images in enumerate(camera_images[1:], start=1):
+            if images.ndim != ref_ndim:
+                raise ValueError(
+                    f"{context} camera tensor {camera_idx} ndim mismatch. "
+                    f"Expected {ref_ndim}, got {images.ndim}."
+                )
+            if tuple(images.shape) != ref_shape:
+                raise ValueError(
+                    f"{context} camera tensor {camera_idx} shape mismatch. "
+                    f"Expected {ref_shape}, got {tuple(images.shape)}."
+                )
+
+        num_cameras = len(camera_images)
+        if ref_ndim == 4:
+            batch_size = ref_shape[0]
+            time_steps = None
+            flat_images = torch.cat(camera_images, dim=0)
+        else:
+            batch_size, time_steps = ref_shape[:2]
+            flat_images = torch.cat(
+                [images.reshape(batch_size * time_steps, *images.shape[2:]) for images in camera_images],
+                dim=0,
+            )
+
+        return flat_images, batch_size, time_steps, num_cameras
+
+    def _encode_images_for_visual_prefix_memory(self, images: Tensor) -> Tensor:
+        if images.ndim == 4:
+            flat_images = images
+            batch_size = images.shape[0]
+            time_steps = None
+        elif images.ndim == 5:
+            batch_size, time_steps = images.shape[:2]
+            flat_images = images.reshape(batch_size * time_steps, *images.shape[2:])
+        else:
+            raise ValueError(
+                "Visual prefix memory images must have shape (B, C, H, W) or "
+                f"(B, T, C, H, W). Got {tuple(images.shape)}."
+            )
+
+        features = self.backbone(flat_images)["feature_map"]
+        features = self.encoder_img_feat_input_proj(features)
+        pooled = self._pool_visual_features_for_memory(features)
+        if time_steps is None:
+            return pooled
+        return pooled.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _encode_multi_camera_images_for_visual_prefix_memory(
+        self,
+        camera_images: list[Tensor],
+    ) -> Tensor:
+        flat_images, batch_size, time_steps, num_cameras = self._flatten_camera_image_batch(
+            camera_images,
+            context="Visual prefix memory",
+        )
+        features = self.backbone(flat_images)["feature_map"]
+        features = self.encoder_img_feat_input_proj(features)
+        pooled = self._pool_visual_features_for_memory(features)
+        if time_steps is None:
+            pooled = pooled.reshape(num_cameras, batch_size, self.config.dim_model)
+        else:
+            pooled = pooled.reshape(num_cameras, batch_size, time_steps, self.config.dim_model)
+        if num_cameras == 1:
+            return pooled[0]
+        return pooled.mean(dim=0)
+
+    def _reduce_camera_embeddings_for_visual_prefix_memory(
+        self,
+        camera_embeddings: list[Tensor],
+    ) -> Tensor:
+        if not camera_embeddings:
+            raise ValueError("Visual prefix memory requires at least one camera embedding.")
+        if len(camera_embeddings) == 1:
+            return camera_embeddings[0]
+        return torch.stack(camera_embeddings, dim=0).mean(dim=0)
+
+    def _encode_multi_camera_observation_tokens(
+        self,
+        camera_images: list[Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        flat_images, batch_size, time_steps, num_cameras = self._flatten_camera_image_batch(
+            camera_images,
+            context="Observation image encoding",
+        )
+        if time_steps is not None:
+            raise ValueError(
+                "Observation image encoding expects current-step camera tensors with shape "
+                f"(B, C, H, W). Got time_steps={time_steps}."
+            )
+
+        cam_features = self.backbone(flat_images)["feature_map"]
+        cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+        cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+        _, dim_model, feat_h, feat_w = cam_features.shape
+        cam_features = cam_features.reshape(num_cameras, batch_size, dim_model, feat_h, feat_w)
+        if cam_pos_embed.shape[0] == 1:
+            cam_pos_embed = cam_pos_embed.expand(num_cameras, -1, -1, -1)
+            cam_pos_embed = einops.rearrange(cam_pos_embed, "cam c h w -> (cam h w) 1 c")
+        else:
+            cam_pos_embed = cam_pos_embed.reshape(num_cameras, batch_size, dim_model, feat_h, feat_w)
+            cam_pos_embed = einops.rearrange(cam_pos_embed, "cam b c h w -> (cam h w) b c")
+
+        return (
+            einops.rearrange(cam_features, "cam b c h w -> (cam h w) b c"),
+            cam_pos_embed,
+        )
+
+    def _project_prefix_states_for_visual_prefix_memory(self, prefix_state: Tensor) -> Tensor:
+        batch_size, time_steps, state_dim = prefix_state.shape
+        flat_prefix_state = prefix_state.reshape(batch_size * time_steps, state_dim)
+        projected = self.encoder_robot_state_input_proj(flat_prefix_state)
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
+
     def _project_signature_tensor(
         self,
         signature: Tensor,
@@ -453,20 +930,23 @@ class StreamingACT(nn.Module):
         context: str,
     ) -> Tensor:
         if self.signature_proj is None:
-            raise RuntimeError(
-                f"{context} requires `self.signature_proj` to be initialized."
-            )
-        if signature.ndim != 2:
+            raise RuntimeError(f"{context} requires `self.signature_proj` to be initialized.")
+        if signature.ndim not in {2, 3}:
             raise ValueError(
-                f"{context} must have shape (B, D_sig). Got {tuple(signature.shape)}."
+                f"{context} must have shape (B, D_sig) or (B, T, D_sig). Got {tuple(signature.shape)}."
             )
         if signature.shape[-1] != self.config.signature_dim:
             raise ValueError(
-                f"{context} last dim must equal `signature_dim={self.config.signature_dim}`. "
+                f"{context} trailing dim must equal signature_dim={self.config.signature_dim}. "
                 f"Got {signature.shape[-1]}."
             )
         dtype = self.signature_proj[0].weight.dtype
-        return self.signature_proj(signature.to(dtype=dtype))
+        if signature.ndim == 2:
+            return self.signature_proj(signature.to(dtype=dtype))
+        batch_size, time_steps, signature_dim = signature.shape
+        flat_signature = signature.reshape(batch_size * time_steps, signature_dim)
+        projected = self.signature_proj(flat_signature.to(dtype=dtype))
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
 
     def _project_delta_signature_tensor(
         self,
@@ -478,20 +958,627 @@ class StreamingACT(nn.Module):
             raise RuntimeError(
                 f"{context} requires `self.delta_signature_proj` to be initialized."
             )
-        if delta_signature.ndim != 2:
+        if delta_signature.ndim not in {2, 3}:
             raise ValueError(
-                f"{context} must have shape (B, D_sig). Got {tuple(delta_signature.shape)}."
+                f"{context} must have shape (B, D_sig) or (B, T, D_sig). Got {tuple(delta_signature.shape)}."
             )
         if delta_signature.shape[-1] != self.config.signature_dim:
             raise ValueError(
-                f"{context} last dim must equal `signature_dim={self.config.signature_dim}`. "
+                f"{context} trailing dim must equal signature_dim={self.config.signature_dim}. "
                 f"Got {delta_signature.shape[-1]}."
             )
         dtype = self.delta_signature_proj[0].weight.dtype
-        return self.delta_signature_proj(delta_signature.to(dtype=dtype))
+        if delta_signature.ndim == 2:
+            return self.delta_signature_proj(delta_signature.to(dtype=dtype))
+        batch_size, time_steps, signature_dim = delta_signature.shape
+        flat_delta_signature = delta_signature.reshape(batch_size * time_steps, signature_dim)
+        projected = self.delta_signature_proj(flat_delta_signature.to(dtype=dtype))
+        return projected.reshape(batch_size, time_steps, self.config.dim_model)
+
+    def _build_visual_prefix_memory_step_input(
+        self,
+        *,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+    ) -> Tensor:
+        inputs = [visual_t, state_t]
+        if self.use_signature_conditioned_visual_prefix_memory:
+            if signature_t is None:
+                raise ValueError(
+                    "Signature-conditioned visual prefix memory update requires `signature_t`."
+                )
+            inputs.append(signature_t)
+            if self.use_delta_signature:
+                if delta_signature_t is None:
+                    raise ValueError(
+                        "Delta-signature-conditioned visual prefix memory update requires "
+                        "`delta_signature_t` when `use_delta_signature=True`."
+                )
+                inputs.append(delta_signature_t)
+        return torch.cat(inputs, dim=-1)
+
+    def _build_slot_memory_route_features(
+        self,
+        *,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        context: str,
+    ) -> Tensor:
+        if not self.use_signature_indexed_slot_memory:
+            raise RuntimeError(
+                "`_build_slot_memory_route_features` requires "
+                "`use_signature_indexed_slot_memory=True`."
+            )
+        if signature_t is None:
+            raise ValueError(f"{context} requires `signature_t` for slot routing.")
+        route_features = [signature_t]
+        if self.config.slot_memory_use_delta_routing:
+            if delta_signature_t is None:
+                raise ValueError(
+                    f"{context} requires `delta_signature_t` when "
+                    "`slot_memory_use_delta_routing=True`."
+                )
+            route_features.append(delta_signature_t)
+        route_features = torch.cat(route_features, dim=-1)
+        expected_dim = self.config.dim_model * (
+            1 + int(self.config.slot_memory_use_delta_routing)
+        )
+        if route_features.ndim != 2 or route_features.shape[1] != expected_dim:
+            raise ValueError(
+                f"{context} route features must have shape (batch_size, {expected_dim}). "
+                f"Got {tuple(route_features.shape)}."
+            )
+        return route_features
+
+    def _compute_signature_indexed_slot_memory_route(
+        self,
+        *,
+        memory_prev: Tensor,
+        route_features: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        route_hidden = self.slot_memory_route_proj(route_features)
+        routing_query = self.slot_memory_route_query_proj(route_hidden).unsqueeze(1)
+        routing_keys = self.slot_memory_route_key_proj(memory_prev)
+        routing_logits = torch.matmul(
+            routing_query, routing_keys.transpose(1, 2)
+        ).squeeze(1) / math.sqrt(self.config.slot_memory_routing_hidden_dim)
+        if self.config.slot_memory_use_softmax_routing:
+            routing_weights = torch.softmax(routing_logits, dim=-1)
+            routing_distribution = routing_weights
+        else:
+            routing_weights = torch.sigmoid(routing_logits)
+            routing_distribution = routing_weights / routing_weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+        return route_hidden, routing_logits, routing_weights, routing_distribution
+
+    def _read_signature_indexed_slot_memory_context(
+        self,
+        *,
+        memory_state: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        route_hidden: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if route_hidden is None:
+            route_features = self._build_slot_memory_route_features(
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                context="Signature-indexed slot memory readout",
+            )
+            route_hidden = self.slot_memory_route_proj(route_features)
+        read_query_input = torch.cat([visual_t, state_t, route_hidden], dim=-1)
+        read_query = self.slot_memory_read_query_proj(read_query_input).unsqueeze(1)
+        read_keys = self.slot_memory_read_key_proj(memory_state)
+        read_values = self.slot_memory_read_value_proj(memory_state)
+        read_logits = torch.matmul(
+            read_query, read_keys.transpose(1, 2)
+        ).squeeze(1) / math.sqrt(self.config.dim_model)
+        read_weights = torch.softmax(read_logits, dim=-1)
+        readout_context = torch.sum(read_weights.unsqueeze(-1) * read_values, dim=1)
+        return readout_context, read_logits, read_weights
+
+    def _update_signature_indexed_slot_memory_step(
+        self,
+        *,
+        memory_prev: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        valid_t: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        batch_size, num_slots, hidden_dim = memory_prev.shape
+        route_features = self._build_slot_memory_route_features(
+            signature_t=signature_t,
+            delta_signature_t=delta_signature_t,
+            context="Signature-indexed slot memory update",
+        )
+        route_hidden, routing_logits, routing_weights, routing_distribution = (
+            self._compute_signature_indexed_slot_memory_route(
+                memory_prev=memory_prev,
+                route_features=route_features,
+            )
+        )
+        write_input = torch.cat([visual_t, state_t, route_features], dim=-1)
+        write_base = self.slot_memory_write_proj(write_input)
+        slot_state_input = torch.cat(
+            [
+                memory_prev,
+                write_base.unsqueeze(1).expand(batch_size, num_slots, hidden_dim),
+                route_hidden.unsqueeze(1).expand(
+                    batch_size,
+                    num_slots,
+                    self.config.slot_memory_routing_hidden_dim,
+                ),
+            ],
+            dim=-1,
+        )
+        candidate = self.slot_memory_candidate_proj(slot_state_input)
+        gate = torch.sigmoid(self.slot_memory_gate_proj(slot_state_input))
+        write_strength = routing_weights.unsqueeze(-1) * gate
+        updated_hidden = memory_prev + write_strength * (candidate - memory_prev)
+
+        if valid_t is not None:
+            valid_t = valid_t.to(dtype=torch.bool, device=memory_prev.device)
+            if valid_t.shape != (batch_size,):
+                raise ValueError(
+                    "Signature-indexed slot memory valid mask must have shape "
+                    f"({batch_size},). Got {tuple(valid_t.shape)}."
+                )
+            updated_hidden = torch.where(
+                valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev
+            )
+
+        readout_context, readout_logits, readout_weights = (
+            self._read_signature_indexed_slot_memory_context(
+                memory_state=updated_hidden,
+                visual_t=visual_t,
+                state_t=state_t,
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                route_hidden=route_hidden,
+            )
+        )
+        return updated_hidden, {
+            "routing_logits": routing_logits,
+            "routing_weights": routing_weights,
+            "routing_distribution": routing_distribution,
+            "write_base": write_base,
+            "candidate": candidate,
+            "gate": gate,
+            "readout_context": readout_context,
+            "readout_logits": readout_logits,
+            "readout_weights": readout_weights,
+        }
+
+    def _update_visual_prefix_memory_step(
+        self,
+        *,
+        memory_prev: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        valid_t: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if self.use_signature_indexed_slot_memory:
+            return self._update_signature_indexed_slot_memory_step(
+                memory_prev=memory_prev,
+                visual_t=visual_t,
+                state_t=state_t,
+                signature_t=signature_t,
+                delta_signature_t=delta_signature_t,
+                valid_t=valid_t,
+            )
+        batch_size = memory_prev.shape[0]
+        step_input = self._build_visual_prefix_memory_step_input(
+            visual_t=visual_t,
+            state_t=state_t,
+            signature_t=signature_t,
+            delta_signature_t=delta_signature_t,
+        )
+        updated_hidden = torch.stack(
+            [
+                slot_update(step_input, memory_prev[:, slot_idx, :])
+                for slot_idx, slot_update in enumerate(self._iter_visual_prefix_memory_updates())
+            ],
+            dim=1,
+        )
+        if valid_t is None:
+            return updated_hidden, {}
+        valid_t = valid_t.to(dtype=torch.bool, device=memory_prev.device)
+        if valid_t.shape != (batch_size,):
+            raise ValueError(
+                "Visual prefix memory valid mask must have shape "
+                f"({batch_size},). Got {tuple(valid_t.shape)}."
+            )
+        return torch.where(valid_t.view(batch_size, 1, 1), updated_hidden, memory_prev), {}
+
+    def _build_visual_prefix_memory_aux_losses(
+        self,
+        *,
+        routing_distribution_sum: Tensor | None,
+        consistency_loss_sum: Tensor | None,
+        valid_step_count: Tensor | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Tensor]:
+        aux_losses: dict[str, Tensor] = {}
+        if valid_step_count is None:
+            return aux_losses
+        valid_step_count = valid_step_count.clamp_min(1.0)
+        if (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_balance_loss_coef > 0.0
+        ):
+            if routing_distribution_sum is None:
+                raise RuntimeError(
+                    "Missing routing distribution statistics for slot-memory "
+                    "balance loss."
+                )
+            average_routing = routing_distribution_sum / valid_step_count
+            uniform = torch.full(
+                average_routing.shape,
+                fill_value=1.0 / float(self.active_memory_num_slots),
+                device=device,
+                dtype=dtype,
+            )
+            aux_losses["slot_memory_balance_loss"] = F.mse_loss(
+                average_routing,
+                uniform,
+                reduction="mean",
+            )
+        if (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_consistency_loss_coef > 0.0
+        ):
+            if consistency_loss_sum is None:
+                raise RuntimeError(
+                    "Missing readout/write statistics for slot-memory consistency loss."
+                )
+            aux_losses["slot_memory_consistency_loss"] = consistency_loss_sum / valid_step_count
+        return aux_losses
+
+    def _scan_visual_prefix_memory(
+        self,
+        *,
+        visual_embeddings: Tensor,
+        state_embeddings: Tensor,
+        signature_embeddings: Tensor | None,
+        delta_signature_embeddings: Tensor | None,
+        prefix_mask: Tensor,
+        initial_state: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, time_steps, hidden_dim = visual_embeddings.shape
+        assert state_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+            "Visual prefix memory state embeddings must match visual embeddings. "
+            f"Got visual={tuple(visual_embeddings.shape)} vs "
+            f"state={tuple(state_embeddings.shape)}."
+        )
+        assert prefix_mask.shape == (batch_size, time_steps), (
+            "Visual prefix memory mask must match the prefix sequence shape. "
+            f"Got mask={tuple(prefix_mask.shape)} vs sequence={(batch_size, time_steps)}."
+        )
+        if signature_embeddings is not None:
+            assert signature_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+                "Visual prefix memory signature embeddings must match visual embeddings. "
+                f"Got signature={tuple(signature_embeddings.shape)} vs "
+                f"visual={tuple(visual_embeddings.shape)}."
+            )
+        if delta_signature_embeddings is not None:
+            assert delta_signature_embeddings.shape == (batch_size, time_steps, hidden_dim), (
+                "Visual prefix memory delta-signature embeddings must match visual embeddings. "
+                f"Got delta_signature={tuple(delta_signature_embeddings.shape)} vs "
+                f"visual={tuple(visual_embeddings.shape)}."
+            )
+
+        if initial_state is None:
+            hidden = self._build_zero_visual_prefix_memory_state(
+                batch_size=batch_size,
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
+            )
+        else:
+            hidden = self._normalize_visual_prefix_memory_state(
+                initial_state,
+                batch_size=batch_size,
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
+                context="Visual prefix memory initial state",
+            )
+
+        prefix_mask = prefix_mask.to(dtype=torch.bool, device=visual_embeddings.device)
+        need_balance_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_balance_loss_coef > 0.0
+        )
+        need_consistency_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_consistency_loss_coef > 0.0
+        )
+        routing_distribution_sum = None
+        consistency_loss_sum = None
+        valid_step_count = None
+        for step_idx in range(time_steps):
+            hidden, step_stats = self._update_visual_prefix_memory_step(
+                memory_prev=hidden,
+                visual_t=visual_embeddings[:, step_idx],
+                state_t=state_embeddings[:, step_idx],
+                signature_t=(
+                    None if signature_embeddings is None else signature_embeddings[:, step_idx]
+                ),
+                delta_signature_t=(
+                    None
+                    if delta_signature_embeddings is None
+                    else delta_signature_embeddings[:, step_idx]
+                ),
+                valid_t=prefix_mask[:, step_idx],
+            )
+            if need_balance_loss:
+                step_distribution = step_stats["routing_distribution"]
+                masked_distribution = (
+                    step_distribution
+                    * prefix_mask[:, step_idx].to(step_distribution.dtype).unsqueeze(-1)
+                )
+                step_distribution_sum = masked_distribution.sum(dim=0)
+                if routing_distribution_sum is None:
+                    routing_distribution_sum = step_distribution_sum
+                else:
+                    routing_distribution_sum = routing_distribution_sum + step_distribution_sum
+            if need_consistency_loss:
+                readout_context = step_stats["readout_context"]
+                write_base = step_stats["write_base"]
+                step_consistency = F.mse_loss(
+                    readout_context,
+                    write_base,
+                    reduction="none",
+                ).mean(dim=-1)
+                masked_step_consistency = (
+                    step_consistency * prefix_mask[:, step_idx].to(step_consistency.dtype)
+                ).sum()
+                if consistency_loss_sum is None:
+                    consistency_loss_sum = masked_step_consistency
+                else:
+                    consistency_loss_sum = consistency_loss_sum + masked_step_consistency
+            if need_balance_loss or need_consistency_loss:
+                step_valid_count = prefix_mask[:, step_idx].to(hidden.dtype).sum()
+                if valid_step_count is None:
+                    valid_step_count = step_valid_count
+                else:
+                    valid_step_count = valid_step_count + step_valid_count
+        aux_losses = self._build_visual_prefix_memory_aux_losses(
+            routing_distribution_sum=routing_distribution_sum,
+            consistency_loss_sum=consistency_loss_sum,
+            valid_step_count=valid_step_count,
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        return hidden, aux_losses
+
+    def _compute_visual_prefix_memory_context(
+        self,
+        *,
+        memory_state: Tensor,
+        visual_embedding: Tensor,
+        state_embedding: Tensor,
+        signature_embedding: Tensor | None,
+        delta_signature_embedding: Tensor | None,
+    ) -> Tensor:
+        if memory_state.ndim != 3:
+            raise ValueError(
+                "Visual prefix memory state must have shape "
+                f"(batch_size, num_memory_slots, dim_model). Got {tuple(memory_state.shape)}."
+            )
+        if not self.use_signature_indexed_slot_memory:
+            return memory_state.mean(dim=1)
+        if not self.config.slot_memory_use_readout_pooling:
+            return memory_state.mean(dim=1)
+        readout_context, _, _ = self._read_signature_indexed_slot_memory_context(
+            memory_state=memory_state,
+            visual_t=visual_embedding,
+            state_t=state_embedding,
+            signature_t=signature_embedding,
+            delta_signature_t=delta_signature_embedding,
+        )
+        return readout_context
+
+    def _apply_visual_prefix_memory_encoder_film(
+        self,
+        encoder_tokens: Tensor,
+        *,
+        memory_context: Tensor,
+        exclude_prefix_tokens: int = 0,
+    ) -> Tensor:
+        if self.visual_prefix_memory_encoder_film is None:
+            raise RuntimeError(
+                "`_apply_visual_prefix_memory_encoder_film` requires "
+                "`self.visual_prefix_memory_encoder_film` to be initialized."
+            )
+        if encoder_tokens.ndim != 3:
+            raise ValueError(
+                "Encoder tokens must have shape (sequence, batch_size, dim_model). "
+                f"Got {tuple(encoder_tokens.shape)}."
+            )
+        if memory_context.ndim != 2:
+            raise ValueError(
+                "Memory context must have shape (batch_size, dim_model). "
+                f"Got {tuple(memory_context.shape)}."
+            )
+        seq_len, batch_size, dim_model = encoder_tokens.shape
+        if memory_context.shape != (batch_size, dim_model):
+            raise ValueError(
+                "Memory context shape mismatch. "
+                f"Expected {(batch_size, dim_model)}, got {tuple(memory_context.shape)}."
+            )
+        if exclude_prefix_tokens < 0 or exclude_prefix_tokens > seq_len:
+            raise ValueError(
+                "`exclude_prefix_tokens` must lie in [0, sequence_length]. "
+                f"Got {exclude_prefix_tokens} for sequence_length={seq_len}."
+            )
+        if exclude_prefix_tokens == seq_len:
+            return encoder_tokens
+
+        film_params = self.visual_prefix_memory_encoder_film(
+            memory_context.to(dtype=encoder_tokens.dtype)
+        )
+        gamma, beta = film_params.chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        target_tokens = encoder_tokens[exclude_prefix_tokens:]
+        conditioned = target_tokens * (1.0 + gamma.unsqueeze(0)) + beta.unsqueeze(0)
+        if exclude_prefix_tokens == 0:
+            return conditioned
+        return torch.cat([encoder_tokens[:exclude_prefix_tokens], conditioned], dim=0)
+
+    def _compute_visual_prefix_memory_token_from_prefix_sequence(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        assert PREFIX_STATE_KEY in batch, (
+            f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
+        )
+        assert PREFIX_MASK_KEY in batch, (
+            f"`{PREFIX_MASK_KEY}` is required to reconstruct visual prefix memory during training."
+        )
+        prefix_camera_images = [
+            batch[prefix_image_key] for prefix_image_key in self.config.prefix_image_features
+        ]
+        visual_embeddings = self._encode_multi_camera_images_for_visual_prefix_memory(
+            prefix_camera_images
+        )
+        state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
+        signature_embeddings = None
+        delta_signature_embeddings = None
+        uses_signature_routed_memory = (
+            self.use_signature_indexed_slot_memory
+            or self.use_signature_conditioned_visual_prefix_memory
+        )
+        requires_delta_memory_signature = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_use_delta_routing
+        ) or (
+            self.use_signature_conditioned_visual_prefix_memory
+            and self.use_delta_signature
+        )
+        if uses_signature_routed_memory:
+            assert PREFIX_PATH_SIGNATURE_KEY in batch, (
+                f"`{PREFIX_PATH_SIGNATURE_KEY}` is required to reconstruct "
+                "signature-routed visual prefix memory during training."
+            )
+            signature_embeddings = self._project_signature_tensor(
+                batch[PREFIX_PATH_SIGNATURE_KEY],
+                context="Prefix path-signature sequence",
+            )
+            if requires_delta_memory_signature:
+                assert PREFIX_DELTA_SIGNATURE_KEY in batch, (
+                    f"`{PREFIX_DELTA_SIGNATURE_KEY}` is required to reconstruct "
+                    "delta-signature-routed visual prefix memory during training."
+                )
+                delta_signature_embeddings = self._project_delta_signature_tensor(
+                    batch[PREFIX_DELTA_SIGNATURE_KEY],
+                    context="Prefix delta-signature sequence",
+                )
+        memory_state, aux_losses = self._scan_visual_prefix_memory(
+            visual_embeddings=visual_embeddings,
+            state_embeddings=state_embeddings,
+            signature_embeddings=signature_embeddings,
+            delta_signature_embeddings=delta_signature_embeddings,
+            prefix_mask=batch[PREFIX_MASK_KEY],
+        )
+        return memory_state, aux_losses
+
+    def compute_online_visual_prefix_memory_token(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        previous_state: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.use_visual_prefix_memory:
+            raise RuntimeError(
+                "`compute_online_visual_prefix_memory_token` requires "
+                "`use_visual_prefix_memory=True`."
+            )
+        assert OBS_IMAGES in batch, (
+            "Online visual prefix memory update requires current-step images in `batch[OBS_IMAGES]`."
+        )
+        assert OBS_STATE in batch, (
+            "Online visual prefix memory update requires `observation.state` in the batch."
+        )
+
+        visual_embedding = self._encode_multi_camera_images_for_visual_prefix_memory(
+            batch[OBS_IMAGES]
+        )
+        state_embedding = self.encoder_robot_state_input_proj(batch[OBS_STATE])
+        if previous_state is None:
+            hidden = self._build_zero_visual_prefix_memory_state(
+                batch_size=visual_embedding.shape[0],
+                device=visual_embedding.device,
+                dtype=visual_embedding.dtype,
+            )
+        else:
+            hidden = self._normalize_visual_prefix_memory_state(
+                previous_state,
+                batch_size=visual_embedding.shape[0],
+                device=visual_embedding.device,
+                dtype=visual_embedding.dtype,
+                context="Cached visual prefix memory state",
+            )
+        signature_embedding = None
+        delta_signature_embedding = None
+        uses_signature_routed_memory = (
+            self.use_signature_indexed_slot_memory
+            or self.use_signature_conditioned_visual_prefix_memory
+        )
+        requires_delta_memory_signature = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_use_delta_routing
+        ) or (
+            self.use_signature_conditioned_visual_prefix_memory
+            and self.use_delta_signature
+        )
+        if uses_signature_routed_memory:
+            assert PATH_SIGNATURE_KEY in batch, (
+                "Online signature-routed visual prefix memory update requires "
+                f"`{PATH_SIGNATURE_KEY}` in the batch."
+            )
+            signature_embedding = self._project_signature_tensor(
+                batch[PATH_SIGNATURE_KEY],
+                context="Current path signature",
+            )
+            if requires_delta_memory_signature:
+                assert DELTA_SIGNATURE_KEY in batch, (
+                    "Online delta-signature-routed visual prefix memory update requires "
+                    f"`{DELTA_SIGNATURE_KEY}` in the batch."
+                )
+                delta_signature_embedding = self._project_delta_signature_tensor(
+                    batch[DELTA_SIGNATURE_KEY],
+                    context="Current delta signature",
+                )
+        next_state, _ = self._update_visual_prefix_memory_step(
+            memory_prev=hidden,
+            visual_t=visual_embedding,
+            state_t=state_embedding,
+            signature_t=signature_embedding,
+            delta_signature_t=delta_signature_embedding,
+            valid_t=torch.ones(
+                (visual_embedding.shape[0],),
+                dtype=torch.bool,
+                device=visual_embedding.device,
+            ),
+        )
+        return next_state, next_state
 
     def forward(
-        self, batch: dict[str, Tensor]
+        self,
+        batch: dict[str, Tensor],
+        *,
+        visual_prefix_memory_token: Tensor | None = None,
+        skip_prefix_sequence_validation: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -499,7 +1586,14 @@ class StreamingACT(nn.Module):
         {
             [robot_state_feature] (optional): (B, state_dim) batch of robot states.
 
-            [image_features]: (B, n_cameras, C, H, W) batch of images.
+            [image_features]: (B, n_cameras, C, H, W) batch of current-step images.
+            [FIRST_FRAME_ANCHOR_KEY] (optional): (B, C, H, W) first-frame anchor image.
+            [PATH_SIGNATURE_KEY] (optional): (B, signature_dim) current path signature.
+            [DELTA_SIGNATURE_KEY] (optional): (B, signature_dim) current delta signature.
+            [PREFIX_STATE_KEY] (optional): (B, T_prefix, state_dim) prefix state sequence.
+            [PREFIX_PATH_SIGNATURE_KEY] (optional): (B, T_prefix, signature_dim) prefix signature sequence.
+            [PREFIX_DELTA_SIGNATURE_KEY] (optional): (B, T_prefix, signature_dim) prefix delta-signature sequence.
+            [PREFIX_MASK_KEY] (optional): (B, T_prefix) prefix valid mask.
                 AND/OR
             [env_state_feature]: (B, env_dim) batch of environment states.
 
@@ -512,30 +1606,17 @@ class StreamingACT(nn.Module):
             latent dimension.
         """
         if self.config.use_vae and self.training:
-            assert (
-                ACTION in batch
-            ), "actions must be provided when using the variational objective in training mode."
+            assert ACTION in batch, (
+                "actions must be provided when using the variational objective in training mode."
+            )
 
-        batch_size = (
-            batch[OBS_IMAGES][0].shape[0]
-            if OBS_IMAGES in batch
-            else (
-                batch[OBS_ENV_STATE].shape[0]
-                if OBS_ENV_STATE in batch
-                else batch[OBS_STATE].shape[0]
-            )
-        )
-        model_device = (
-            batch[OBS_STATE].device
-            if OBS_STATE in batch
-            else (
-                batch[OBS_ENV_STATE].device
-                if OBS_ENV_STATE in batch
-                else batch[OBS_IMAGES][0].device
-            )
-        )
+        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        self._last_visual_prefix_memory_aux_losses = {}
+        if not skip_prefix_sequence_validation:
+            self._validate_prefix_sequence_inputs(batch, batch_size)
 
         signature_embed = None
+        signature_step_embed = None
         if self.use_path_signature:
             assert PATH_SIGNATURE_KEY in batch, (
                 f"`{PATH_SIGNATURE_KEY}` is required when `use_path_signature=True`."
@@ -549,12 +1630,21 @@ class StreamingACT(nn.Module):
                 f"Batch mismatch for `{PATH_SIGNATURE_KEY}`: expected {batch_size}, "
                 f"got {path_signature.shape[0]}."
             )
-            signature_embed = self._project_signature_tensor(
+            assert path_signature.shape[1] == self.config.signature_dim, (
+                f"`{PATH_SIGNATURE_KEY}` second dim must be `signature_dim={self.config.signature_dim}`. "
+                f"Got {path_signature.shape[1]}."
+            )
+            signature_step_embed = self._project_signature_tensor(
                 path_signature,
                 context="Current path signature",
-            ).unsqueeze(1)
-
+            )
+            assert signature_step_embed.shape == (batch_size, self.config.dim_model), (
+                f"`signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(signature_step_embed.shape)}."
+            )
+            signature_embed = signature_step_embed.unsqueeze(1)  # (B, 1, D)
         delta_signature_embed = None
+        delta_signature_step_embed = None
         if self.use_delta_signature:
             assert DELTA_SIGNATURE_KEY in batch, (
                 f"`{DELTA_SIGNATURE_KEY}` is required when `use_delta_signature=True`."
@@ -568,10 +1658,72 @@ class StreamingACT(nn.Module):
                 f"Batch mismatch for `{DELTA_SIGNATURE_KEY}`: expected {batch_size}, "
                 f"got {delta_signature.shape[0]}."
             )
-            delta_signature_embed = self._project_delta_signature_tensor(
+            assert delta_signature.shape[1] == self.config.signature_dim, (
+                f"`{DELTA_SIGNATURE_KEY}` second dim must be "
+                f"`signature_dim={self.config.signature_dim}`. "
+                f"Got {delta_signature.shape[1]}."
+            )
+            delta_signature_step_embed = self._project_delta_signature_tensor(
                 delta_signature,
                 context="Current delta signature",
-            ).unsqueeze(1)
+            )
+            assert delta_signature_step_embed.shape == (batch_size, self.config.dim_model), (
+                f"`delta_signature_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(delta_signature_step_embed.shape)}."
+            )
+            delta_signature_embed = delta_signature_step_embed.unsqueeze(1)  # (B, 1, D)
+
+        if self.use_first_frame_anchor:
+            assert FIRST_FRAME_ANCHOR_KEY in batch, (
+                f"`{FIRST_FRAME_ANCHOR_KEY}` is required when `use_first_frame_anchor=True`."
+            )
+            anchor_image = batch[FIRST_FRAME_ANCHOR_KEY]
+            assert anchor_image.ndim == 4, (
+                f"`{FIRST_FRAME_ANCHOR_KEY}` must have shape (batch_size, C, H, W). "
+                f"Got ndim={anchor_image.ndim}, shape={tuple(anchor_image.shape)}."
+            )
+            assert anchor_image.shape[0] == batch_size, (
+                f"Batch mismatch for `{FIRST_FRAME_ANCHOR_KEY}`: expected {batch_size}, "
+                f"got {anchor_image.shape[0]}."
+            )
+            anchor_features = self.backbone(anchor_image)["feature_map"]
+            anchor_features = self.encoder_img_feat_input_proj(anchor_features)
+            anchor_embed = self.anchor_token_pool(anchor_features).flatten(1)
+            anchor_embed = self.anchor_token_proj(anchor_embed)
+            assert anchor_embed.shape == (batch_size, self.config.dim_model), (
+                f"`anchor_embed` must have shape ({batch_size}, {self.config.dim_model}). "
+                f"Got {tuple(anchor_embed.shape)}."
+            )
+            anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
+
+        visual_prefix_memory_embed = None
+        if self.use_visual_prefix_memory:
+            if visual_prefix_memory_token is None:
+                (
+                    visual_prefix_memory_embed,
+                    self._last_visual_prefix_memory_aux_losses,
+                ) = self._compute_visual_prefix_memory_token_from_prefix_sequence(batch)
+            else:
+                if visual_prefix_memory_token.ndim != 3:
+                    raise ValueError(
+                        "Visual prefix memory token override must have shape "
+                        f"(batch_size, num_memory_slots, dim_model). Got {tuple(visual_prefix_memory_token.shape)}."
+                    )
+                expected_shape = (
+                    batch_size,
+                    self.active_memory_num_slots,
+                    self.config.dim_model,
+                )
+                if tuple(visual_prefix_memory_token.shape) != expected_shape:
+                    raise ValueError(
+                        "Visual prefix memory token override shape mismatch. "
+                        f"Expected {expected_shape}, got {tuple(visual_prefix_memory_token.shape)}."
+                    )
+                visual_prefix_memory_embed = visual_prefix_memory_token.to(
+                    device=batch[OBS_STATE].device,
+                    dtype=self.encoder_latent_input_proj.weight.dtype,
+                )
+                self._last_visual_prefix_memory_aux_losses = {}
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -580,20 +1732,12 @@ class StreamingACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(
-                    batch[OBS_STATE]
-                )
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
-            action_embed = self.vae_encoder_action_input_proj(
-                batch[ACTION]
-            )  # (B, S, D)
+            action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
             if self.config.robot_state_feature:
-                vae_encoder_input = [
-                    cls_embed,
-                    robot_state_embed,
-                    action_embed,
-                ]  # (B, S+2, D)
+                vae_encoder_input = [cls_embed, robot_state_embed, action_embed]  # (B, S+2, D)
             else:
                 vae_encoder_input = [cls_embed, action_embed]
             vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
@@ -608,7 +1752,7 @@ class StreamingACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=model_device,
+                device=batch[OBS_STATE].device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -619,9 +1763,7 @@ class StreamingACT(nn.Module):
                 vae_encoder_input.permute(1, 0, 2),
                 pos_embed=pos_embed.permute(1, 0, 2),
                 key_padding_mask=key_padding_mask,
-            )[
-                0
-            ]  # select the class token, with shape (B, D)
+            )[0]  # select the class token, with shape (B, D)
             latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
             mu = latent_pdf_params[:, : self.config.latent_dim]
             # This is 2log(sigma). Done this way to match the original implementation.
@@ -633,88 +1775,128 @@ class StreamingACT(nn.Module):
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros(
-                [batch_size, self.config.latent_dim], dtype=torch.float32
-            ).to(model_device)
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                batch[OBS_STATE].device
+            )
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(
-            self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)
-        )
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        current_robot_state_embed = None
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_robot_state_input_proj(batch[OBS_STATE])
-            )
+            current_robot_state_embed = self.encoder_robot_state_input_proj(batch[OBS_STATE])
+            encoder_in_tokens.append(current_robot_state_embed)
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+        image_token_seq = None
+        image_pos_seq = None
+        if self.config.visual_observation_features:
+            image_token_seq, image_pos_seq = self._encode_multi_camera_observation_tokens(
+                batch[OBS_IMAGES]
             )
-
-        if self.config.image_features:
-            # For a list of images, the H and W may vary but H*W is constant.
-            # NOTE: If modifying this section, verify on MPS devices that
-            # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
-                    dtype=cam_features.dtype
-                )
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
-
-                # Rearrange features to (sequence, batch, dim).
-                cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        if image_token_seq is not None and image_pos_seq is not None:
+            encoder_in_tokens = torch.cat([encoder_in_tokens, image_token_seq], dim=0)
+            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, image_pos_seq], dim=0)
+
+        if self.use_memory_conditioned_encoder_film:
+            assert visual_prefix_memory_embed is not None, (
+                "Memory-conditioned encoder FiLM requires `visual_prefix_memory_embed`."
+            )
+            assert current_robot_state_embed is not None, (
+                "Memory-conditioned encoder FiLM requires a projected robot state token."
+            )
+            assert image_token_seq is not None, (
+                "Memory-conditioned encoder FiLM requires current-step image tokens "
+                "to derive the readout query."
+            )
+            memory_context = self._compute_visual_prefix_memory_context(
+                memory_state=visual_prefix_memory_embed,
+                visual_embedding=image_token_seq.mean(dim=0),
+                state_embedding=current_robot_state_embed,
+                signature_embedding=signature_step_embed,
+                delta_signature_embedding=delta_signature_step_embed,
+            )
+            # Keep the latent token untouched and modulate the current-step observation tokens.
+            encoder_in_tokens = self._apply_visual_prefix_memory_encoder_film(
+                encoder_in_tokens,
+                memory_context=memory_context,
+                exclude_prefix_tokens=1,
+            )
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
 
         extra_memory_tokens = []
         extra_memory_pos_embed = []
+        # Decoder cross-attention memory order:
+        # [anchor?, signature?, delta_signature?, prefix_memory_slots?, encoder_tokens...].
+        # These extra 1D tokens intentionally use zero positional embeddings; token type
+        # is conveyed by their dedicated projection path and fixed insertion order.
+        if self.use_first_frame_anchor:
+            anchor_token = anchor_embed.transpose(0, 1).to(
+                device=encoder_out.device, dtype=encoder_out.dtype
+            )  # (1, B, D)
+            anchor_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            extra_memory_tokens.append(anchor_token)
+            extra_memory_pos_embed.append(anchor_pos_embed)
         if self.use_path_signature:
-            assert signature_embed is not None
-            extra_memory_tokens.append(
-                signature_embed.transpose(0, 1).to(
-                    device=encoder_out.device, dtype=encoder_out.dtype
-                )
+            signature_token = signature_embed.transpose(0, 1).to(
+                device=encoder_out.device, dtype=encoder_out.dtype
+            )  # (1, B, D)
+            signature_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
             )
-            extra_memory_pos_embed.append(
-                torch.zeros(
-                    (1, 1, self.config.dim_model),
-                    dtype=encoder_in_pos_embed.dtype,
-                    device=encoder_in_pos_embed.device,
-                )
-            )
+            extra_memory_tokens.append(signature_token)
+            extra_memory_pos_embed.append(signature_pos_embed)
         if self.use_delta_signature:
             assert delta_signature_embed is not None
-            extra_memory_tokens.append(
-                delta_signature_embed.transpose(0, 1).to(
-                    device=encoder_out.device, dtype=encoder_out.dtype
-                )
+            delta_signature_token = delta_signature_embed.transpose(0, 1).to(
+                device=encoder_out.device,
+                dtype=encoder_out.dtype,
+            )  # (1, B, D)
+            delta_signature_pos_embed = torch.zeros(
+                (1, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
             )
-            extra_memory_pos_embed.append(
-                torch.zeros(
-                    (1, 1, self.config.dim_model),
-                    dtype=encoder_in_pos_embed.dtype,
-                    device=encoder_in_pos_embed.device,
-                )
+            extra_memory_tokens.append(delta_signature_token)
+            extra_memory_pos_embed.append(delta_signature_pos_embed)
+        if self.use_visual_prefix_memory:
+            assert visual_prefix_memory_embed is not None
+            visual_prefix_memory_token = visual_prefix_memory_embed.transpose(0, 1).to(
+                device=encoder_out.device,
+                dtype=encoder_out.dtype,
             )
+            visual_prefix_memory_pos_embed = torch.zeros(
+                (self.active_memory_num_slots, 1, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            extra_memory_tokens.append(visual_prefix_memory_token)
+            extra_memory_pos_embed.append(visual_prefix_memory_pos_embed)
+
         if extra_memory_tokens:
+            # Extra non-image context tokens are injected into encoder memory before decoder cross-attention.
             encoder_out = torch.cat([*extra_memory_tokens, encoder_out], dim=0)
-            encoder_in_pos_embed = torch.cat(
-                [*extra_memory_pos_embed, encoder_in_pos_embed], dim=0
+            encoder_in_pos_embed = torch.cat([*extra_memory_pos_embed, encoder_in_pos_embed], dim=0)
+            assert encoder_out.shape[0] == encoder_in_pos_embed.shape[0], (
+                "Encoder token length and positional embedding length must match after "
+                "extra memory token injection."
             )
+
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
@@ -742,21 +1924,12 @@ class StreamingACTEncoder(nn.Module):
     def __init__(self, config: StreamingACTConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
-        num_layers = (
-            config.n_vae_encoder_layers
-            if self.is_vae_encoder
-            else config.n_encoder_layers
-        )
-        self.layers = nn.ModuleList(
-            [StreamingACTEncoderLayer(config) for _ in range(num_layers)]
-        )
+        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        self.layers = nn.ModuleList([StreamingACTEncoderLayer(config) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 
     def forward(
-        self,
-        x: Tensor,
-        pos_embed: Tensor | None = None,
-        key_padding_mask: Tensor | None = None,
+        self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
     ) -> Tensor:
         for layer in self.layers:
             x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask)
@@ -767,9 +1940,7 @@ class StreamingACTEncoder(nn.Module):
 class StreamingACTEncoderLayer(nn.Module):
     def __init__(self, config: StreamingACTConfig):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
         # Feed forward layers.
         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
@@ -784,9 +1955,7 @@ class StreamingACTEncoderLayer(nn.Module):
         self.activation = get_activation_fn(config.feedforward_activation)
         self.pre_norm = config.pre_norm
 
-    def forward(
-        self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
-    ) -> Tensor:
+    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
@@ -811,9 +1980,7 @@ class StreamingACTDecoder(nn.Module):
     def __init__(self, config: StreamingACTConfig):
         """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
-        self.layers = nn.ModuleList(
-            [StreamingACTDecoderLayer(config) for _ in range(config.n_decoder_layers)]
-        )
+        self.layers = nn.ModuleList([StreamingACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
         self.norm = nn.LayerNorm(config.dim_model)
 
     def forward(
@@ -825,10 +1992,7 @@ class StreamingACTDecoder(nn.Module):
     ) -> Tensor:
         for layer in self.layers:
             x = layer(
-                x,
-                encoder_out,
-                decoder_pos_embed=decoder_pos_embed,
-                encoder_pos_embed=encoder_pos_embed,
+                x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed
             )
         if self.norm is not None:
             x = self.norm(x)
@@ -838,12 +2002,8 @@ class StreamingACTDecoder(nn.Module):
 class StreamingACTDecoderLayer(nn.Module):
     def __init__(self, config: StreamingACTConfig):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
-        self.multihead_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
         # Feed forward layers.
         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
@@ -884,9 +2044,7 @@ class StreamingACTDecoderLayer(nn.Module):
         if self.pre_norm:
             x = self.norm1(x)
         q = k = self.maybe_add_pos_embed(x, decoder_pos_embed)
-        x = self.self_attn(q, k, value=x)[
-            0
-        ]  # select just the output, not the attention weights
+        x = self.self_attn(q, k, value=x)[0]  # select just the output, not the attention weights
         x = skip + self.dropout1(x)
         if self.pre_norm:
             skip = x
@@ -898,9 +2056,7 @@ class StreamingACTDecoderLayer(nn.Module):
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
             value=encoder_out,
-        )[
-            0
-        ]  # select just the output, not the attention weights
+        )[0]  # select just the output, not the attention weights
         x = skip + self.dropout2(x)
         if self.pre_norm:
             skip = x
@@ -925,14 +2081,9 @@ def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tenso
     """
 
     def get_position_angle_vec(position):
-        return [
-            position / np.power(10000, 2 * (hid_j // 2) / dimension)
-            for hid_j in range(dimension)
-        ]
+        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
 
-    sinusoid_table = np.array(
-        [get_position_angle_vec(pos_i) for pos_i in range(num_positions)]
-    )
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
     return torch.from_numpy(sinusoid_table).float()
@@ -977,9 +2128,7 @@ class StreamingACTSinusoidalPositionEmbedding2d(nn.Module):
         x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
 
         inverse_frequency = self._temperature ** (
-            2
-            * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2)
-            / self.dimension
+            2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension
         )
 
         x_range = x_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
@@ -987,15 +2136,9 @@ class StreamingACTSinusoidalPositionEmbedding2d(nn.Module):
 
         # Note: this stack then flatten operation results in interleaved sine and cosine terms.
         # pos_embed_x and pos_embed_y are (1, H, W, C // 2).
-        pos_embed_x = torch.stack(
-            (x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1
-        ).flatten(3)
-        pos_embed_y = torch.stack(
-            (y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1
-        ).flatten(3)
-        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(
-            0, 3, 1, 2
-        )  # (1, C, H, W)
+        pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
+        pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
+        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
 
         return pos_embed
 

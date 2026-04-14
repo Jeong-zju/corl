@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import math
 import re
@@ -18,7 +19,15 @@ from dataset_utils import (
     load_dataset_split,
     resolve_dataset_root,
 )
-from eval_helpers import write_summary
+from eval_helpers import (
+    build_prefix_sequence_eval_inputs,
+    compute_delta_signature_step_np,
+    compute_signatory_signature_np,
+    compute_simple_signature_np,
+    ensure_prefix_sequence_batch_dims,
+    resolve_signature_backend,
+    write_summary,
+)
 
 
 MAIN_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +60,8 @@ SUPPORTED_TASK_FEATURE_KEYS = {
     TASK_NAME_FEATURE_KEY,
     TASK_DESCRIPTION_FEATURE_KEY,
 }
+DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 
 
 def _maybe_create_tqdm(
@@ -169,11 +180,16 @@ def _validate_supported_input_features(cfg) -> None:
     if state_key is not None:
         supported.add(state_key)
     supported.update(_resolve_required_task_feature_keys(cfg))
+    if bool(getattr(cfg, "use_path_signature", False)):
+        supported.add(DEFAULT_PATH_SIGNATURE_KEY)
+    if bool(getattr(cfg, "use_delta_signature", False)):
+        supported.add(DEFAULT_DELTA_SIGNATURE_KEY)
 
     unsupported = [str(key) for key in input_features if str(key) not in supported]
     if unsupported:
         raise NotImplementedError(
-            "RoboCasa ACT eval currently supports image, state, and task-id inputs only. "
+            "RoboCasa eval currently supports image, state, task-id, and optional "
+            "path-signature inputs only. "
             f"Unsupported input features: {unsupported}"
         )
 
@@ -287,6 +303,28 @@ def _normalize_robocasa_split(raw_value: str | None) -> str:
             f"got {raw_value!r}."
         )
     return value
+
+
+def _compute_online_signature(
+    state_history: deque[np.ndarray],
+    history_length: int,
+    sig_depth: int,
+    signature_backend: str,
+) -> np.ndarray:
+    if history_length <= 0:
+        raise ValueError(f"history_length must be > 0, got {history_length}")
+    if len(state_history) == 0:
+        raise ValueError("state_history is empty; cannot compute path signature.")
+
+    window = np.stack(list(state_history), axis=0).astype(np.float32, copy=False)
+    if window.shape[0] < history_length:
+        pad_len = history_length - window.shape[0]
+        pad = np.repeat(window[:1], pad_len, axis=0)
+        window = np.concatenate([pad, window], axis=0)
+
+    if signature_backend == "signatory":
+        return compute_signatory_signature_np(window, sig_depth)
+    return compute_simple_signature_np(window, sig_depth)
 
 
 def _parse_tasks(task_arg: str | None) -> list[str]:
@@ -579,6 +617,7 @@ class RoboCasaACTPolicyAdapter:
         postprocessor,
         policy_dir: Path,
         task_index_resolver: _TaskIndexResolver,
+        signature_backend: str | None = None,
     ) -> None:
         self.policy = policy
         self.cfg = cfg
@@ -587,8 +626,21 @@ class RoboCasaACTPolicyAdapter:
         self.policy_dir = policy_dir
         self.task_index_resolver = task_index_resolver
         self.visual_specs = _resolve_visual_features(cfg)
+        self.policy_image_keys = [policy_key for policy_key, _env_key, _shape in self.visual_specs]
         self.state_feature_key, self.state_shape = _resolve_state_feature_key(cfg)
         self.required_task_feature_keys = _resolve_required_task_feature_keys(cfg)
+        self.use_path_signature = bool(getattr(cfg, "use_path_signature", False))
+        self.use_prefix_sequence_training = bool(
+            getattr(cfg, "use_prefix_sequence_training", False)
+        )
+        self.use_visual_prefix_memory = bool(
+            getattr(cfg, "use_visual_prefix_memory", False)
+        )
+        self.use_delta_signature = bool(getattr(cfg, "use_delta_signature", False))
+        self.build_explicit_prefix_eval_inputs = bool(
+            self.use_prefix_sequence_training and not self.use_visual_prefix_memory
+        )
+        self.signature_backend = signature_backend
         _validate_supported_input_features(cfg)
         if self.state_feature_key is None:
             raise RuntimeError(
@@ -602,10 +654,34 @@ class RoboCasaACTPolicyAdapter:
                 "mapping was found. Pass `--dataset robocasa/...` or evaluate from a "
                 "training run that still has `dataset_split.json`."
             )
+        if self.use_path_signature and self.signature_backend is None:
+            raise RuntimeError(
+                "RoboCasa streaming_act eval requires a resolved signature backend "
+                "when `use_path_signature=True`."
+            )
+        self.reset()
 
     def reset(self) -> None:
         if hasattr(self.policy, "reset"):
             self.policy.reset()
+        if self.use_path_signature:
+            self.state_history = deque(maxlen=int(self.cfg.history_length))
+            self.previous_signature_vec: np.ndarray | None = None
+        else:
+            self.state_history = None
+            self.previous_signature_vec = None
+        if self.build_explicit_prefix_eval_inputs:
+            self.prefix_state_history: list[Any] = []
+            self.prefix_image_histories = {
+                image_key: [] for image_key in self.policy_image_keys
+            }
+            self.prefix_signature_history = [] if self.use_path_signature else None
+            self.prefix_delta_signature_history = [] if self.use_delta_signature else None
+        else:
+            self.prefix_state_history = None
+            self.prefix_image_histories = None
+            self.prefix_signature_history = None
+            self.prefix_delta_signature_history = None
 
     def _build_task_feature(
         self,
@@ -684,7 +760,105 @@ class RoboCasaACTPolicyAdapter:
         import torch
 
         obs = self._build_policy_observation(observation, env=env)
+        if self.use_path_signature:
+            assert self.state_history is not None
+            state_now = (
+                obs[self.state_feature_key]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+            self.state_history.append(state_now.copy())
+            signature_vec = _compute_online_signature(
+                state_history=self.state_history,
+                history_length=int(self.cfg.history_length),
+                sig_depth=int(self.cfg.signature_depth),
+                signature_backend=str(self.signature_backend),
+            )
+            if signature_vec.shape[0] != int(self.cfg.signature_dim):
+                raise RuntimeError(
+                    "Online signature dimension mismatch: "
+                    f"got {signature_vec.shape[0]}, expected cfg.signature_dim={self.cfg.signature_dim}."
+                )
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = torch.from_numpy(
+                signature_vec.astype(np.float32, copy=False)
+            )
+            if self.use_delta_signature:
+                delta_signature_vec = compute_delta_signature_step_np(
+                    signature_vec,
+                    self.previous_signature_vec,
+                )
+                obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
+                    delta_signature_vec.astype(np.float32, copy=False)
+                )
+                self.previous_signature_vec = signature_vec.astype(np.float32, copy=True)
+
+        if self.build_explicit_prefix_eval_inputs:
+            assert self.prefix_state_history is not None
+            assert self.prefix_image_histories is not None
+            build_prefix_sequence_eval_inputs(
+                obs=obs,
+                cfg=self.cfg,
+                state_key=self.state_feature_key,
+                image_keys=self.policy_image_keys,
+                signature_key=(
+                    DEFAULT_PATH_SIGNATURE_KEY if self.use_path_signature else None
+                ),
+                delta_signature_key=(
+                    DEFAULT_DELTA_SIGNATURE_KEY if self.use_delta_signature else None
+                ),
+                prefix_state_history=self.prefix_state_history,
+                prefix_signature_history=self.prefix_signature_history,
+                prefix_delta_signature_history=self.prefix_delta_signature_history,
+                prefix_image_histories=self.prefix_image_histories,
+            )
+
         obs = self.preprocessor(obs)
+        if self.use_path_signature:
+            if DEFAULT_PATH_SIGNATURE_KEY not in obs:
+                raise KeyError(
+                    f"`{DEFAULT_PATH_SIGNATURE_KEY}` missing after preprocessing; "
+                    "cannot run policy with use_path_signature=True."
+                )
+            path_signature = obs[DEFAULT_PATH_SIGNATURE_KEY]
+            if path_signature.ndim == 1:
+                path_signature = path_signature.unsqueeze(0)
+            elif path_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_PATH_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                    f"got shape={tuple(path_signature.shape)}"
+                )
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature.to(
+                device=obs[self.state_feature_key].device,
+                dtype=obs[self.state_feature_key].dtype,
+            )
+        if self.use_delta_signature:
+            if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
+                raise KeyError(
+                    f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessing; "
+                    "cannot run policy with use_delta_signature=True."
+                )
+            delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
+            if delta_signature.ndim == 1:
+                delta_signature = delta_signature.unsqueeze(0)
+            elif delta_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                    f"got shape={tuple(delta_signature.shape)}"
+                )
+            obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
+                device=obs[self.state_feature_key].device,
+                dtype=obs[self.state_feature_key].dtype,
+            )
+        if self.build_explicit_prefix_eval_inputs:
+            ensure_prefix_sequence_batch_dims(
+                obs=obs,
+                state_key=self.state_feature_key,
+                image_keys=self.policy_image_keys,
+                use_path_signature=self.use_path_signature,
+                use_delta_signature=self.use_delta_signature,
+            )
         with torch.no_grad():
             action = self.policy.select_action(obs)
         action = self.postprocessor(action)
@@ -862,9 +1036,9 @@ def evaluate_policy(
     postprocessor,
     policy_dir: Path,
 ) -> None:
-    if policy_type != "act":
+    if policy_type not in {"act", "streaming_act"}:
         raise NotImplementedError(
-            "RoboCasa env eval currently supports only `act` checkpoints."
+            "RoboCasa env eval currently supports `act` and `streaming_act` checkpoints."
         )
     if int(args.num_rollouts) <= 0:
         raise ValueError("`--num-rollouts` must be positive for RoboCasa eval.")
@@ -895,6 +1069,37 @@ def evaluate_policy(
         )
 
     _validate_supported_input_features(cfg)
+    use_path_signature = bool(
+        policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
+    )
+    use_prefix_sequence_training = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_prefix_sequence_training", False)
+    )
+    use_visual_prefix_memory = bool(
+        policy_type == "streaming_act"
+        and getattr(cfg, "use_visual_prefix_memory", False)
+    )
+    use_delta_signature = bool(
+        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
+    )
+    signature_backend = None
+    if use_path_signature:
+        signature_backend = resolve_signature_backend(
+            getattr(args, "signature_backend", "auto")
+        )
+        print(
+            "[load] RoboCasa streaming signatures: "
+            f"backend={signature_backend}, history={cfg.history_length}, "
+            f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+    if use_prefix_sequence_training:
+        mode_text = "online_visual_memory" if use_visual_prefix_memory else "full_prefix"
+        print(
+            "[load] RoboCasa prefix context: "
+            f"mode={mode_text}, max_steps={cfg.prefix_train_max_steps}, "
+            f"stride={cfg.prefix_frame_stride}, delta_signature={use_delta_signature}"
+        )
     visual_specs = _resolve_visual_features(cfg)
     camera_names, camera_width, camera_height = _resolve_camera_setup(visual_specs)
     video_image_key = _choose_video_image_key(visual_specs)
@@ -955,6 +1160,7 @@ def evaluate_policy(
                 postprocessor=postprocessor,
                 policy_dir=policy_dir,
                 task_index_resolver=task_index_resolver,
+                signature_backend=signature_backend,
             )
             _progress_write(
                 overall_progress,
