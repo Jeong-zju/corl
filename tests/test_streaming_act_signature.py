@@ -12,6 +12,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "data"))
+sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 sys.path.insert(
     0,
     str(
@@ -30,7 +31,9 @@ from lerobot_policy_streaming_act.configuration_streaming_act import (
     PATH_SIGNATURE_KEY,
     StreamingACTConfig,
 )
+from lerobot_policy_streaming_act.signature_cache import _manifests_are_compatible
 from lerobot_policy_streaming_act.modeling_streaming_act import StreamingACTPolicy
+from train_policy import resolve_effective_dataset_repo_id
 
 
 def _fixed_size_list(values: np.ndarray):
@@ -225,3 +228,71 @@ def test_process_dataset_writes_signature_cache_without_parquet_columns(
     cache_dir = next(dataset_root.glob(".signature_cache/*/signature_cache_v1"))
     assert (cache_dir / "metadata.json").exists()
     assert list(cache_dir.glob("*.npy"))
+
+
+def test_resolve_effective_dataset_repo_id_prefers_leaf_dataset_over_broad_defaults(
+    tmp_path: Path,
+) -> None:
+    local_data_root = tmp_path / "data"
+    dataset_root = local_data_root / "robocasa" / "composite" / "ArrangeBreadBasket"
+    dataset_root.mkdir(parents=True)
+
+    resolved = resolve_effective_dataset_repo_id(
+        requested_repo_id="robocasa/composite",
+        default_repo_id="robocasa/composite",
+        dataset_root=dataset_root,
+        local_data_root=local_data_root,
+    )
+
+    assert resolved == "robocasa/composite/ArrangeBreadBasket"
+
+
+def test_resolve_effective_dataset_repo_id_keeps_exact_dataset_defaults(
+    tmp_path: Path,
+) -> None:
+    local_data_root = tmp_path / "data"
+    dataset_root = local_data_root / "robocasa" / "composite" / "ArrangeBreadBasket"
+    dataset_root.mkdir(parents=True)
+
+    resolved = resolve_effective_dataset_repo_id(
+        requested_repo_id="robocasa/composite/ArrangeBreadBasket",
+        default_repo_id="robocasa/composite/ArrangeBreadBasket",
+        dataset_root=dataset_root,
+        local_data_root=local_data_root,
+    )
+
+    assert resolved == "robocasa/composite/ArrangeBreadBasket"
+
+
+def test_signature_cache_manifest_compat_accepts_legacy_info_backed_episode_path() -> None:
+    current_manifest = {
+        "dataset_root": "/tmp/dataset",
+        "info_path": "/tmp/dataset/meta/info.json",
+        "stats_path": "/tmp/dataset/meta/stats.json",
+        "episodes_path": "/tmp/dataset/meta/episodes/chunk-000/file-000.parquet",
+        "total_frames": 5,
+        "data_files": [
+            {
+                "path": "data/chunk-000/file-000.parquet",
+                "size": 123,
+                "mtime_ns": 1,
+            }
+        ],
+    }
+    cached_manifest = {
+        "dataset_root": "/tmp/dataset",
+        "info_path": "/tmp/dataset/meta/info.json",
+        "stats_path": "/tmp/dataset/meta/stats.json",
+        "episodes_path": "/tmp/dataset/meta/info.json",
+        "episode_metadata_path": "/tmp/dataset/meta/info.json",
+        "total_frames": 5,
+        "data_files": [
+            {
+                "path": "data/chunk-000/file-000.parquet",
+                "size": 123,
+                "mtime_ns": 999,
+            }
+        ],
+    }
+
+    assert _manifests_are_compatible(cached_manifest, current_manifest)

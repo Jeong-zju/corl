@@ -57,6 +57,44 @@ def resolve_signature_cache_dir(
     return root / f"signature_cache_v{SIGNATURE_CACHE_LAYOUT_VERSION}"
 
 
+def _normalize_dataset_repo_id_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().replace("\\", "/").strip("/")
+
+
+def resolve_effective_dataset_repo_id(
+    *,
+    requested_repo_id: str | None,
+    default_repo_id: str | None,
+    dataset_root: Path,
+    local_data_root: Path,
+) -> str:
+    inferred_repo_id = infer_dataset_repo_id(
+        dataset_root,
+        local_data_root=local_data_root.resolve(),
+    )
+    requested = _normalize_dataset_repo_id_text(requested_repo_id)
+    if not requested:
+        return inferred_repo_id
+
+    defaulted = _normalize_dataset_repo_id_text(default_repo_id)
+    inferred = _normalize_dataset_repo_id_text(inferred_repo_id)
+    if (
+        defaulted
+        and requested == defaulted
+        and inferred
+        and inferred != requested
+        and inferred.startswith(f"{requested}/")
+    ):
+        print(
+            "[INFO] dataset_repo_id: overriding broad defaults value "
+            f"`{requested}` with inferred dataset id `{inferred_repo_id}`"
+        )
+        return inferred_repo_id
+    return requested_repo_id if requested_repo_id is not None else inferred_repo_id
+
+
 def load_signature_cache_metadata(
     dataset_root: Path,
     *,
@@ -132,6 +170,39 @@ def augment_dataset_metadata_with_signature_cache(
         if key not in stats:
             stats[key] = _identity_signature_stats(int(cache_spec["shape"][0]))
     return info, stats
+
+
+def get_signature_cache_only_feature_keys(info: dict | None) -> set[str]:
+    """Return feature keys whose payload lives in `.signature_cache`, not parquet.
+
+    Older datasets record `storage=signature_cache` only in top-level metadata
+    like `info["path_signature"]`, while newer metadata may also attach storage
+    directly on the feature spec. We support both layouts here.
+    """
+    if not isinstance(info, dict):
+        return set()
+
+    keys: set[str] = set()
+    features = info.get("features", {})
+    if isinstance(features, dict):
+        for key, feature_spec in features.items():
+            if (
+                isinstance(feature_spec, dict)
+                and str(feature_spec.get("storage", "")).lower() == "signature_cache"
+            ):
+                keys.add(str(key))
+
+    for metadata_key in ("path_signature", "delta_signature"):
+        metadata = info.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        if str(metadata.get("storage", "")).lower() != "signature_cache":
+            continue
+        feature_key = metadata.get("key")
+        if feature_key:
+            keys.add(str(feature_key))
+
+    return keys
 
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
@@ -743,16 +814,29 @@ def install_lerobot_dataset_load_patch() -> None:
 
     def load_hf_dataset_with_timing(self):
         load_start_s = time.perf_counter()
-        cached_feature_keys = set(signature_cache_feature_keys_for_dataset(self.root))
+        runtime_cached_feature_keys = set(
+            signature_cache_feature_keys_for_dataset(self.root)
+        )
+        metadata_cached_feature_keys = get_signature_cache_only_feature_keys(
+            getattr(self.meta, "info", None)
+        )
+        cached_feature_keys = (
+            runtime_cached_feature_keys | metadata_cached_feature_keys
+        )
         load_feature_specs = {
             key: feature_spec
             for key, feature_spec in self.features.items()
             if key not in cached_feature_keys
         }
-        if cached_feature_keys:
+        if metadata_cached_feature_keys:
+            print(
+                "[INFO] dataset.load_hf_dataset: excluding signature-cache-only "
+                f"features from parquet load: {sorted(metadata_cached_feature_keys)}"
+            )
+        if runtime_cached_feature_keys:
             print(
                 "[INFO] signature_cache: excluding cached parquet columns from HF load: "
-                f"{sorted(cached_feature_keys)}"
+                f"{sorted(runtime_cached_feature_keys)}"
             )
         hf_transform = build_hf_transform_to_torch(load_feature_specs)
         parquet_paths = sorted((self.root / "data").glob("*/*.parquet"))
@@ -1721,6 +1805,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.set_defaults(
         _policy_defaults_path=(None if defaults_path is None else str(defaults_path)),
         _policy_defaults_dataset_root=defaults.get("dataset_root"),
+        _policy_defaults_dataset_repo_id=defaults.get("dataset_repo_id"),
     )
     return parser
 
@@ -1773,13 +1858,11 @@ def main(argv: list[str] | None = None) -> None:
             defaults_dataset_root,
             local_data_root=args.local_data_root.resolve(),
         )
-    dataset_repo_id = (
-        str(args.dataset_repo_id)
-        if args.dataset_repo_id
-        else infer_dataset_repo_id(
-            source_dataset_root,
-            local_data_root=args.local_data_root.resolve(),
-        )
+    dataset_repo_id = resolve_effective_dataset_repo_id(
+        requested_repo_id=args.dataset_repo_id,
+        default_repo_id=getattr(args, "_policy_defaults_dataset_repo_id", None),
+        dataset_root=source_dataset_root,
+        local_data_root=args.local_data_root.resolve(),
     )
     dataset_root = ensure_lerobot_dataset_v30_compat(
         source_dataset_root,

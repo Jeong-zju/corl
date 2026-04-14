@@ -442,24 +442,91 @@ def write_table_atomic(table, file_path: Path, pq_module) -> None:
     temp_path.replace(file_path)
 
 
+def _read_total_frames_from_info(info_path: Path) -> int | None:
+    if not info_path.exists():
+        return None
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    total_frames = info.get("total_frames")
+    if total_frames is None:
+        return None
+    total_frames = int(total_frames)
+    if total_frames <= 0:
+        raise ValueError(f"Expected a positive total_frames in {info_path}.")
+    return total_frames
+
+
+def _read_total_frames_from_episodes_jsonl(episodes_jsonl_path: Path) -> int | None:
+    if not episodes_jsonl_path.exists():
+        return None
+    total_frames = 0
+    found_lengths = False
+    with episodes_jsonl_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            length = record.get("length")
+            if length is None:
+                continue
+            length = int(length)
+            if length < 0:
+                raise ValueError(
+                    "Episode length must be non-negative in "
+                    f"{episodes_jsonl_path} at line {line_number}."
+                )
+            total_frames += length
+            found_lengths = True
+    return total_frames if found_lengths else None
+
+
+def resolve_episode_metadata(dataset_root: Path) -> tuple[Path, int]:
+    info_path = dataset_root / "meta/info.json"
+    total_frames_from_info = _read_total_frames_from_info(info_path)
+
+    episodes_parquet_path = dataset_root / "meta/episodes/chunk-000/file-000.parquet"
+    if episodes_parquet_path.exists():
+        if total_frames_from_info is not None:
+            return episodes_parquet_path, total_frames_from_info
+        _, pq = require_pyarrow()
+        episode_meta = pq.read_table(
+            episodes_parquet_path,
+            columns=["dataset_to_index"],
+        )
+        total_frames = int(max(episode_meta.column("dataset_to_index").to_pylist()))
+        if total_frames <= 0:
+            raise ValueError(
+                f"Expected positive dataset_to_index values in {episodes_parquet_path}."
+            )
+        return episodes_parquet_path, total_frames
+
+    if total_frames_from_info is not None:
+        return info_path, total_frames_from_info
+
+    episodes_jsonl_path = dataset_root / "meta/episodes.jsonl"
+    total_frames = _read_total_frames_from_episodes_jsonl(episodes_jsonl_path)
+    if total_frames is not None:
+        return episodes_jsonl_path, total_frames
+
+    raise FileNotFoundError(
+        "Could not determine dataset frame count. Checked "
+        f"{info_path}, {episodes_jsonl_path}, and {episodes_parquet_path}."
+    )
+
+
 def build_signature_cache_manifest(dataset_root: Path) -> dict[str, object]:
     data_files = iter_data_parquet_files(dataset_root)
     if not data_files:
         raise FileNotFoundError(
             f"No parquet files were found under {dataset_root / 'data'}."
         )
-    episodes_path = dataset_root / "meta/episodes/chunk-000/file-000.parquet"
-    _, pq = require_pyarrow()
-    episode_meta = pq.read_table(
-        episodes_path,
-        columns=["dataset_to_index"],
-    )
-    total_frames = int(max(episode_meta.column("dataset_to_index").to_pylist()))
+    episode_metadata_path, total_frames = resolve_episode_metadata(dataset_root)
     return {
         "dataset_root": str(dataset_root.resolve()),
         "info_path": str((dataset_root / "meta/info.json").resolve()),
         "stats_path": str((dataset_root / "meta/stats.json").resolve()),
-        "episodes_path": str(episodes_path.resolve()),
+        "episodes_path": str(episode_metadata_path.resolve()),
+        "episode_metadata_path": str(episode_metadata_path.resolve()),
         "total_frames": total_frames,
         "data_files": [
             {

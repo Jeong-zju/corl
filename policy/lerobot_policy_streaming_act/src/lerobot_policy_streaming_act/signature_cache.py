@@ -299,8 +299,21 @@ def _manifests_are_compatible(
         return False
     if cached_manifest.get("stats_path") != current_manifest.get("stats_path"):
         return False
-    if cached_manifest.get("episodes_path") != current_manifest.get("episodes_path"):
-        return False
+
+    current_episodes_path = current_manifest.get("episodes_path")
+    current_info_path = current_manifest.get("info_path")
+    cached_episodes_path = cached_manifest.get("episodes_path")
+    cached_episode_metadata_path = cached_manifest.get("episode_metadata_path")
+    legacy_info_backed_episode_path = (
+        cached_episodes_path == current_info_path
+        or cached_episode_metadata_path == current_info_path
+    )
+    if not legacy_info_backed_episode_path:
+        if (
+            cached_episodes_path != current_episodes_path
+            and cached_episode_metadata_path != current_episodes_path
+        ):
+            return False
     if int(cached_manifest.get("total_frames", -1)) != int(current_manifest.get("total_frames", -1)):
         return False
 
