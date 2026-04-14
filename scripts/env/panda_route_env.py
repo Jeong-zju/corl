@@ -4016,11 +4016,6 @@ def get_eval_defaults(policy_type: str) -> dict[str, Any]:
 
 
 def collect_dataset(args) -> Path:
-    if bool(getattr(args, "enable_first_frame_anchor", False)):
-        raise NotImplementedError(
-            "First-frame anchor dataset export is not implemented for `panda_route` yet. "
-            "Only `braidedhub` currently supports the shared-backbone raw-anchor path."
-        )
     map_config = build_default_map_config()
     enable_randomize = bool(getattr(args, "enable_randomize", False))
     print(
@@ -4149,11 +4144,6 @@ def evaluate_policy(
         raise RuntimeError("panda_route evaluation expects square image inputs.")
     if cfg.robot_state_feature is None:
         raise RuntimeError("Policy has no observation.state feature.")
-    if bool(getattr(cfg, "use_first_frame_anchor", False)):
-        raise NotImplementedError(
-            "First-frame anchor evaluation is not implemented for `panda_route` yet. "
-            "Only `braidedhub` currently supports the shared-backbone raw-anchor path."
-        )
     state_key = "observation.state"
     state_dim = int(cfg.robot_state_feature.shape[0])
 

@@ -15,7 +15,6 @@ train:
   eval_freq: -1
   chunk_size: 5
   n_action_steps: 5
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

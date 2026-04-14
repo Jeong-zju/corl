@@ -31,7 +31,6 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 RAW_IMAGE_ARRAY_STORAGE_ENCODING = "raw_uint8_array"
 RAW_IMAGE_ARRAY_STORAGE_DTYPE = "uint8"
 SIGNATURE_CACHE_LAYOUT_VERSION = 1
@@ -1019,33 +1018,6 @@ def install_lerobot_dataset_load_patch() -> None:
     LeRobotDataset._custom_dataset_load_patch_installed = True
 
 
-def resolve_use_imagenet_stats(
-    dataset_root: Path,
-    use_imagenet_stats: bool,
-) -> bool:
-    if not use_imagenet_stats:
-        return False
-
-    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
-    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
-
-    camera_keys = [
-        key
-        for key, spec in info.get("features", {}).items()
-        if isinstance(spec, dict) and spec.get("dtype") in ("image", "video")
-    ]
-    missing_camera_stats = [key for key in camera_keys if key not in stats]
-    if missing_camera_stats:
-        print(
-            "[WARN] meta/stats.json is missing camera stats keys required by "
-            "LeRobot's ImageNet-stats override:\n"
-            + "\n".join(f"  - {key}" for key in missing_camera_stats)
-            + "\n[WARN] Auto-switching to --disable-imagenet-stats behavior."
-        )
-        return False
-    return True
-
-
 def summarize_visual_storage_modes(dataset_root: Path) -> dict[str, int]:
     info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
     counts = {"image": 0, "video": 0}
@@ -1139,33 +1111,6 @@ def resolve_history_length(dataset_root: Path, history_length: int) -> int:
         "Could not auto-resolve history_length from dataset metadata. "
         "Install pyarrow or pass --history-length explicitly."
     )
-
-
-def validate_first_frame_anchor_dataset(
-    dataset_root: Path, use_first_frame_anchor: bool
-) -> None:
-    if not use_first_frame_anchor:
-        return
-
-    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
-    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
-    anchor_spec = info.get("features", {}).get(FIRST_FRAME_ANCHOR_KEY)
-    if anchor_spec is None:
-        raise KeyError(
-            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' not found in {dataset_root / 'meta/info.json'}. "
-            "Regenerate the dataset with "
-            "`main/scripts/collect_imitation_dataset.py --env braidedhub --enable-first-frame-anchor`."
-        )
-    if anchor_spec.get("dtype") not in {"image", "video"}:
-        raise ValueError(
-            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' must be stored as image/video, "
-            f"got dtype={anchor_spec.get('dtype')!r}."
-        )
-    if FIRST_FRAME_ANCHOR_KEY not in stats:
-        raise KeyError(
-            f"Dataset stats for '{FIRST_FRAME_ANCHOR_KEY}' are missing from {dataset_root / 'meta/stats.json'}. "
-            "Regenerate the dataset so the anchor feature participates in normalization."
-        )
 
 
 def validate_delta_signature_dataset(
@@ -1621,40 +1566,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("chunk_size", 5),
             help="ACT-style action chunk size.",
         )
-    anchor_group = parser.add_mutually_exclusive_group()
-    anchor_group.add_argument(
-        "--enable-first-frame-anchor",
-        dest="use_first_frame_anchor",
-        action="store_true",
-        help="Enable an episode-constant first-frame anchor token from observation.anchor_image.",
-    )
-    anchor_group.add_argument(
-        "--disable-first-frame-anchor",
-        dest="use_first_frame_anchor",
-        action="store_false",
-        help="Disable the first-frame anchor token input.",
-    )
-    parser.set_defaults(
-        use_first_frame_anchor=defaults.get("use_first_frame_anchor", False),
-    )
-
-    imagenet_group = parser.add_mutually_exclusive_group()
-    imagenet_group.add_argument(
-        "--enable-imagenet-stats",
-        dest="use_imagenet_stats",
-        action="store_true",
-        help="Replace visual dataset stats with ImageNet stats when available.",
-    )
-    imagenet_group.add_argument(
-        "--disable-imagenet-stats",
-        dest="use_imagenet_stats",
-        action="store_false",
-        help="Use dataset-provided visual stats instead of ImageNet stats.",
-    )
-    parser.set_defaults(
-        use_imagenet_stats=defaults.get("use_imagenet_stats", True),
-    )
-
     parser.add_argument(
         "--wandb-project",
         type=str,
@@ -1878,21 +1789,6 @@ def main(argv: list[str] | None = None) -> None:
         split_seed=int(args.split_seed),
         split_shuffle=bool(args.split_shuffle),
     )
-    use_first_frame_anchor = bool(args.use_first_frame_anchor)
-    validate_first_frame_anchor_dataset(
-        dataset_root=dataset_root,
-        use_first_frame_anchor=use_first_frame_anchor,
-    )
-    if args.policy != "streaming_act" and use_first_frame_anchor:
-        raise NotImplementedError(
-            "`--enable-first-frame-anchor` is only supported by the local "
-            "`streaming_act` implementation. Other current policies, including "
-            "`act` and `diffusion`, should be run without it."
-        )
-    use_imagenet_stats = resolve_use_imagenet_stats(
-        dataset_root=dataset_root,
-        use_imagenet_stats=args.use_imagenet_stats,
-    )
     visual_storage_modes = summarize_visual_storage_modes(dataset_root)
 
     from lerobot.policies.act.configuration_act import ACTConfig
@@ -2010,7 +1906,7 @@ def main(argv: list[str] | None = None) -> None:
         repo_id=dataset_repo_id,
         root=str(dataset_root),
         episodes=split_spec.train_episode_indices,
-        use_imagenet_stats=use_imagenet_stats,
+        use_imagenet_stats=False,
         video_backend=args.video_backend,
     )
 
@@ -2193,8 +2089,6 @@ def main(argv: list[str] | None = None) -> None:
             f"- action_execution: chunk_size={args.chunk_size}, "
             f"n_action_steps={args.n_action_steps}"
         )
-    print(f"- use_imagenet_stats: {use_imagenet_stats}")
-    print(f"- use_first_frame_anchor: {use_first_frame_anchor}")
     if args.policy == "streaming_act":
         print(f"- use_path_signature: {use_path_signature}")
         if use_path_signature:

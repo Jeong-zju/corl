@@ -24,7 +24,7 @@ bash bash/prepare_metaworld_mt50_sipm_dataset.sh \
 * 数据采集
 
 ```bash
-python scripts/collect_imitation_dataset.py --env braidedhub --num-per-task 100 --path-signature-depth 3 --enable-randomize --enable-first-frame-anchor
+python scripts/collect_imitation_dataset.py --env braidedhub --num-per-task 100 --path-signature-depth 3 --enable-randomize
 ```
 
 * 训练

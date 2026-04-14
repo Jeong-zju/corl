@@ -54,7 +54,7 @@
 anchor 的语义被严格定义为“episode reset 之后、执行第一步动作之前采集到的第一帧视觉观测”。它不是任意历史帧，也不是滑动窗口中的旧帧。
 
 实现要求：
-1. 新增显式开关，例如 `use_first_frame_anchor`，默认关闭。
+1. 新增显式开关，默认关闭。
 2. anchor 训练语义和评估语义必须完全一致：
    - 训练时：dataset export 阶段把 first-frame anchor 写入数据集；
    - 评估时：rollout 开始后缓存第一帧，并在整个 episode 中重复复用。

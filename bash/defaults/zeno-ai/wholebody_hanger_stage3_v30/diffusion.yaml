@@ -28,8 +28,6 @@ train:
   horizon: 104
   n_action_steps: 100
   drop_n_last_frames: 3
-  use_first_frame_anchor: false
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

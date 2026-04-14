@@ -14,11 +14,6 @@ policy:
     left: observation.images.realsense_left
     right: observation.images.realsense_right
     top: observation.images.realsense_top
-  use_path_signature: true
-  use_delta_signature: true
-  signature_depth: 3
-  signature_dim: 5219
-  signature_backend: auto
 
 runtime:
   control_hz: 20.0

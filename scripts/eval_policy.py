@@ -38,7 +38,6 @@ from policy_defaults import (
 )
 
 
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 
@@ -69,20 +68,6 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
             f"Streaming ACT package source not found: {streaming_act_src}"
         )
     sys.path.insert(0, str(streaming_act_src))
-
-
-def validate_first_frame_anchor_support(
-    *,
-    env_name: str,
-    use_first_frame_anchor: bool,
-) -> None:
-    if not use_first_frame_anchor:
-        return
-    if env_name != "braidedhub":
-        raise NotImplementedError(
-            "First-frame anchor evaluation is currently implemented only for `braidedhub`. "
-            f"Got env={env_name!r}."
-        )
 
 
 def validate_prefix_sequence_support(
@@ -735,10 +720,6 @@ def run_env_evaluation(
     postprocessor,
     policy_dir: Path,
 ) -> None:
-    validate_first_frame_anchor_support(
-        env_name=args.env,
-        use_first_frame_anchor=bool(getattr(cfg, "use_first_frame_anchor", False)),
-    )
     validate_prefix_sequence_support(
         policy_name=args.policy,
         use_prefix_sequence_training=bool(
@@ -848,7 +829,6 @@ def run_dataset_evaluation(
     use_delta_signature = bool(
         args.policy == "streaming_act" and getattr(cfg, "use_delta_signature", False)
     )
-    use_first_frame_anchor = bool(getattr(cfg, "use_first_frame_anchor", False))
     build_explicit_prefix_eval_inputs = (
         use_prefix_sequence_training and not use_visual_prefix_memory
     )
@@ -881,11 +861,6 @@ def run_dataset_evaluation(
                 else "the policy updates recurrent memory from the true current observation at each step"
             )
         )
-    if use_first_frame_anchor:
-        print(
-            "[info] first-frame anchor eval enabled: "
-            f"key={FIRST_FRAME_ANCHOR_KEY}, fallback_camera={visual_keys[0]}"
-        )
 
     action_dim: int | None = None
     total_abs_error: np.ndarray | None = None
@@ -895,7 +870,6 @@ def run_dataset_evaluation(
     total_cosine_count = 0
     total_steps = 0
     results: list[dict[str, object]] = []
-    warned_anchor_fallback = False
     planned_steps_per_episode: list[int] = []
     for _, rel_indices in episode_groups:
         planned_steps = len(rel_indices)
@@ -939,7 +913,6 @@ def run_dataset_evaluation(
             else None
         )
         previous_signature_vec: np.ndarray | None = None
-        first_frame_anchor = None
         episode_abs_error: np.ndarray | None = None
         episode_sq_error: np.ndarray | None = None
         episode_l2_error = 0.0
@@ -975,23 +948,6 @@ def run_dataset_evaluation(
                 obs[env_state_key] = as_tensor_copy(item[env_state_key])
             for visual_key in visual_keys:
                 obs[visual_key] = as_tensor_copy(item[visual_key])
-
-            if use_first_frame_anchor:
-                if FIRST_FRAME_ANCHOR_KEY in item:
-                    anchor_tensor = as_tensor_copy(item[FIRST_FRAME_ANCHOR_KEY])
-                    if first_frame_anchor is None:
-                        first_frame_anchor = anchor_tensor.detach().clone()
-                else:
-                    if not warned_anchor_fallback:
-                        print(
-                            "[WARN] Dataset does not contain `observation.anchor_image`; "
-                            f"falling back to the first frame from `{visual_keys[0]}`."
-                        )
-                        warned_anchor_fallback = True
-                    if first_frame_anchor is None:
-                        first_frame_anchor = as_tensor_copy(item[visual_keys[0]])
-                    anchor_tensor = first_frame_anchor.detach().clone()
-                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_tensor
 
             signature_vec: np.ndarray | None = None
             if use_path_signature:
@@ -1094,23 +1050,6 @@ def run_dataset_evaluation(
                     image_keys=visual_keys,
                     use_path_signature=use_path_signature,
                     use_delta_signature=use_delta_signature,
-                )
-            if use_first_frame_anchor:
-                if FIRST_FRAME_ANCHOR_KEY not in obs:
-                    raise KeyError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` missing after preprocessor."
-                    )
-                anchor_image = obs[FIRST_FRAME_ANCHOR_KEY]
-                if anchor_image.ndim == 3:
-                    anchor_image = anchor_image.unsqueeze(0)
-                elif anchor_image.ndim != 4:
-                    raise RuntimeError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` must be 3D/4D after preprocessing, "
-                        f"got shape={tuple(anchor_image.shape)}"
-                    )
-                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_image.to(
-                    device=obs[state_key].device,
-                    dtype=obs[state_key].dtype,
                 )
 
             with torch.no_grad():

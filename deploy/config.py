@@ -116,6 +116,8 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     raw = load_yaml_mapping(path)
 
     policy_raw = _as_mapping(raw, "policy")
+    policy_type = str(policy_raw.get("type", "act"))
+    use_streaming_signatures = policy_type == "streaming_act"
     runtime_raw = _as_mapping(raw, "runtime")
     image_raw = _as_mapping(raw, "image")
     ros_raw = _as_mapping(raw, "ros")
@@ -123,7 +125,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     command_raw = _as_mapping(raw, "command")
 
     policy = PolicyConfig(
-        type=str(policy_raw.get("type", "act")),
+        type=policy_type,
         path=resolve_path(policy_raw.get("path"), config_path=path, must_exist=False),
         device=str(policy_raw.get("device", "cuda")),
         load_device=(
@@ -149,13 +151,31 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
             "right": "observation.images.realsense_right",
             "top": "observation.images.realsense_top",
         },
-        use_path_signature=bool(policy_raw.get("use_path_signature", False)),
-        use_delta_signature=bool(policy_raw.get("use_delta_signature", False)),
-        signature_depth=int(policy_raw.get("signature_depth", 3)),
-        signature_dim=(
-            None if policy_raw.get("signature_dim") is None else int(policy_raw["signature_dim"])
+        use_path_signature=(
+            bool(policy_raw.get("use_path_signature", False))
+            if use_streaming_signatures
+            else False
         ),
-        signature_backend=str(policy_raw.get("signature_backend", "auto")),
+        use_delta_signature=(
+            bool(policy_raw.get("use_delta_signature", False))
+            if use_streaming_signatures
+            else False
+        ),
+        signature_depth=(
+            int(policy_raw.get("signature_depth", 3))
+            if use_streaming_signatures
+            else 0
+        ),
+        signature_dim=(
+            None
+            if (not use_streaming_signatures or policy_raw.get("signature_dim") is None)
+            else int(policy_raw["signature_dim"])
+        ),
+        signature_backend=(
+            str(policy_raw.get("signature_backend", "auto"))
+            if use_streaming_signatures
+            else "disabled"
+        ),
     )
 
     runtime = RuntimeConfig(

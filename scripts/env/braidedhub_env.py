@@ -125,7 +125,6 @@ DEFAULT_LAST_ACTION_MODE = "zero"
 DEFAULT_INCLUDE_PATH_SIGNATURES = True
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 DEFAULT_SIGNATURE_WINDOW_SIZE = 0
 DEFAULT_SIGNATURE_DEPTH = 3
 DEFAULT_SIGNATURE_BACKEND = "auto"
@@ -2083,7 +2082,6 @@ def collect_dataset(args) -> Path:
         image_size=args.image_size,
         config=map_config,
         episodes_per_chunk=args.episodes_per_chunk,
-        use_first_frame_anchor=bool(getattr(args, "enable_first_frame_anchor", False)),
         use_delta_signature=bool(getattr(args, "enable_delta_signature", False)),
     )
     return output_path
@@ -2181,7 +2179,6 @@ def evaluate_policy(
     build_explicit_prefix_eval_inputs = (
         use_prefix_sequence_training and not use_visual_prefix_memory
     )
-    use_first_frame_anchor = bool(getattr(cfg, "use_first_frame_anchor", False))
     signature_key = DEFAULT_PATH_SIGNATURE_KEY
     signature_backend = None
     if use_path_signature:
@@ -2219,11 +2216,6 @@ def evaluate_policy(
                 else "rollout uses fixed-size recurrent memory without rebuilding "
                 "explicit prefix-sequence tensors each step"
             )
-        )
-    if use_first_frame_anchor:
-        print(
-            "[info] first-frame anchor enabled: "
-            f"key={FIRST_FRAME_ANCHOR_KEY}, cache_lifetime=one_episode"
         )
 
     map_config = build_default_map_config()
@@ -2304,7 +2296,6 @@ def evaluate_policy(
         )
         prefix_image_history = [] if build_explicit_prefix_eval_inputs else None
         previous_signature_vec = None
-        first_frame_anchor = None
         last_info = {
             **env.last_info,
             "phase_name": env.get_phase_name(state_xy),
@@ -2321,8 +2312,6 @@ def evaluate_policy(
                 config=map_config,
                 robot_xy=state_xy,
             )
-            if use_first_frame_anchor and first_frame_anchor is None:
-                first_frame_anchor = frame.copy()
             writer.stdin.write(frame.astype(np.uint8).tobytes())
 
             obs = build_eval_observation(
@@ -2332,16 +2321,6 @@ def evaluate_policy(
                 image_key=image_key,
                 state_dim=state_dim,
             )
-            if use_first_frame_anchor:
-                if first_frame_anchor is None:
-                    raise RuntimeError("First-frame anchor cache was not initialized at rollout start.")
-                obs[FIRST_FRAME_ANCHOR_KEY] = (
-                    torch.from_numpy(first_frame_anchor)
-                    .permute(2, 0, 1)
-                    .contiguous()
-                    .float()
-                    / 255.0
-                )
 
             if use_path_signature:
                 assert state_history is not None
@@ -2439,24 +2418,6 @@ def evaluate_policy(
                     image_key=image_key,
                     use_path_signature=use_path_signature,
                     use_delta_signature=use_delta_signature,
-                )
-            if use_first_frame_anchor:
-                if FIRST_FRAME_ANCHOR_KEY not in obs:
-                    raise KeyError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` missing after preprocessor; "
-                        "cannot run policy with use_first_frame_anchor=True."
-                    )
-                anchor_image = obs[FIRST_FRAME_ANCHOR_KEY]
-                if anchor_image.ndim == 3:
-                    anchor_image = anchor_image.unsqueeze(0)
-                elif anchor_image.ndim != 4:
-                    raise RuntimeError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` must be 3D/4D after preprocessing, "
-                        f"got shape={tuple(anchor_image.shape)}"
-                    )
-                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_image.to(
-                    device=obs[state_key].device,
-                    dtype=obs[state_key].dtype,
                 )
 
             with torch.no_grad():
@@ -3942,7 +3903,6 @@ def generate_lerobot_v30_dataset(
     image_size: int = DEFAULT_VIDEO_IMAGE_SIZE,
     config: MapConfig | None = None,
     episodes_per_chunk: int = DEFAULT_LEROBOT_EPISODES_PER_CHUNK,
-    use_first_frame_anchor: bool = False,
     use_delta_signature: bool = False,
 ) -> Path:
     pa, pq = _require_lerobot_export_dependencies()
@@ -3983,8 +3943,6 @@ def generate_lerobot_v30_dataset(
 
     base_image = make_lerobot_base_image(map_config, image_size=image_size)
     video_keys = [VIDEO_KEY]
-    if use_first_frame_anchor:
-        video_keys.append(FIRST_FRAME_ANCHOR_KEY)
     records: dict[str, list[Any]] = {
         "timestamp": [],
         "frame_index": [],
@@ -4035,27 +3993,12 @@ def generate_lerobot_v30_dataset(
             root
             / f"videos/{VIDEO_KEY}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
         )
-        anchor_video_file = (
-            None
-            if not use_first_frame_anchor
-            else root
-            / f"videos/{FIRST_FRAME_ANCHOR_KEY}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
-        )
         data_file.parent.mkdir(parents=True, exist_ok=True)
         video_file.parent.mkdir(parents=True, exist_ok=True)
-        if anchor_video_file is not None:
-            anchor_video_file.parent.mkdir(parents=True, exist_ok=True)
 
         ffmpeg_proc = start_ffmpeg_raw_writer(video_file, image_size, image_size, fps)
         if ffmpeg_proc.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for raw video writing.")
-        anchor_ffmpeg_proc = None
-        if anchor_video_file is not None:
-            anchor_ffmpeg_proc = start_ffmpeg_raw_writer(
-                anchor_video_file, image_size, image_size, fps
-            )
-            if anchor_ffmpeg_proc.stdin is None:
-                raise RuntimeError("Failed to open ffmpeg stdin for anchor video writing.")
         episode_base_image = make_lerobot_episode_base_image(
             base_image,
             config=map_config,
@@ -4079,7 +4022,6 @@ def generate_lerobot_v30_dataset(
             episode_records[DEFAULT_PATH_SIGNATURE_KEY] = []
         if use_delta_signature:
             episode_records[DEFAULT_DELTA_SIGNATURE_KEY] = []
-        anchor_frame = None
         episode_delta_signatures = (
             None
             if not use_delta_signature
@@ -4137,37 +4079,16 @@ def generate_lerobot_v30_dataset(
                 robot_xy=(float(state_xy[0]), float(state_xy[1])),
             )
             update_visual_feature_stats(visual_stats_by_key[VIDEO_KEY], frame)
-            if use_first_frame_anchor and anchor_frame is None:
-                anchor_frame = frame.copy()
             ffmpeg_proc.stdin.write(frame.astype(np.uint8).tobytes())
-            if anchor_ffmpeg_proc is not None:
-                if anchor_frame is None:
-                    raise RuntimeError("Anchor frame was not initialized before anchor video write.")
-                anchor_ffmpeg_proc.stdin.write(anchor_frame.astype(np.uint8).tobytes())
             global_index += 1
 
         episode_to_index = global_index
-        if use_first_frame_anchor:
-            if anchor_frame is None:
-                raise RuntimeError("Anchor frame was not captured for the episode.")
-            update_visual_feature_stats(
-                visual_stats_by_key[FIRST_FRAME_ANCHOR_KEY],
-                anchor_frame,
-                weight=episode_length,
-            )
         ffmpeg_proc.stdin.close()
         return_code = ffmpeg_proc.wait()
         if return_code != 0:
             raise RuntimeError(
                 f"ffmpeg failed with code {return_code} for episode {episode_idx}"
             )
-        if anchor_ffmpeg_proc is not None:
-            anchor_ffmpeg_proc.stdin.close()
-            anchor_return_code = anchor_ffmpeg_proc.wait()
-            if anchor_return_code != 0:
-                raise RuntimeError(
-                    f"ffmpeg failed with code {anchor_return_code} for anchor episode {episode_idx}"
-                )
 
         episode_table = build_episode_data_table(pa, episode_records)
         pq.write_table(episode_table, data_file, compression="snappy")
@@ -4178,14 +4099,6 @@ def generate_lerobot_v30_dataset(
         video_frame_counts_by_key[VIDEO_KEY][episode_idx] = int(video_info["frames"])
         data_files.append(data_file)
         video_files.append(video_file)
-        if anchor_video_file is not None:
-            anchor_video_info = ffprobe_video(anchor_video_file)
-            if FIRST_FRAME_ANCHOR_KEY not in first_video_info_by_key:
-                first_video_info_by_key[FIRST_FRAME_ANCHOR_KEY] = anchor_video_info
-            video_frame_counts_by_key[FIRST_FRAME_ANCHOR_KEY][episode_idx] = int(
-                anchor_video_info["frames"]
-            )
-            video_files.append(anchor_video_file)
 
         episode_meta = {
             "episode_index": episode_idx,
@@ -4202,15 +4115,6 @@ def generate_lerobot_v30_dataset(
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
         }
-        if anchor_video_file is not None:
-            episode_meta.update(
-                {
-                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/chunk_index": chunk_index,
-                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/file_index": file_index,
-                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/from_timestamp": 0.0,
-                    f"videos/{FIRST_FRAME_ANCHOR_KEY}/to_timestamp": float(episode_length / fps),
-                }
-            )
         episodes_meta.append(episode_meta)
 
     total_frames = len(records["index"])
@@ -4371,28 +4275,6 @@ def generate_lerobot_v30_dataset(
             "task_index": {"dtype": "int64", "shape": [1], "names": None},
         },
     }
-    if use_first_frame_anchor:
-        anchor_video_info = first_video_info_by_key[FIRST_FRAME_ANCHOR_KEY]
-        info["features"][FIRST_FRAME_ANCHOR_KEY] = {
-            "dtype": "video",
-            "shape": [anchor_video_info["height"], anchor_video_info["width"], 3],
-            "names": ["height", "width", "channels"],
-            "info": {
-                "video.height": anchor_video_info["height"],
-                "video.width": anchor_video_info["width"],
-                "video.codec": anchor_video_info["codec"],
-                "video.pix_fmt": anchor_video_info["pix_fmt"],
-                "video.is_depth_map": False,
-                "video.fps": int(fps),
-                "video.channels": 3,
-                "has_audio": False,
-            },
-        }
-        info["first_frame_anchor"] = {
-            "key": FIRST_FRAME_ANCHOR_KEY,
-            "storage": "video",
-            "semantics": "episode_reset_first_frame_repeated_for_all_timesteps",
-        }
     if (
         processed_dataset.path_signatures is not None
         and processed_dataset.path_signature_key is not None
@@ -4446,10 +4328,6 @@ def generate_lerobot_v30_dataset(
         "timestamp": build_stats(np.asarray(records["timestamp"], dtype=np.float32)),
         VIDEO_KEY: finalize_visual_feature_stats(visual_stats_by_key[VIDEO_KEY]),
     }
-    if use_first_frame_anchor:
-        stats[FIRST_FRAME_ANCHOR_KEY] = finalize_visual_feature_stats(
-            visual_stats_by_key[FIRST_FRAME_ANCHOR_KEY]
-        )
     if (
         processed_dataset.path_signatures is not None
         and processed_dataset.path_signature_key is not None
