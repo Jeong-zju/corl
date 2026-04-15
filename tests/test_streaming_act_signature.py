@@ -48,7 +48,10 @@ from lerobot_policy_streaming_act.prefix_sequence import (
     build_prefix_sequence_input_features,
     prefix_image_key_from_camera_key,
 )
-from train_policy import resolve_effective_dataset_repo_id
+from train_policy import (
+    resolve_effective_dataset_repo_id,
+    resolve_pre_normalized_signature_observation_keys,
+)
 
 
 def _fixed_size_list(values: np.ndarray):
@@ -139,6 +142,29 @@ def test_streaming_act_signature_affects_output() -> None:
 
     assert out_1.shape == (2, 2, 17)
     assert not torch.allclose(out_1, out_2)
+
+
+def test_pre_normalized_signature_keys_include_prefix_sequence_keys() -> None:
+    assert resolve_pre_normalized_signature_observation_keys(
+        feature_keys=(PATH_SIGNATURE_KEY, DELTA_SIGNATURE_KEY),
+        reader_pre_normalized=True,
+        use_prefix_sequence_training=True,
+        use_path_signature=True,
+        use_delta_signature=True,
+    ) == (
+        PATH_SIGNATURE_KEY,
+        DELTA_SIGNATURE_KEY,
+        PREFIX_PATH_SIGNATURE_KEY,
+        PREFIX_DELTA_SIGNATURE_KEY,
+    )
+
+    assert resolve_pre_normalized_signature_observation_keys(
+        feature_keys=(PATH_SIGNATURE_KEY,),
+        reader_pre_normalized=True,
+        use_prefix_sequence_training=False,
+        use_path_signature=True,
+        use_delta_signature=False,
+    ) == (PATH_SIGNATURE_KEY,)
 
 
 def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:

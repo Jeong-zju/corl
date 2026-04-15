@@ -34,6 +34,10 @@ warnings.filterwarnings(
 RAW_IMAGE_ARRAY_STORAGE_ENCODING = "raw_uint8_array"
 RAW_IMAGE_ARRAY_STORAGE_DTYPE = "uint8"
 SIGNATURE_CACHE_LAYOUT_VERSION = 1
+PATH_SIGNATURE_FEATURE_KEY = "observation.path_signature"
+DELTA_SIGNATURE_FEATURE_KEY = "observation.delta_signature"
+PREFIX_PATH_SIGNATURE_FEATURE_KEY = "observation.prefix_path_signature"
+PREFIX_DELTA_SIGNATURE_FEATURE_KEY = "observation.prefix_delta_signature"
 
 
 def _sanitize_signature_cache_path_part(value: str) -> str:
@@ -146,6 +150,26 @@ def _identity_signature_stats(feature_dim: int) -> dict[str, list[float] | list[
         "std": ones,
         "count": [0],
     }
+
+
+def resolve_pre_normalized_signature_observation_keys(
+    *,
+    feature_keys: tuple[str, ...],
+    reader_pre_normalized: bool,
+    use_prefix_sequence_training: bool,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+) -> tuple[str, ...]:
+    if not reader_pre_normalized:
+        return ()
+
+    resolved_keys = list(str(key) for key in feature_keys)
+    if use_prefix_sequence_training:
+        if use_path_signature and PATH_SIGNATURE_FEATURE_KEY in resolved_keys:
+            resolved_keys.append(PREFIX_PATH_SIGNATURE_FEATURE_KEY)
+        if use_delta_signature and DELTA_SIGNATURE_FEATURE_KEY in resolved_keys:
+            resolved_keys.append(PREFIX_DELTA_SIGNATURE_FEATURE_KEY)
+    return tuple(dict.fromkeys(resolved_keys))
 
 
 def augment_dataset_metadata_with_signature_cache(
@@ -2551,12 +2575,20 @@ def main(argv: list[str] | None = None) -> None:
                 "Signature cache is required for this dataset because the parquet files "
                 "do not contain the requested signature columns, but the cache could not be prepared."
             )
-        if signature_cache_reader is not None and signature_cache_reader.pre_normalized:
-            policy_cfg.pre_normalized_observation_keys = tuple(
-                signature_cache_reader.feature_keys
+        policy_cfg.pre_normalized_observation_keys = (
+            resolve_pre_normalized_signature_observation_keys(
+                feature_keys=tuple(signature_cache_reader.feature_keys)
+                if signature_cache_reader is not None
+                else (),
+                reader_pre_normalized=bool(
+                    signature_cache_reader is not None
+                    and signature_cache_reader.pre_normalized
+                ),
+                use_prefix_sequence_training=bool(use_prefix_sequence_training),
+                use_path_signature=bool(use_path_signature),
+                use_delta_signature=bool(use_delta_signature),
             )
-        else:
-            policy_cfg.pre_normalized_observation_keys = ()
+        )
     elif args.policy == "diffusion":
         policy_cfg = DiffusionConfig(
             device=args.device,
