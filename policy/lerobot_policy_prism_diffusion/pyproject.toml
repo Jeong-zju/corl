@@ -1,7 +1,7 @@
 [project]
-name = "lerobot_policy_streaming_act"
+name = "lerobot_policy_prism_diffusion"
 version = "0.1.0"
-description = "Streaming ACT policy package for LeRobot."
+description = "PRISM Diffusion policy package for LeRobot."
 dependencies = [
     "lerobot",
 ]

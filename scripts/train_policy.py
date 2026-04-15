@@ -237,6 +237,15 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
+def ensure_prism_diffusion_importable(repo_root: Path) -> None:
+    prism_diffusion_src = repo_root / "main/policy/lerobot_policy_prism_diffusion/src"
+    if not prism_diffusion_src.exists():
+        raise FileNotFoundError(
+            f"PRISM Diffusion package source not found: {prism_diffusion_src}"
+        )
+    sys.path.insert(0, str(prism_diffusion_src))
+
+
 def teardown_wandb_safely(exit_code: int) -> None:
     try:
         import wandb
@@ -1039,7 +1048,7 @@ def install_lerobot_dataset_load_patch() -> None:
     )
     LeRobotDataset._query_videos = query_videos_with_timestamp_layout_detection
     LeRobotDataset._query_hf_dataset = query_hf_dataset_with_compact_relative_index
-    LeRobotDataset._custom_dataset_load_patch_installed = True
+    LeRobotDataset._custom_dataset_load_patch_installed = True # pyright: ignore[reportAttributeAccessIssue]
 
 
 def summarize_visual_storage_modes(dataset_root: Path) -> dict[str, int]:
@@ -1577,7 +1586,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -1597,7 +1606,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -1804,7 +1813,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning."
         ),
     )
-    if known_args.policy == "diffusion":
+    if known_args.policy in {"diffusion", "prism_diffusion"}:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
@@ -2271,6 +2280,8 @@ def main(argv: list[str] | None = None) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)
+    elif args.policy == "prism_diffusion":
+        ensure_prism_diffusion_importable(repo_root)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
@@ -2324,6 +2335,7 @@ def main(argv: list[str] | None = None) -> None:
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
+    PrismDiffusionConfig = None
     if args.policy == "streaming_act":
         from lerobot_policy_streaming_act.configuration_streaming_act import (
             DELTA_SIGNATURE_KEY,
@@ -2340,6 +2352,15 @@ def main(argv: list[str] | None = None) -> None:
             configure_signature_cache_runtime,
             prepare_signature_cache_runtime,
         )
+    elif args.policy == "prism_diffusion":
+        from lerobot_policy_prism_diffusion.configuration_diffusion import (
+            PrismDiffusionConfig,
+        )
+
+        configure_prefix_image_cache_runtime = None
+        prepare_prefix_image_cache_runtime = None
+        configure_signature_cache_runtime = None
+        prepare_signature_cache_runtime = None
     else:
         configure_prefix_image_cache_runtime = None
         prepare_prefix_image_cache_runtime = None
@@ -2421,7 +2442,7 @@ def main(argv: list[str] | None = None) -> None:
         signature_dim = 0
 
     resolved_diffusion_drop_n_last_frames = None
-    if args.policy == "diffusion":
+    if args.policy in {"diffusion", "prism_diffusion"}:
         resolved_diffusion_drop_n_last_frames = resolve_diffusion_drop_n_last_frames(
             n_obs_steps=int(args.n_obs_steps),
             horizon=int(args.horizon),
@@ -2589,8 +2610,11 @@ def main(argv: list[str] | None = None) -> None:
                 use_delta_signature=bool(use_delta_signature),
             )
         )
-    elif args.policy == "diffusion":
-        policy_cfg = DiffusionConfig(
+    elif args.policy in {"diffusion", "prism_diffusion"}:
+        diffusion_config_cls = (
+            PrismDiffusionConfig if args.policy == "prism_diffusion" else DiffusionConfig
+        )
+        policy_cfg = diffusion_config_cls(
             device=args.device,
             use_amp=bool(args.use_amp),
             push_to_hub=False,
@@ -2703,7 +2727,7 @@ def main(argv: list[str] | None = None) -> None:
             "- video_backend: ignored "
             "(dataset stores visual observations directly in parquet image columns)"
         )
-    if args.policy == "diffusion":
+    if args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- action_execution: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -2776,7 +2800,7 @@ def main(argv: list[str] | None = None) -> None:
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
         )
-    elif args.policy == "diffusion":
+    elif args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- diffusion: "
             f"n_obs_steps={int(args.n_obs_steps)}, "

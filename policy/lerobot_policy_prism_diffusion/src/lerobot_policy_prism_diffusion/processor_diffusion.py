@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -30,17 +29,18 @@ from lerobot.processor import (
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from .configuration_diffusion import PrismDiffusionConfig
 
 
-def make_diffusion_pre_post_processors(
-    config: DiffusionConfig,
+def make_prism_diffusion_pre_post_processors(
+    config: PrismDiffusionConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for a diffusion policy.
+    Constructs pre-processor and post-processor pipelines for a PRISM diffusion policy.
 
     The pre-processing pipeline prepares the input data for the model by:
     1. Renaming features.
@@ -53,7 +53,7 @@ def make_diffusion_pre_post_processors(
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the diffusion policy,
+        config: The configuration object for the PRISM diffusion policy,
             containing feature definitions, normalization mappings, and device information.
         dataset_stats: A dictionary of statistics used for normalization.
             Defaults to None.

@@ -33,7 +33,6 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -42,20 +41,21 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from .configuration_diffusion import PrismDiffusionConfig
 
 
-class DiffusionPolicy(PreTrainedPolicy):
+class PrismDiffusionPolicy(PreTrainedPolicy):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
     (paper: https://huggingface.co/papers/2303.04137, code: https://github.com/real-stanford/diffusion_policy).
     """
 
-    config_class = DiffusionConfig
-    name = "diffusion"
+    config_class = PrismDiffusionConfig
+    name = "prism_diffusion"
 
     def __init__(
         self,
-        config: DiffusionConfig,
+        config: PrismDiffusionConfig,
         **kwargs,
     ):
         """
@@ -165,7 +165,7 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
 
 
 class DiffusionModel(nn.Module):
-    def __init__(self, config: DiffusionConfig):
+    def __init__(self, config: PrismDiffusionConfig):
         super().__init__()
         self.config = config
 
@@ -451,7 +451,7 @@ class DiffusionRgbEncoder(nn.Module):
     Includes the ability to normalize and crop the image first.
     """
 
-    def __init__(self, config: DiffusionConfig):
+    def __init__(self, config: PrismDiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
         if config.resize_shape is not None:
@@ -605,7 +605,7 @@ class DiffusionConditionalUnet1d(nn.Module):
     Note: this removes local conditioning as compared to the original diffusion policy code.
     """
 
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+    def __init__(self, config: PrismDiffusionConfig, global_cond_dim: int):
         super().__init__()
 
         self.config = config

@@ -70,6 +70,15 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
+def ensure_prism_diffusion_importable(repo_root: Path) -> None:
+    prism_diffusion_src = repo_root / "main/policy/lerobot_policy_prism_diffusion/src"
+    if not prism_diffusion_src.exists():
+        raise FileNotFoundError(
+            f"PRISM Diffusion package source not found: {prism_diffusion_src}"
+        )
+    sys.path.insert(0, str(prism_diffusion_src))
+
+
 def validate_prefix_sequence_support(
     *,
     policy_name: str,
@@ -206,7 +215,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -244,7 +253,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -1200,6 +1209,8 @@ def main(argv: list[str] | None = None) -> None:
     ensure_writable_hf_cache_env(repo_root)
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)
+    elif args.policy == "prism_diffusion":
+        ensure_prism_diffusion_importable(repo_root)
 
     try:
         from lerobot.configs.policies import PreTrainedConfig
@@ -1220,6 +1231,15 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         policy_cls = StreamingACTPolicy
+    elif args.policy == "prism_diffusion":
+        from lerobot_policy_prism_diffusion.configuration_diffusion import (
+            PrismDiffusionConfig,
+        )
+        from lerobot_policy_prism_diffusion.modeling_diffusion import (
+            PrismDiffusionPolicy,
+        )
+
+        policy_cls = PrismDiffusionPolicy
     elif args.policy == "diffusion":
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
