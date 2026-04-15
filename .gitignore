@@ -10,5 +10,5 @@ data/*
 **/*.egg-info/
 depends/signatory/build/
 *.so
-discusstions/
+discussions/
 plot/
