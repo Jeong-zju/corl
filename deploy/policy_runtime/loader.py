@@ -71,6 +71,13 @@ class PolicyRuntime:
             )
 
             policy_cls = StreamingACTPolicy
+        elif policy_type == "prism_diffusion":
+            raise ValueError(
+                "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
+                "The current deploy runtime supports only 'act' and 'streaming_act'. "
+                "Use main/scripts/eval_policy.py for PRISM Diffusion checkpoints "
+                "until deploy support is added."
+            )
         elif policy_type == "act":
             from lerobot.policies.act.modeling_act import ACTPolicy
 

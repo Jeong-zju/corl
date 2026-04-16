@@ -1600,8 +1600,8 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train LeRobot ACT, Diffusion, or Streaming ACT on a local "
-            "LeRobot dataset."
+            "Train LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "on a local LeRobot dataset."
         )
     )
     parser.add_argument(
@@ -2248,6 +2248,248 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "hidden cache folder under the dataset root."
             ),
         )
+    elif known_args.policy == "prism_diffusion":
+        path_signature_group = parser.add_mutually_exclusive_group()
+        path_signature_group.add_argument(
+            "--enable-path-signature",
+            dest="use_path_signature",
+            action="store_true",
+            help=(
+                "Record path-signature conditioning in the PRISM Diffusion "
+                "checkpoint config."
+            ),
+        )
+        path_signature_group.add_argument(
+            "--disable-path-signature",
+            dest="use_path_signature",
+            action="store_false",
+            help="Disable path-signature conditioning in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_path_signature=defaults.get("use_path_signature", False),
+        )
+        parser.add_argument(
+            "--history-length",
+            type=int,
+            default=defaults.get("history_length", 0),
+            help=(
+                "History window size recorded in PrismDiffusionConfig. "
+                "Set 0 to defer inference to the local policy package."
+            ),
+        )
+        parser.add_argument(
+            "--signature-dim",
+            type=int,
+            default=defaults.get("signature_dim", 0),
+            help=(
+                "Serialized signature feature dim for PRISM Diffusion. "
+                "Set 0 to defer inference to the local policy package."
+            ),
+        )
+        parser.add_argument(
+            "--signature-depth",
+            type=int,
+            default=defaults.get("signature_depth", 3),
+            help="Serialized signature truncation depth for PRISM Diffusion.",
+        )
+        parser.add_argument(
+            "--signature-hidden-dim",
+            type=int,
+            default=defaults.get("signature_hidden_dim", 512),
+            help="Serialized signature projection hidden dim for PRISM Diffusion.",
+        )
+        parser.add_argument(
+            "--signature-dropout",
+            type=float,
+            default=defaults.get("signature_dropout", 0.1),
+            help="Serialized signature projection dropout for PRISM Diffusion.",
+        )
+        delta_signature_group = parser.add_mutually_exclusive_group()
+        delta_signature_group.add_argument(
+            "--enable-delta-signature",
+            dest="use_delta_signature",
+            action="store_true",
+            help="Record delta-signature conditioning in PrismDiffusionConfig.",
+        )
+        delta_signature_group.add_argument(
+            "--disable-delta-signature",
+            dest="use_delta_signature",
+            action="store_false",
+            help="Disable delta-signature conditioning in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_delta_signature=defaults.get("use_delta_signature", False),
+        )
+        prefix_group = parser.add_mutually_exclusive_group()
+        prefix_group.add_argument(
+            "--enable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_true",
+            help="Record prefix-sequence training support in PrismDiffusionConfig.",
+        )
+        prefix_group.add_argument(
+            "--disable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_false",
+            help="Disable prefix-sequence training fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_prefix_sequence_training=defaults.get(
+                "use_prefix_sequence_training", False
+            ),
+        )
+        parser.add_argument(
+            "--prefix-train-max-steps",
+            type=int,
+            default=defaults.get("prefix_train_max_steps", 32),
+            help="Serialized prefix length budget for PRISM Diffusion configs.",
+        )
+        parser.add_argument(
+            "--prefix-frame-stride",
+            type=int,
+            default=defaults.get("prefix_frame_stride", 1),
+            help="Serialized prefix subsampling stride for PRISM Diffusion configs.",
+        )
+        parser.add_argument(
+            "--prefix-pad-value",
+            type=float,
+            default=defaults.get("prefix_pad_value", 0.0),
+            help="Serialized prefix padding value for PRISM Diffusion configs.",
+        )
+        visual_prefix_memory_group = parser.add_mutually_exclusive_group()
+        visual_prefix_memory_group.add_argument(
+            "--enable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_true",
+            help="Record visual prefix memory support in PrismDiffusionConfig.",
+        )
+        visual_prefix_memory_group.add_argument(
+            "--disable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_false",
+            help="Disable visual prefix memory fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_visual_prefix_memory=defaults.get("use_visual_prefix_memory", False),
+        )
+        signature_indexed_slot_memory_group = parser.add_mutually_exclusive_group()
+        signature_indexed_slot_memory_group.add_argument(
+            "--enable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_true",
+            help="Record Signature-Indexed Slot Memory support in PrismDiffusionConfig.",
+        )
+        signature_indexed_slot_memory_group.add_argument(
+            "--disable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_false",
+            help="Disable Signature-Indexed Slot Memory fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_signature_indexed_slot_memory=defaults.get(
+                "use_signature_indexed_slot_memory", False
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-num-slots",
+            type=int,
+            default=defaults.get("slot_memory_num_slots", 4),
+            help="Serialized number of PRISM slot-memory slots.",
+        )
+        parser.add_argument(
+            "--slot-memory-routing-hidden-dim",
+            type=int,
+            default=defaults.get("slot_memory_routing_hidden_dim", 512),
+            help="Serialized PRISM slot-routing hidden dim.",
+        )
+        slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
+        slot_memory_delta_routing_group.add_argument(
+            "--enable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_true",
+            help="Record delta-signature slot routing in PrismDiffusionConfig.",
+        )
+        slot_memory_delta_routing_group.add_argument(
+            "--disable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_false",
+            help="Disable delta-signature slot routing in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_delta_routing=defaults.get(
+                "slot_memory_use_delta_routing", False
+            ),
+        )
+        slot_memory_softmax_group = parser.add_mutually_exclusive_group()
+        slot_memory_softmax_group.add_argument(
+            "--enable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_true",
+            help="Use softmax slot routing in serialized PRISM Diffusion configs.",
+        )
+        slot_memory_softmax_group.add_argument(
+            "--disable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_false",
+            help="Use sigmoid slot routing in serialized PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_softmax_routing=defaults.get(
+                "slot_memory_use_softmax_routing", True
+            ),
+        )
+        slot_memory_readout_group = parser.add_mutually_exclusive_group()
+        slot_memory_readout_group.add_argument(
+            "--enable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_true",
+            help="Use readout pooling in serialized PRISM Diffusion configs.",
+        )
+        slot_memory_readout_group.add_argument(
+            "--disable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_false",
+            help="Disable readout pooling in serialized PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_readout_pooling=defaults.get(
+                "slot_memory_use_readout_pooling", True
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-balance-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_balance_loss_coef", 0.0),
+            help="Serialized PRISM slot-memory balance loss coefficient.",
+        )
+        parser.add_argument(
+            "--slot-memory-consistency-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_consistency_loss_coef", 0.0),
+            help="Serialized PRISM slot-memory consistency loss coefficient.",
+        )
+        parser.add_argument(
+            "--prism-adapter-hidden-dim",
+            type=int,
+            default=defaults.get("prism_adapter_hidden_dim", 512),
+            help="Serialized hidden dim for the PRISM adapter MLP.",
+        )
+        prism_adapter_zero_init_group = parser.add_mutually_exclusive_group()
+        prism_adapter_zero_init_group.add_argument(
+            "--enable-prism-adapter-zero-init",
+            dest="prism_adapter_zero_init",
+            action="store_true",
+            help="Zero-initialize the serialized PRISM adapter parameters.",
+        )
+        prism_adapter_zero_init_group.add_argument(
+            "--disable-prism-adapter-zero-init",
+            dest="prism_adapter_zero_init",
+            action="store_false",
+            help="Disable zero-init for serialized PRISM adapter parameters.",
+        )
+        parser.set_defaults(
+            prism_adapter_zero_init=defaults.get("prism_adapter_zero_init", True),
+        )
     parser.set_defaults(
         _policy_defaults_path=(None if defaults_path is None else str(defaults_path)),
         _policy_defaults_dataset_root=defaults.get("dataset_root"),
@@ -2373,6 +2615,13 @@ def main(argv: list[str] | None = None) -> None:
     install_lerobot_dataset_load_patch()
     install_episode_aware_sampler_patch()
 
+    prism_use_path_signature = False
+    prism_use_delta_signature = False
+    prism_use_prefix_sequence_training = False
+    prism_use_visual_prefix_memory = False
+    prism_history_length = 0
+    prism_signature_dim = 0
+
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
         use_delta_signature = bool(args.use_delta_signature)
@@ -2433,6 +2682,20 @@ def main(argv: list[str] | None = None) -> None:
                 "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
                 "so the training loader materializes signatures from the dataset cache."
             )
+    elif args.policy == "prism_diffusion":
+        use_path_signature = False
+        use_delta_signature = False
+        use_prefix_sequence_training = False
+        use_visual_prefix_memory = False
+        resolved_history_length = 0
+        signature_dim = 0
+
+        prism_use_path_signature = bool(args.use_path_signature)
+        prism_use_delta_signature = bool(args.use_delta_signature)
+        prism_use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
+        prism_use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
+        prism_history_length = int(args.history_length)
+        prism_signature_dim = int(args.signature_dim)
     else:
         use_path_signature = False
         use_delta_signature = False
@@ -2614,6 +2877,46 @@ def main(argv: list[str] | None = None) -> None:
         diffusion_config_cls = (
             PrismDiffusionConfig if args.policy == "prism_diffusion" else DiffusionConfig
         )
+        prism_config_kwargs = {}
+        if args.policy == "prism_diffusion":
+            prism_config_kwargs = {
+                "use_path_signature": prism_use_path_signature,
+                "use_delta_signature": prism_use_delta_signature,
+                "history_length": prism_history_length,
+                "signature_dim": prism_signature_dim,
+                "signature_depth": int(args.signature_depth),
+                "signature_hidden_dim": int(args.signature_hidden_dim),
+                "signature_dropout": float(args.signature_dropout),
+                "use_prefix_sequence_training": prism_use_prefix_sequence_training,
+                "prefix_train_max_steps": int(args.prefix_train_max_steps),
+                "prefix_frame_stride": int(args.prefix_frame_stride),
+                "prefix_pad_value": float(args.prefix_pad_value),
+                "use_visual_prefix_memory": prism_use_visual_prefix_memory,
+                "use_signature_indexed_slot_memory": bool(
+                    args.use_signature_indexed_slot_memory
+                ),
+                "slot_memory_num_slots": int(args.slot_memory_num_slots),
+                "slot_memory_routing_hidden_dim": int(
+                    args.slot_memory_routing_hidden_dim
+                ),
+                "slot_memory_use_delta_routing": bool(
+                    args.slot_memory_use_delta_routing
+                ),
+                "slot_memory_use_softmax_routing": bool(
+                    args.slot_memory_use_softmax_routing
+                ),
+                "slot_memory_use_readout_pooling": bool(
+                    args.slot_memory_use_readout_pooling
+                ),
+                "slot_memory_balance_loss_coef": float(
+                    args.slot_memory_balance_loss_coef
+                ),
+                "slot_memory_consistency_loss_coef": float(
+                    args.slot_memory_consistency_loss_coef
+                ),
+                "prism_adapter_hidden_dim": int(args.prism_adapter_hidden_dim),
+                "prism_adapter_zero_init": bool(args.prism_adapter_zero_init),
+            }
         policy_cfg = diffusion_config_cls(
             device=args.device,
             use_amp=bool(args.use_amp),
@@ -2622,6 +2925,7 @@ def main(argv: list[str] | None = None) -> None:
             horizon=int(args.horizon),
             n_action_steps=int(args.n_action_steps),
             drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
+            **prism_config_kwargs,
         )
     else:
         if configure_signature_cache_runtime is not None:
@@ -2808,6 +3112,47 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
+        if args.policy == "prism_diffusion":
+            print(f"- use_path_signature: {prism_use_path_signature}")
+            if prism_use_path_signature:
+                print(
+                    f"- signature: dim={prism_signature_dim}, "
+                    f"depth={int(args.signature_depth)}, "
+                    f"history={prism_history_length}, "
+                    f"hidden={int(args.signature_hidden_dim)}, "
+                    f"dropout={float(args.signature_dropout)}"
+                )
+            print(f"- use_delta_signature: {prism_use_delta_signature}")
+            print(
+                "- prefix_sequence: "
+                f"enabled={prism_use_prefix_sequence_training}, "
+                f"max_steps={int(args.prefix_train_max_steps)}, "
+                f"stride={int(args.prefix_frame_stride)}, "
+                f"pad_value={float(args.prefix_pad_value)}"
+            )
+            print(f"- use_visual_prefix_memory: {prism_use_visual_prefix_memory}")
+            print(
+                "- slot_memory: "
+                "enabled="
+                f"{bool(args.use_signature_indexed_slot_memory)}, "
+                f"num_slots={int(args.slot_memory_num_slots)}, "
+                f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                "delta_routing="
+                f"{bool(args.slot_memory_use_delta_routing)}, "
+                "softmax_routing="
+                f"{bool(args.slot_memory_use_softmax_routing)}, "
+                "readout_pooling="
+                f"{bool(args.slot_memory_use_readout_pooling)}, "
+                "balance_loss_coef="
+                f"{float(args.slot_memory_balance_loss_coef)}, "
+                "consistency_loss_coef="
+                f"{float(args.slot_memory_consistency_loss_coef)}"
+            )
+            print(
+                "- prism_adapter: "
+                f"hidden_dim={int(args.prism_adapter_hidden_dim)}, "
+                f"zero_init={bool(args.prism_adapter_zero_init)}"
+            )
     print(
         f"- wandb: enable={wandb_enable}, project={resolved_wandb_project}, mode={args.wandb_mode}"
     )

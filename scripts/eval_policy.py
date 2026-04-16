@@ -246,9 +246,9 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a LeRobot ACT, Diffusion, or Streaming ACT checkpoint "
-            "either with env rollouts (`--env`) or on a held-out dataset split "
-            "(`--dataset`)."
+            "Evaluate a LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "checkpoint either with env rollouts (`--env`) or on a held-out "
+            "dataset split (`--dataset`)."
         )
     )
     parser.add_argument(

@@ -154,6 +154,31 @@ class PrismDiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Optional PRISM extensions. These default to the baseline diffusion behavior
+    # and are serialized so checkpoint configs can round-trip local PRISM settings.
+    use_path_signature: bool = False
+    use_delta_signature: bool = False
+    history_length: int = 0
+    signature_dim: int = 0
+    signature_depth: int = 3
+    signature_hidden_dim: int = 512
+    signature_dropout: float = 0.1
+    use_prefix_sequence_training: bool = False
+    prefix_train_max_steps: int = 32
+    prefix_frame_stride: int = 1
+    prefix_pad_value: float = 0.0
+    use_visual_prefix_memory: bool = False
+    use_signature_indexed_slot_memory: bool = False
+    slot_memory_num_slots: int = 4
+    slot_memory_routing_hidden_dim: int = 512
+    slot_memory_use_delta_routing: bool = False
+    slot_memory_use_softmax_routing: bool = True
+    slot_memory_use_readout_pooling: bool = True
+    slot_memory_balance_loss_coef: float = 0.0
+    slot_memory_consistency_loss_coef: float = 0.0
+    prism_adapter_hidden_dim: int = 512
+    prism_adapter_zero_init: bool = True
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)

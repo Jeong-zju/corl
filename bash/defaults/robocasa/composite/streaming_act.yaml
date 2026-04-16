@@ -67,7 +67,7 @@ eval:
   max_steps_per_episode: null
   seed: 42
   device: "cuda"
-  n_action_steps: 50
+  n_action_steps: 100
   signature_backend: "auto"
   robocasa_conda_env: "robocasa"
   num_rollouts: 20
