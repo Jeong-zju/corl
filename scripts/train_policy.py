@@ -2016,7 +2016,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--test-ratio",
         type=float,
         default=defaults.get("test_ratio", 0.2),
-        help="Held-out test-set ratio computed over episodes.",
+        help=(
+            "Held-out test-set ratio computed over episodes. "
+            "Use 0 to place every episode in the training split."
+        ),
     )
     parser.add_argument(
         "--split-seed",

@@ -351,9 +351,9 @@ def load_dataset_info(dataset_root: Path) -> dict[str, object]:
 def get_total_episodes(dataset_root: Path) -> int:
     info = load_dataset_info(dataset_root)
     total_episodes = int(info.get("total_episodes", 0))
-    if total_episodes <= 1:
+    if total_episodes <= 0:
         raise ValueError(
-            f"Dataset must contain at least 2 episodes to create a train/test split. "
+            f"Dataset must contain at least 1 episode. "
             f"Got total_episodes={total_episodes} for {dataset_root}."
         )
     return total_episodes
@@ -368,8 +368,9 @@ def build_dataset_split(
     split_seed: int,
     split_shuffle: bool,
 ) -> DatasetSplitSpec:
-    if not (0.0 < float(test_ratio) < 1.0):
-        raise ValueError(f"`test_ratio` must lie in (0, 1), got {test_ratio}.")
+    resolved_test_ratio = float(test_ratio)
+    if not (0.0 <= resolved_test_ratio < 1.0):
+        raise ValueError(f"`test_ratio` must lie in [0, 1), got {test_ratio}.")
 
     total_episodes = get_total_episodes(dataset_root)
     episode_indices = np.arange(total_episodes, dtype=np.int64)
@@ -377,8 +378,17 @@ def build_dataset_split(
         rng = np.random.default_rng(split_seed)
         rng.shuffle(episode_indices)
 
-    test_count = int(round(total_episodes * float(test_ratio)))
-    test_count = min(max(1, test_count), total_episodes - 1)
+    if resolved_test_ratio == 0.0:
+        test_count = 0
+    else:
+        if total_episodes <= 1:
+            raise ValueError(
+                "Dataset must contain at least 2 episodes when `test_ratio > 0` so "
+                f"both train and test splits are non-empty. Got total_episodes={total_episodes} "
+                f"for {dataset_root}."
+            )
+        test_count = int(round(total_episodes * resolved_test_ratio))
+        test_count = min(max(1, test_count), total_episodes - 1)
     train_count = total_episodes - test_count
 
     train_episode_indices = sorted(int(ep) for ep in episode_indices[:train_count].tolist())
@@ -391,7 +401,7 @@ def build_dataset_split(
         total_episodes=int(total_episodes),
         train_episode_indices=train_episode_indices,
         test_episode_indices=test_episode_indices,
-        test_ratio=float(test_ratio),
+        test_ratio=resolved_test_ratio,
         split_seed=int(split_seed),
         split_shuffle=bool(split_shuffle),
     )
