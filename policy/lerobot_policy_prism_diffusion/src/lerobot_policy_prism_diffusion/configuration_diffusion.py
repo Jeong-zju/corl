@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
@@ -154,6 +154,9 @@ class PrismDiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Processor/runtime controls
+    pre_normalized_observation_keys: tuple[str, ...] = field(default_factory=tuple)
+
     # Optional PRISM extensions. These default to the baseline diffusion behavior
     # and are serialized so checkpoint configs can round-trip local PRISM settings.
     use_path_signature: bool = False
@@ -270,6 +273,17 @@ class PrismDiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
+
+    @property
+    def image_features(self) -> dict[str, PolicyFeature]:
+        if not self.input_features:
+            return {}
+        return {
+            key: ft
+            for key, ft in self.input_features.items()
+            if ft.type is FeatureType.VISUAL
+            and not key.startswith("observation.prefix_images.")
+        }
 
     @property
     def observation_delta_indices(self) -> list:

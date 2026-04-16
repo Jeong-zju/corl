@@ -1197,9 +1197,10 @@ def validate_prefix_sequence_support(
 ) -> None:
     if not use_prefix_sequence_training:
         return
-    if policy_name != "streaming_act":
+    if policy_name not in {"streaming_act", "prism_diffusion"}:
         raise NotImplementedError(
-            "Prefix-sequence training is currently implemented only for `streaming_act`. "
+            "Prefix-sequence training is currently implemented only for "
+            "`streaming_act` and `prism_diffusion`. "
             f"Got policy={policy_name!r} during {context}."
         )
 
@@ -1381,7 +1382,6 @@ def build_policy_feature_overrides(
 def install_prefix_sequence_dataset_patch() -> None:
     import lerobot.datasets.factory as dataset_factory
     import lerobot.scripts.lerobot_train as lerobot_train_module
-    from lerobot_policy_streaming_act.prefix_sequence import PrefixSequenceDataset
 
     try:
         from lerobot_policy_streaming_act.prefix_image_cache import (
@@ -1413,7 +1413,22 @@ def install_prefix_sequence_dataset_patch() -> None:
         policy_cfg = cfg.policy
         if not bool(getattr(policy_cfg, "use_prefix_sequence_training", False)):
             return dataset
-        if isinstance(dataset, PrefixSequenceDataset):
+        policy_name = getattr(policy_cfg, "type", None)
+        if policy_name == "streaming_act":
+            from lerobot_policy_streaming_act.prefix_sequence import (
+                PrefixSequenceDataset,
+            )
+
+            wrapper_cls = PrefixSequenceDataset
+        elif policy_name == "prism_diffusion":
+            from lerobot_policy_prism_diffusion.prefix_dataset import (
+                PrismDiffusionPrefixDataset,
+            )
+
+            wrapper_cls = PrismDiffusionPrefixDataset
+        else:
+            return dataset
+        if isinstance(dataset, wrapper_cls):
             return dataset
         prefix_image_cache_reader = get_prefix_image_cache_reader_for_dataset(
             Path(dataset.root)
@@ -1424,7 +1439,7 @@ def install_prefix_sequence_dataset_patch() -> None:
                 f"(keys={list(prefix_image_cache_reader.camera_keys)}, "
                 f"mode={prefix_image_cache_reader.mode})"
             )
-        return PrefixSequenceDataset(
+        return wrapper_cls(
             dataset,
             prefix_train_max_steps=int(policy_cfg.prefix_train_max_steps),
             prefix_frame_stride=int(policy_cfg.prefix_frame_stride),
@@ -2356,6 +2371,75 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("prefix_pad_value", 0.0),
             help="Serialized prefix padding value for PRISM Diffusion configs.",
         )
+        parser.add_argument(
+            "--signature-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("signature_cache_mode", "off"),
+            help=(
+                "Fast path for path/delta signature loading in PRISM Diffusion. "
+                "`memmap` reads from a disk-backed contiguous cache, `ram` preloads "
+                "that cache once into shared memory, and `off` falls back to parquet "
+                "columns."
+            ),
+        )
+        parser.add_argument(
+            "--signature-cache-dtype",
+            choices=["float16", "float32"],
+            default=defaults.get("signature_cache_dtype", "float16"),
+            help=(
+                "Storage dtype used by the PRISM Diffusion signature cache. The "
+                "cache preserves runtime normalization semantics."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-signature-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_signature_cache", False)),
+            help="Force a signature cache rebuild before PRISM Diffusion training starts.",
+        )
+        parser.add_argument(
+            "--signature-cache-root",
+            type=Path,
+            default=defaults.get("signature_cache_root"),
+            help=(
+                "Optional signature cache directory override. Defaults to a hidden "
+                "cache folder under the dataset root."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-image-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("prefix_image_cache_mode", "off"),
+            help=(
+                "Optional raw prefix-image cache for PRISM Diffusion. `memmap` "
+                "reads contiguous cached frames from disk, `ram` preloads that "
+                "cache once, and `off` falls back to the dataset image/video path."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-image-cache-dtype",
+            choices=["uint8", "float16", "float32"],
+            default=defaults.get("prefix_image_cache_dtype", "uint8"),
+            help=(
+                "Storage dtype used by the optional PRISM Diffusion prefix-image "
+                "cache. `uint8` minimizes disk and RAM footprint."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-prefix-image-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_prefix_image_cache", False)),
+            help="Force a prefix-image cache rebuild before PRISM Diffusion training starts.",
+        )
+        parser.add_argument(
+            "--prefix-image-cache-root",
+            type=Path,
+            default=defaults.get("prefix_image_cache_root"),
+            help=(
+                "Optional prefix-image cache directory override. Defaults to a "
+                "hidden cache folder under the dataset root."
+            ),
+        )
         visual_prefix_memory_group = parser.add_mutually_exclusive_group()
         visual_prefix_memory_group.add_argument(
             "--enable-visual-prefix-memory",
@@ -2524,6 +2608,7 @@ def main(argv: list[str] | None = None) -> None:
         ensure_streaming_act_importable(repo_root)
     elif args.policy == "prism_diffusion":
         ensure_prism_diffusion_importable(repo_root)
+        ensure_streaming_act_importable(repo_root)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
@@ -2578,12 +2663,7 @@ def main(argv: list[str] | None = None) -> None:
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
     PrismDiffusionConfig = None
-    if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_streaming_act import (
-            DELTA_SIGNATURE_KEY,
-            PATH_SIGNATURE_KEY,
-            StreamingACTConfig,
-        )
+    if args.policy in {"streaming_act", "prism_diffusion"}:
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
             configure_prefix_image_cache_runtime,
@@ -2594,15 +2674,17 @@ def main(argv: list[str] | None = None) -> None:
             configure_signature_cache_runtime,
             prepare_signature_cache_runtime,
         )
+
+    if args.policy == "streaming_act":
+        from lerobot_policy_streaming_act.configuration_streaming_act import (
+            DELTA_SIGNATURE_KEY,
+            PATH_SIGNATURE_KEY,
+            StreamingACTConfig,
+        )
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
             PrismDiffusionConfig,
         )
-
-        configure_prefix_image_cache_runtime = None
-        prepare_prefix_image_cache_runtime = None
-        configure_signature_cache_runtime = None
-        prepare_signature_cache_runtime = None
     else:
         configure_prefix_image_cache_runtime = None
         prepare_prefix_image_cache_runtime = None
@@ -2621,6 +2703,8 @@ def main(argv: list[str] | None = None) -> None:
     prism_use_visual_prefix_memory = False
     prism_history_length = 0
     prism_signature_dim = 0
+    prism_required_signature_parquet_keys: list[str] = []
+    required_signature_parquet_keys: list[str] = []
 
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
@@ -2694,8 +2778,59 @@ def main(argv: list[str] | None = None) -> None:
         prism_use_delta_signature = bool(args.use_delta_signature)
         prism_use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
         prism_use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
-        prism_history_length = int(args.history_length)
-        prism_signature_dim = int(args.signature_dim)
+        prism_required_signature_parquet_keys = [
+            key
+            for key, enabled in (
+                ("observation.path_signature", bool(prism_use_path_signature)),
+                ("observation.delta_signature", bool(prism_use_delta_signature)),
+            )
+            if enabled
+        ]
+        validate_prefix_sequence_support(
+            policy_name=args.policy,
+            use_prefix_sequence_training=prism_use_prefix_sequence_training,
+            context="training",
+        )
+        prism_history_length = (
+            resolve_history_length(
+                dataset_root=dataset_root,
+                history_length=args.history_length,
+            )
+            if prism_use_path_signature
+            else int(args.history_length)
+        )
+        prism_signature_dim = resolve_signature_dim(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_path_signature=prism_use_path_signature,
+            signature_dim=args.signature_dim,
+        )
+        validate_delta_signature_dataset(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_delta_signature=prism_use_delta_signature,
+        )
+        validate_prefix_sequence_dataset(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_prefix_sequence_training=prism_use_prefix_sequence_training,
+            use_imagenet_stats=False,
+            use_path_signature=prism_use_path_signature,
+            use_delta_signature=prism_use_delta_signature,
+        )
+        if (
+            prism_required_signature_parquet_keys
+            and str(args.signature_cache_mode) == "off"
+            and not parquet_has_columns(dataset_root, prism_required_signature_parquet_keys)
+        ):
+            raise ValueError(
+                "This dataset does not store the requested signature features as parquet columns. "
+                "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
+                "so the training loader materializes signatures from the dataset cache."
+            )
     else:
         use_path_signature = False
         use_delta_signature = False
@@ -2703,6 +2838,18 @@ def main(argv: list[str] | None = None) -> None:
         use_visual_prefix_memory = False
         resolved_history_length = 0
         signature_dim = 0
+
+    active_use_prefix_sequence_training = bool(
+        use_prefix_sequence_training
+        if args.policy == "streaming_act"
+        else prism_use_prefix_sequence_training
+    )
+    active_use_path_signature = bool(
+        use_path_signature if args.policy == "streaming_act" else prism_use_path_signature
+    )
+    active_use_delta_signature = bool(
+        use_delta_signature if args.policy == "streaming_act" else prism_use_delta_signature
+    )
 
     resolved_diffusion_drop_n_last_frames = None
     if args.policy in {"diffusion", "prism_diffusion"}:
@@ -2715,16 +2862,16 @@ def main(argv: list[str] | None = None) -> None:
 
     input_features_override = None
     output_features_override = None
-    if use_prefix_sequence_training:
+    if active_use_prefix_sequence_training:
         install_prefix_sequence_dataset_patch()
         input_features_override, output_features_override = build_policy_feature_overrides(
             dataset_root=dataset_root,
             dataset_repo_id=dataset_repo_id,
             signature_cache_root=args.signature_cache_root,
-            use_prefix_sequence_training=use_prefix_sequence_training,
+            use_prefix_sequence_training=active_use_prefix_sequence_training,
             prefix_train_max_steps=int(args.prefix_train_max_steps),
-            use_path_signature=use_path_signature,
-            use_delta_signature=use_delta_signature,
+            use_path_signature=active_use_path_signature,
+            use_delta_signature=active_use_delta_signature,
         )
 
     run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2925,8 +3072,77 @@ def main(argv: list[str] | None = None) -> None:
             horizon=int(args.horizon),
             n_action_steps=int(args.n_action_steps),
             drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
+            input_features=input_features_override,
+            output_features=output_features_override,
             **prism_config_kwargs,
         )
+        if args.policy == "prism_diffusion":
+            active_signature_keys = tuple(
+                key
+                for key, enabled in (
+                    ("observation.path_signature", bool(prism_use_path_signature)),
+                    ("observation.delta_signature", bool(prism_use_delta_signature)),
+                )
+                if enabled
+            )
+            configure_signature_cache_runtime(
+                SignatureCacheRuntimeConfig(
+                    dataset_root=dataset_root,
+                    dataset_repo_id=dataset_repo_id,
+                    mode=str(args.signature_cache_mode),
+                    cache_dtype=str(args.signature_cache_dtype),
+                    feature_keys=active_signature_keys,
+                    normalization_mode=policy_cfg.normalization_mapping.get(
+                        "STATE", "mean_std"
+                    ),
+                    refresh=bool(args.refresh_signature_cache),
+                    cache_root=args.signature_cache_root,
+                )
+            )
+            signature_cache_reader = prepare_signature_cache_runtime()
+            if prism_use_prefix_sequence_training:
+                configure_prefix_image_cache_runtime(
+                    PrefixImageCacheRuntimeConfig(
+                        dataset_root=dataset_root,
+                        dataset_repo_id=dataset_repo_id,
+                        mode=str(args.prefix_image_cache_mode),
+                        cache_dtype=str(args.prefix_image_cache_dtype),
+                        refresh=bool(args.refresh_prefix_image_cache),
+                        cache_root=args.prefix_image_cache_root,
+                    )
+                )
+                prepare_prefix_image_cache_runtime()
+            elif configure_prefix_image_cache_runtime is not None:
+                configure_prefix_image_cache_runtime(None)
+            if (
+                signature_cache_reader is None
+                and prism_required_signature_parquet_keys
+                and not parquet_has_columns(
+                    dataset_root,
+                    prism_required_signature_parquet_keys,
+                )
+            ):
+                raise RuntimeError(
+                    "Signature cache is required for this dataset because the parquet "
+                    "files do not contain the requested signature columns, but the "
+                    "cache could not be prepared."
+                )
+            policy_cfg.pre_normalized_observation_keys = (
+                resolve_pre_normalized_signature_observation_keys(
+                    feature_keys=tuple(signature_cache_reader.feature_keys)
+                    if signature_cache_reader is not None
+                    else (),
+                    reader_pre_normalized=bool(
+                        signature_cache_reader is not None
+                        and signature_cache_reader.pre_normalized
+                    ),
+                    use_prefix_sequence_training=bool(
+                        prism_use_prefix_sequence_training
+                    ),
+                    use_path_signature=bool(prism_use_path_signature),
+                    use_delta_signature=bool(prism_use_delta_signature),
+                )
+            )
     else:
         if configure_signature_cache_runtime is not None:
             configure_signature_cache_runtime(None)

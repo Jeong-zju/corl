@@ -62,6 +62,11 @@ def make_prism_diffusion_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    pre_normalized_keys = set(getattr(config, "pre_normalized_observation_keys", ()))
+    normalize_observation_keys = {
+        key for key in (config.input_features or {}) if key not in pre_normalized_keys
+    }
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
@@ -70,6 +75,8 @@ def make_prism_diffusion_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
+            device=config.device,
+            normalize_observation_keys=normalize_observation_keys,
         ),
     ]
     output_steps = [
