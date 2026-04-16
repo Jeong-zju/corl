@@ -19,6 +19,7 @@ from dataset_utils import (
     build_dataset_split,
     ensure_lerobot_dataset_v30_compat,
     infer_dataset_repo_id,
+    is_supported_lerobot_dataset_root,
     resolve_dataset_root,
     save_dataset_split,
     validate_dataset_root,
@@ -97,6 +98,159 @@ def resolve_effective_dataset_repo_id(
         )
         return inferred_repo_id
     return requested_repo_id if requested_repo_id is not None else inferred_repo_id
+
+
+def _normalize_dataset_task_names(
+    value: list[str] | tuple[str, ...] | set[str] | str | None,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    raw_items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    task_names: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        task_name = str(raw_item).strip()
+        if not task_name or task_name in seen:
+            continue
+        seen.add(task_name)
+        task_names.append(task_name)
+    return tuple(task_names)
+
+
+def _iter_exact_dataset_root_candidates(
+    selector: str | Path | None,
+    *,
+    local_data_root: Path,
+) -> list[Path]:
+    if selector is None:
+        return []
+
+    dataset_text = str(selector).strip()
+    if not dataset_text:
+        return []
+
+    normalized_dataset_text = dataset_text.replace("\\", "/")
+    raw_path = Path(dataset_text).expanduser()
+    candidates: list[Path] = []
+
+    if raw_path.is_absolute() or raw_path.exists() or dataset_text.startswith("."):
+        candidates.append(raw_path)
+
+    if not raw_path.is_absolute():
+        if normalized_dataset_text.startswith("main/data/"):
+            candidates.append(
+                local_data_root / normalized_dataset_text[len("main/data/") :]
+            )
+        elif normalized_dataset_text.startswith("data/"):
+            candidates.append(
+                local_data_root / normalized_dataset_text[len("data/") :]
+            )
+        else:
+            candidates.append(local_data_root / dataset_text)
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(candidate)
+    return ordered
+
+
+def _resolve_dataset_root_from_exact_task_names(
+    selector: str | Path | None,
+    *,
+    local_data_root: Path,
+    exact_task_names: tuple[str, ...],
+) -> Path | None:
+    if not exact_task_names:
+        return None
+
+    for base_candidate in _iter_exact_dataset_root_candidates(
+        selector,
+        local_data_root=local_data_root,
+    ):
+        if is_supported_lerobot_dataset_root(base_candidate):
+            if len(exact_task_names) == 1 and base_candidate.name == exact_task_names[0]:
+                return base_candidate.resolve()
+            continue
+
+        matched_roots: list[Path] = []
+        for task_name in exact_task_names:
+            task_candidate = base_candidate / task_name
+            if not (
+                is_supported_lerobot_dataset_root(task_candidate)
+                and task_candidate.name == task_name
+            ):
+                matched_roots = []
+                break
+            matched_roots.append(task_candidate.resolve())
+
+        if not matched_roots:
+            continue
+        if len(matched_roots) == 1:
+            return matched_roots[0]
+
+        raise NotImplementedError(
+            "The selected defaults declare multiple exact dataset task names under "
+            f"{base_candidate}, but train_policy currently expects a single local "
+            "dataset root. "
+            f"dataset_tasks={list(exact_task_names)}. "
+            "Create a merged dataset root first or use a task-specific defaults file."
+        )
+
+    return None
+
+
+def resolve_training_dataset_root(
+    *,
+    dataset: str | Path | None,
+    defaults_dataset_root: str | Path | None,
+    local_data_root: Path,
+    exact_task_names: list[str] | tuple[str, ...] | set[str] | str | None = None,
+) -> Path:
+    resolved_local_data_root = local_data_root.resolve()
+    normalized_task_names = _normalize_dataset_task_names(exact_task_names)
+    last_error: FileNotFoundError | None = None
+
+    if dataset is not None:
+        matched_root = _resolve_dataset_root_from_exact_task_names(
+            dataset,
+            local_data_root=resolved_local_data_root,
+            exact_task_names=normalized_task_names,
+        )
+        if matched_root is not None:
+            return matched_root
+        try:
+            return resolve_dataset_root(
+                dataset,
+                local_data_root=resolved_local_data_root,
+            )
+        except FileNotFoundError as exc:
+            last_error = exc
+
+    if defaults_dataset_root is not None:
+        matched_root = _resolve_dataset_root_from_exact_task_names(
+            defaults_dataset_root,
+            local_data_root=resolved_local_data_root,
+            exact_task_names=normalized_task_names,
+        )
+        if matched_root is not None:
+            return matched_root
+        try:
+            return resolve_dataset_root(
+                defaults_dataset_root,
+                local_data_root=resolved_local_data_root,
+            )
+        except FileNotFoundError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError("No dataset selector or defaults dataset_root was provided.")
 
 
 def load_signature_cache_metadata(
@@ -2594,6 +2748,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         _policy_defaults_path=(None if defaults_path is None else str(defaults_path)),
         _policy_defaults_dataset_root=defaults.get("dataset_root"),
         _policy_defaults_dataset_repo_id=defaults.get("dataset_repo_id"),
+        _policy_defaults_dataset_tasks=defaults.get("dataset_tasks"),
     )
     return parser
 
@@ -2642,18 +2797,12 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
-    try:
-        source_dataset_root = resolve_dataset_root(
-            args.dataset,
-            local_data_root=args.local_data_root.resolve(),
-        )
-    except FileNotFoundError:
-        if not defaults_dataset_root:
-            raise
-        source_dataset_root = resolve_dataset_root(
-            defaults_dataset_root,
-            local_data_root=args.local_data_root.resolve(),
-        )
+    source_dataset_root = resolve_training_dataset_root(
+        dataset=args.dataset,
+        defaults_dataset_root=defaults_dataset_root,
+        local_data_root=args.local_data_root.resolve(),
+        exact_task_names=getattr(args, "_policy_defaults_dataset_tasks", None),
+    )
     dataset_repo_id = resolve_effective_dataset_repo_id(
         requested_repo_id=args.dataset_repo_id,
         default_repo_id=getattr(args, "_policy_defaults_dataset_repo_id", None),
@@ -3226,6 +3375,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"- dataset_root_source: {source_dataset_root}")
         print(f"- dataset_root_runtime: {dataset_root}")
     print(f"- dataset_repo_id: {dataset_repo_id}")
+    normalized_dataset_tasks = _normalize_dataset_task_names(
+        getattr(args, "_policy_defaults_dataset_tasks", None)
+    )
+    if normalized_dataset_tasks:
+        print(f"- dataset_tasks: {list(normalized_dataset_tasks)}")
     if args.task:
         print(f"- task: {args.task}")
     print(

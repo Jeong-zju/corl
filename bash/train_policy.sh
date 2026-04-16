@@ -15,6 +15,7 @@ cd "${REPO_ROOT}"
 #   bash main/bash/train_policy.sh --dataset metaworld_mt50 --policy streaming_act
 #   bash main/bash/train_policy.sh --dataset robocasa/composite/ArrangeBreadBasket --policy act
 #   bash main/bash/train_policy.sh --env robocasa/composite --policy streaming_act
+#   bash main/bash/train_policy.sh --env robocasa/composite/ArrangeBreadBasket --policy act
 
 policy_name="act"
 env_name=""
