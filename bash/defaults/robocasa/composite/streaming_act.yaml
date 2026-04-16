@@ -5,6 +5,7 @@ train:
   dataset_tasks:
     - "ArrangeBreadBasket"
   output_root: "outputs/train/robocasa/composite/streaming-act-prism"
+  resume: false
   job_name: "streaming-act-prism"
   wandb_project: "robocasa-composite-multitask"
   wandb_mode: "online"

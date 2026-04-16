@@ -9,17 +9,21 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import warnings
 
 from dataset_utils import (
+    DATASET_SPLIT_FILENAME,
     DEFAULT_LOCAL_DATA_ROOT,
+    DatasetSplitSpec,
     build_dataset_split,
     ensure_lerobot_dataset_v30_compat,
     infer_dataset_repo_id,
     is_supported_lerobot_dataset_root,
+    load_dataset_split,
     resolve_dataset_root,
     save_dataset_split,
     validate_dataset_root,
@@ -40,6 +44,21 @@ PATH_SIGNATURE_FEATURE_KEY = "observation.path_signature"
 DELTA_SIGNATURE_FEATURE_KEY = "observation.delta_signature"
 PREFIX_PATH_SIGNATURE_FEATURE_KEY = "observation.prefix_path_signature"
 PREFIX_DELTA_SIGNATURE_FEATURE_KEY = "observation.prefix_delta_signature"
+CHECKPOINTS_DIRNAME = "checkpoints"
+LAST_CHECKPOINT_LINK_NAME = "last"
+PRETRAINED_MODEL_DIRNAME = "pretrained_model"
+TRAIN_CONFIG_FILENAME = "train_config.json"
+TRAINING_STATE_DIRNAME = "training_state"
+TRAINING_STEP_FILENAME = "training_step.json"
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeRunState:
+    run_dir: Path
+    checkpoint_dir: Path
+    pretrained_model_dir: Path
+    train_config_path: Path
+    split_path: Path | None
 
 
 def _sanitize_signature_cache_path_part(value: str) -> str:
@@ -1704,6 +1723,160 @@ def resolve_default_train_output_root(
     return default_train_output_root(policy_name)
 
 
+def _resolve_train_output_root_candidates(raw: Path) -> list[Path]:
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend([Path.cwd() / raw, repo_root / raw, repo_root / "main" / raw])
+
+    for candidate in list(candidates):
+        candidate_str = str(candidate)
+        repo_root_str = str(repo_root)
+        if candidate_str.startswith(f"{repo_root_str}/outputs/"):
+            suffix = candidate_str[len(f"{repo_root_str}/outputs/") :]
+            candidates.append(repo_root / "main" / "outputs" / suffix)
+        if candidate_str.startswith(f"{repo_root_str}/main/outputs/"):
+            suffix = candidate_str[len(f"{repo_root_str}/main/outputs/") :]
+            candidates.append(repo_root / "outputs" / suffix)
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
+
+
+def iter_training_run_dirs(train_output_root: Path) -> list[Path]:
+    run_dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    for resolved_root in _resolve_train_output_root_candidates(
+        train_output_root.expanduser()
+    ):
+        if not resolved_root.is_dir():
+            continue
+        candidates = [
+            path
+            for path in resolved_root.iterdir()
+            if path.is_dir()
+        ]
+        candidates.sort(
+            key=lambda path: (path.stat().st_mtime, path.name),
+            reverse=True,
+        )
+        for candidate in candidates:
+            resolved = candidate.resolve(strict=False)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            run_dirs.append(resolved)
+
+    return run_dirs
+
+
+def iter_resume_checkpoint_dirs(run_dir: Path) -> list[Path]:
+    checkpoints_dir = run_dir / CHECKPOINTS_DIRNAME
+    if not checkpoints_dir.is_dir():
+        return []
+
+    candidates: list[Path] = []
+    last_dir = checkpoints_dir / LAST_CHECKPOINT_LINK_NAME
+    if last_dir.is_dir():
+        candidates.append(last_dir.resolve(strict=False))
+
+    numbered_dirs = [
+        path
+        for path in checkpoints_dir.iterdir()
+        if path.is_dir() and path.name != LAST_CHECKPOINT_LINK_NAME
+    ]
+    numbered_dirs.sort(
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    candidates.extend(path.resolve(strict=False) for path in numbered_dirs)
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def is_resumable_checkpoint_dir(checkpoint_dir: Path) -> bool:
+    pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIRNAME
+    training_state_dir = checkpoint_dir / TRAINING_STATE_DIRNAME
+    return (
+        pretrained_model_dir.is_dir()
+        and (pretrained_model_dir / TRAIN_CONFIG_FILENAME).is_file()
+        and training_state_dir.is_dir()
+        and (training_state_dir / TRAINING_STEP_FILENAME).is_file()
+    )
+
+
+def resolve_resume_run_state(train_output_root: Path) -> ResumeRunState:
+    run_dirs = iter_training_run_dirs(train_output_root)
+    if not run_dirs:
+        raise FileNotFoundError(
+            "Resume requested, but no prior training runs were found under "
+            f"{train_output_root}."
+        )
+
+    for run_dir in run_dirs:
+        for checkpoint_dir in iter_resume_checkpoint_dirs(run_dir):
+            if not is_resumable_checkpoint_dir(checkpoint_dir):
+                continue
+            pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIRNAME
+            split_path = run_dir / DATASET_SPLIT_FILENAME
+            return ResumeRunState(
+                run_dir=run_dir,
+                checkpoint_dir=checkpoint_dir,
+                pretrained_model_dir=pretrained_model_dir,
+                train_config_path=pretrained_model_dir / TRAIN_CONFIG_FILENAME,
+                split_path=split_path if split_path.is_file() else None,
+            )
+
+    raise FileNotFoundError(
+        "Resume requested, but no resumable checkpoint was found under "
+        f"{train_output_root}."
+    )
+
+
+def load_resume_dataset_split(
+    *,
+    resume_run_state: ResumeRunState,
+    source_dataset_root: Path,
+    dataset_repo_id: str,
+) -> DatasetSplitSpec | None:
+    if resume_run_state.split_path is None:
+        return None
+
+    split_spec = load_dataset_split(resume_run_state.split_path)
+    saved_dataset_root = Path(split_spec.dataset_root).expanduser().resolve()
+    expected_dataset_root = source_dataset_root.resolve()
+
+    if saved_dataset_root != expected_dataset_root:
+        raise ValueError(
+            "The latest resumable run was created from a different dataset root. "
+            f"saved={saved_dataset_root}, expected={expected_dataset_root}."
+        )
+    if str(split_spec.dataset_repo_id) != str(dataset_repo_id):
+        raise ValueError(
+            "The latest resumable run was created from a different dataset_repo_id. "
+            f"saved={split_spec.dataset_repo_id!r}, expected={dataset_repo_id!r}."
+        )
+    return split_spec
+
+
 def default_wandb_project_name(
     dataset_repo_id: str | None,
     dataset_root: Path,
@@ -1877,6 +2050,23 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         ),
         help="Root folder for training outputs.",
     )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help=(
+            "Resume from the newest resumable checkpoint under --output-root. "
+            "The latest run directory is reused instead of creating a new timestamped run."
+        ),
+    )
+    resume_group.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Disable resume and start a fresh run.",
+    )
+    parser.set_defaults(resume=bool(defaults.get("resume", False)))
     parser.add_argument(
         "--job-name",
         type=str,
@@ -2815,14 +3005,27 @@ def main(argv: list[str] | None = None) -> None:
         local_data_root=args.local_data_root.resolve(),
     )
     validate_dataset_root(dataset_root)
-    split_spec = build_dataset_split(
-        dataset_arg=args.dataset,
-        dataset_root=source_dataset_root,
-        dataset_repo_id=dataset_repo_id,
-        test_ratio=float(args.test_ratio),
-        split_seed=int(args.split_seed),
-        split_shuffle=bool(args.split_shuffle),
+    resume_run_state = (
+        resolve_resume_run_state(args.output_root) if bool(args.resume) else None
     )
+    split_spec = (
+        load_resume_dataset_split(
+            resume_run_state=resume_run_state,
+            source_dataset_root=source_dataset_root,
+            dataset_repo_id=dataset_repo_id,
+        )
+        if resume_run_state is not None
+        else None
+    )
+    if split_spec is None:
+        split_spec = build_dataset_split(
+            dataset_arg=args.dataset,
+            dataset_root=source_dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            test_ratio=float(args.test_ratio),
+            split_seed=int(args.split_seed),
+            split_shuffle=bool(args.split_shuffle),
+        )
     visual_storage_modes = summarize_visual_storage_modes(dataset_root)
 
     from lerobot.policies.act.configuration_act import ACTConfig
@@ -3037,37 +3240,6 @@ def main(argv: list[str] | None = None) -> None:
             prefix_train_max_steps=int(args.prefix_train_max_steps),
             use_path_signature=active_use_path_signature,
             use_delta_signature=active_use_delta_signature,
-        )
-
-    run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = (args.output_root / run_stamp).resolve()
-    split_path = output_dir / "dataset_split.json"
-
-    wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
-    resolved_wandb_project = (
-        str(args.wandb_project)
-        if args.wandb_project
-        else default_wandb_project_name(
-            dataset_repo_id=dataset_repo_id,
-            dataset_root=dataset_root,
-        )
-    )
-    resolved_job_name = args.job_name
-    if wandb_enable:
-        resolved_job_name = (
-            args.wandb_run_name
-            if args.wandb_run_name
-            else f"{args.job_name}-s{args.seed}-{run_stamp}"
-        )
-
-    if (
-        wandb_enable
-        and args.wandb_mode == "online"
-        and "WANDB_API_KEY" not in os.environ
-    ):
-        print(
-            "[WARN] WANDB_API_KEY not found in environment. "
-            "If you are not already logged in, run `wandb login` first."
         )
 
     dataset_cfg = DatasetConfig(
@@ -3322,6 +3494,84 @@ def main(argv: list[str] | None = None) -> None:
             n_action_steps=args.n_action_steps,
         )
 
+    resume_saved_train_cfg = None
+    resume_optimizer_cfg = None
+    resume_scheduler_cfg = None
+    if resume_run_state is not None:
+        policy_cfg.pretrained_path = resume_run_state.pretrained_model_dir
+        try:
+            resume_saved_train_cfg = TrainPipelineConfig.from_pretrained(
+                resume_run_state.train_config_path,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            print(
+                "[WARN] Failed to load saved train config from "
+                f"{resume_run_state.train_config_path}: {exc}"
+            )
+        else:
+            saved_policy_type = getattr(resume_saved_train_cfg.policy, "type", None)
+            if saved_policy_type and str(saved_policy_type) != str(args.policy):
+                raise ValueError(
+                    "The latest resumable checkpoint was created with a different "
+                    f"policy type: saved={saved_policy_type!r}, requested={args.policy!r}."
+                )
+            resume_optimizer_cfg = resume_saved_train_cfg.optimizer
+            resume_scheduler_cfg = resume_saved_train_cfg.scheduler
+
+        if resume_optimizer_cfg is None:
+            resume_optimizer_cfg = policy_cfg.get_optimizer_preset()
+        if resume_scheduler_cfg is None:
+            resume_scheduler_cfg = policy_cfg.get_scheduler_preset()
+
+    run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = (
+        resume_run_state.run_dir.resolve()
+        if resume_run_state is not None
+        else (args.output_root / run_stamp).resolve()
+    )
+    split_path = output_dir / DATASET_SPLIT_FILENAME
+
+    wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
+    resolved_wandb_project = (
+        str(args.wandb_project)
+        if args.wandb_project
+        else default_wandb_project_name(
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+    )
+    resolved_job_name = (
+        str(resume_saved_train_cfg.job_name)
+        if (
+            resume_saved_train_cfg is not None
+            and resume_saved_train_cfg.job_name is not None
+        )
+        else str(args.job_name)
+    )
+    if wandb_enable:
+        if args.wandb_run_name:
+            resolved_job_name = str(args.wandb_run_name)
+        elif resume_run_state is None:
+            resolved_job_name = f"{args.job_name}-s{args.seed}-{run_stamp}"
+        elif (
+            resume_saved_train_cfg is not None
+            and resume_saved_train_cfg.job_name is not None
+        ):
+            resolved_job_name = str(resume_saved_train_cfg.job_name)
+        else:
+            resolved_job_name = output_dir.name
+
+    if (
+        wandb_enable
+        and args.wandb_mode == "online"
+        and "WANDB_API_KEY" not in os.environ
+    ):
+        print(
+            "[WARN] WANDB_API_KEY not found in environment. "
+            "If you are not already logged in, run `wandb login` first."
+        )
+
     env_cfg = None
     if args.task:
         from lerobot.envs.configs import MetaworldEnv as MetaworldEnvConfig
@@ -3354,6 +3604,7 @@ def main(argv: list[str] | None = None) -> None:
         policy=policy_cfg,
         output_dir=output_dir,
         job_name=resolved_job_name,
+        resume=bool(resume_run_state is not None),
         seed=args.seed,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
@@ -3361,6 +3612,8 @@ def main(argv: list[str] | None = None) -> None:
         eval_freq=effective_eval_freq,
         log_freq=args.log_freq,
         save_freq=args.save_freq,
+        optimizer=resume_optimizer_cfg,
+        scheduler=resume_scheduler_cfg,
         wandb=wandb_cfg,
     )
 
@@ -3382,6 +3635,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"- dataset_tasks: {list(normalized_dataset_tasks)}")
     if args.task:
         print(f"- task: {args.task}")
+    print(f"- resume: {bool(resume_run_state is not None)}")
+    if resume_run_state is not None:
+        print(f"- resume_run_dir: {resume_run_state.run_dir}")
+        print(f"- resume_checkpoint_dir: {resume_run_state.checkpoint_dir}")
+        print(f"- resume_train_config_path: {resume_run_state.train_config_path}")
+        print(
+            "- train_split_source: "
+            f"{resume_run_state.split_path or 'recomputed from current dataset/split args'}"
+        )
     print(
         f"- train_test_split: train={split_spec.train_count}, "
         f"test={split_spec.test_count}, "
@@ -3562,6 +3824,13 @@ def main(argv: list[str] | None = None) -> None:
         mixed_precision=resolved_mixed_precision,
     )
 
+    resume_config_arg = None
+    if resume_run_state is not None and not any(
+        str(arg).startswith("--config_path=") for arg in sys.argv[1:]
+    ):
+        resume_config_arg = f"--config_path={resume_run_state.train_config_path}"
+        sys.argv.append(resume_config_arg)
+
     try:
         train(cfg, accelerator=accelerator)
         saved_split_path = save_dataset_split(output_dir, split_spec)
@@ -3570,6 +3839,9 @@ def main(argv: list[str] | None = None) -> None:
         print("\n[WARN] Training interrupted by user. Cleaning up wandb before exit.")
         teardown_wandb_safely(exit_code=130)
         raise SystemExit(130)
+    finally:
+        if resume_config_arg is not None and sys.argv[-1] == resume_config_arg:
+            sys.argv.pop()
 
 
 if __name__ == "__main__":

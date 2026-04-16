@@ -1,8 +1,9 @@
 # 数据目录说明
 
-`main/data/` 里现在主要维护三个工具：
+`main/data/` 里现在主要维护四个工具：
 
 - `convert_legacy_dataset_to_v30.py`：把 legacy 的 LeRobot v2.1 数据集转换成 v3.0 数据集，并带进度条展示转换过程。
+- `convert_rosbag_to_lerobot.py`：通过 YAML 配置把 ROS bag 转成 LeRobot v3.0 数据集，适合像 hanger 这样需要自定义图像 key 映射和 state/action 拼接规则的数据。
 - `process_dataset.py`：为已有的 LeRobot 数据集计算全前缀 `path signature` / `delta signature`，把结果写到独立的 signature cache，并同步更新数据集元信息。
 - `hfd.sh`：从 Hugging Face 下载 model 或 dataset 仓库快照，适合拉取原始数据集到本地。
 
@@ -11,7 +12,7 @@
 在仓库根目录运行：
 
 ```bash
-cd /home/jeong/zeno/corl/main
+cd /path/to/project-root
 conda activate corl-py312
 ```
 
@@ -77,6 +78,47 @@ python data/convert_legacy_dataset_to_v30.py \
 - `curl`
 - `aria2c` 或 `wget`
 - `jq`（可选；有的话鉴权检查更稳）
+
+## `convert_rosbag_to_lerobot.py`
+
+这个脚本用于把 ROS bag 直接转换成 LeRobot `v3.0` 数据集，并把下面这些 dataset-specific 逻辑放进 YAML：
+
+- 图像话题到 `observation.images.*` key 的映射
+- 各个状态量/动作量从 ROS message 里怎么提取
+- `observation.state`、`action` 等向量特征由哪些源按什么顺序拼接
+- 相对项目根目录的输入/输出路径、FPS、图像尺寸、视频编码、并行 worker 数等参数
+
+脚本当前采用“两遍读取 + 增量写入”的方式控制内存占用：
+
+- 第一遍只扫描各 topic 的时间戳，规划每一帧应采样的消息索引
+- 第二遍只反序列化真正会被用到的消息，并直接把 frame 逐条写入 LeRobot 数据集
+- `processing.n_workers` 仍会保留在配置和摘要里，但转换阶段现在会按 bag 顺序处理，以避免多个 worker 同时缓存整包数据导致 OOM
+
+当前仓库附带了一份 zeno 示例配置：
+
+```bash
+python data/convert_rosbag_to_lerobot.py \
+  --config data/configs/zeno_conversion.yaml \
+  --validate-config
+```
+
+实际转换时去掉 `--validate-config` 即可：
+
+```bash
+python data/convert_rosbag_to_lerobot.py \
+  --config data/configs/zeno_conversion.yaml
+```
+
+如果输出目录已存在，也可以临时覆盖配置里的行为：
+
+```bash
+python data/convert_rosbag_to_lerobot.py \
+  --config data/configs/zeno_conversion.yaml \
+  --overwrite-output
+```
+
+配置里的 `dataset.data_root` 和 `dataset.output_dir` 现在都必须写成相对项目根目录的路径，例如 `data/WholeBody_Hanger/stage3`。
+脚本会自动通过自身所在位置推导项目根目录，所以即使 `main` 目录改名，也不需要改 YAML 里的前缀。
 
 ## `process_dataset.py`
 

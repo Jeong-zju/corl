@@ -2,6 +2,7 @@ train:
   dataset_root: "data/zeno-ai/day3_5_Exp1_processed"
   dataset_repo_id: "zeno-ai/day3_5_Exp1_processed"
   output_root: "outputs/train/zeno-ai/day3_5_Exp1_processed/diffusion"
+  resume: false
   job_name: "diffusion"
   wandb_project: "day3_5_Exp1_processed"
   wandb_mode: "online"

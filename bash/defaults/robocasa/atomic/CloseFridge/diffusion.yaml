@@ -3,6 +3,7 @@ train:
   dataset_root: "data/robocasa/atomic/CloseFridge"
   dataset_repo_id: "robocasa/atomic/CloseFridge"
   output_root: "outputs/train/robocasa/atomic/CloseFridge/diffusion"
+  resume: false
   job_name: "diffusion"
   wandb_project: "robocasa-atomic-CloseFridge"
   wandb_mode: "online"

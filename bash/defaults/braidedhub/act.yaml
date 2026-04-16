@@ -2,6 +2,7 @@ train:
   dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   output_root: "outputs/train/braidedhub/act-baseline"
+  resume: false
   job_name: "act-baseline"
   wandb_project: "braidedhub"
   wandb_mode: "online"

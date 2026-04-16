@@ -3,6 +3,7 @@ train:
   dataset_root: "data/robocasa/composite/ArrangeBreadBasket"
   dataset_repo_id: "robocasa/composite/ArrangeBreadBasket"
   output_root: "outputs/train/robocasa/composite/ArrangeBreadBasket/act"
+  resume: false
   job_name: "act"
   wandb_project: "robocasa-composite-arrangebreadbasket"
   wandb_mode: "online"

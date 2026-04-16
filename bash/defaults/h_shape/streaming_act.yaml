@@ -2,6 +2,7 @@ train:
   dataset_root: "data/zeno-ai/rrt_connect_h_v30"
   dataset_repo_id: "zeno-ai/rrt_connect_h_v30"
   output_root: "outputs/train/h_shape/streaming-act"
+  resume: false
   job_name: "streaming-act"
   wandb_project: "h_shape"
   wandb_mode: "online"

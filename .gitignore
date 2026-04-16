@@ -3,6 +3,7 @@ data/*
 !data/*.py
 !data/README.md
 !data/hfd.sh
+!data/configs
 **/__pycache__/
 *.npz
 .cache
