@@ -20,6 +20,10 @@ from eval_helpers import (
     resolve_single_visual_observation_feature,
     write_summary,
 )
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    resolve_policy_capability_flags,
+)
 from policy_defaults import load_policy_mode_defaults
 
 
@@ -495,22 +499,16 @@ def evaluate_policy(
     state_key = "observation.state"
     state_dim = int(cfg.robot_state_feature.shape[0])
 
-    use_path_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
-    )
-    use_prefix_sequence_training = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_delta_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_delta_signature = capability_flags.use_delta_signature
+    use_signature_indexed_slot_memory = (
+        capability_flags.use_signature_indexed_slot_memory
     )
     build_explicit_prefix_eval_inputs = (
-        use_prefix_sequence_training and not use_visual_prefix_memory
+        capability_flags.build_explicit_prefix_eval_inputs
     )
     signature_key = DEFAULT_PATH_SIGNATURE_KEY
     signature_backend = None
@@ -542,11 +540,24 @@ def evaluate_policy(
             f"pad_value={cfg.prefix_pad_value}"
         )
     elif use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
         print(
             "[info] visual prefix memory online update enabled: "
-            "rollout uses fixed-size recurrent memory without rebuilding "
-            "explicit prefix-sequence tensors each step"
+            + (
+                "rollout uses signature-indexed slot memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+                if use_signature_indexed_slot_memory
+                else "rollout uses fixed-size recurrent memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+            )
         )
+        if initial_memory_debug is not None:
+            print(
+                "[info] visual prefix memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                f"updates={int(initial_memory_debug.get('update_count', 0))}"
+            )
 
     env = HShape2DEnv(seed=args.seed, success_threshold=args.success_threshold)
     base_img = env.render_base_image(image_hw)
@@ -746,12 +757,24 @@ def evaluate_policy(
             "steps": int(len(trajectory) - 1),
             "sum_reward": float(episode_reward),
         }
+        memory_debug_stats = (
+            get_visual_memory_debug_stats(policy) if use_visual_prefix_memory else None
+        )
+        if memory_debug_stats is not None:
+            result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
+        memory_debug_text = ""
+        if memory_debug_stats is not None:
+            memory_debug_text = (
+                " "
+                f"memory_updates={int(memory_debug_stats.get('update_count', 0))} "
+                f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
+            )
         print(
             f"[{ep_idx + 1:03d}/{args.num_rollouts:03d}] "
             f"task={TASK_ID_TO_NAME[task_id]} success={success} "
             f"steps={result['steps']} final_dist={final_distance:.3f} "
-            f"video={video_path.name}"
+            f"video={video_path.name}{memory_debug_text}"
         )
 
     summary = {
@@ -767,6 +790,10 @@ def evaluate_policy(
         "policy_dir": str(policy_dir),
         "results": results,
     }
+    if use_visual_prefix_memory:
+        memory_debug_stats = get_visual_memory_debug_stats(policy)
+        if memory_debug_stats is not None:
+            summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
     print(f"\nSaved {args.num_rollouts} rollout videos to: {output_dir}")

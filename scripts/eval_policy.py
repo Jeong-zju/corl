@@ -32,6 +32,11 @@ from eval_helpers import (
     resolve_signature_backend,
     write_summary,
 )
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    policy_supports_signature_features,
+    resolve_policy_capability_flags,
+)
 from policy_defaults import (
     load_policy_mode_defaults,
     load_policy_mode_defaults_for_dataset,
@@ -81,43 +86,37 @@ def ensure_prism_diffusion_importable(repo_root: Path) -> None:
 
 def validate_prefix_sequence_support(
     *,
-    policy_name: str,
     use_prefix_sequence_training: bool,
 ) -> None:
     if not use_prefix_sequence_training:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Prefix-sequence evaluation is currently implemented only for `streaming_act`. "
-            f"Got policy={policy_name!r}."
-        )
 
 
 def validate_visual_prefix_memory_support(
     *,
-    policy_name: str,
     use_visual_prefix_memory: bool,
+    use_prefix_sequence_training: bool,
 ) -> None:
     if not use_visual_prefix_memory:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Visual prefix memory evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
+    if not use_prefix_sequence_training:
+        raise ValueError(
+            "Visual prefix memory evaluation requires "
+            "`use_prefix_sequence_training=True` in the loaded policy config."
         )
 
 
 def validate_delta_signature_support(
     *,
-    policy_name: str,
+    use_path_signature: bool,
     use_delta_signature: bool,
 ) -> None:
     if not use_delta_signature:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Delta-signature evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
+    if not use_path_signature:
+        raise ValueError(
+            "Delta-signature evaluation requires `use_path_signature=True` in the "
+            "loaded policy config."
         )
 
 
@@ -505,7 +504,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     parser.set_defaults(enable_randomize=bool(defaults.get("enable_randomize", False)))
 
-    if known_args.policy == "streaming_act":
+    if policy_supports_signature_features(known_args.policy):
         parser.add_argument(
             "--signature-backend",
             type=str,
@@ -730,19 +729,20 @@ def run_env_evaluation(
     policy_dir: Path,
 ) -> None:
     validate_prefix_sequence_support(
-        policy_name=args.policy,
         use_prefix_sequence_training=bool(
             getattr(cfg, "use_prefix_sequence_training", False)
         ),
     )
     validate_visual_prefix_memory_support(
-        policy_name=args.policy,
         use_visual_prefix_memory=bool(
             getattr(cfg, "use_visual_prefix_memory", False)
         ),
+        use_prefix_sequence_training=bool(
+            getattr(cfg, "use_prefix_sequence_training", False)
+        ),
     )
     validate_delta_signature_support(
-        policy_name=args.policy,
+        use_path_signature=bool(getattr(cfg, "use_path_signature", False)),
         use_delta_signature=bool(getattr(cfg, "use_delta_signature", False)),
     )
 
@@ -820,26 +820,16 @@ def run_dataset_evaluation(
     env_state_key = resolve_env_state_key(cfg)
     action_key = resolve_action_key(cfg)
 
-    use_path_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_path_signature", False)
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_signature_indexed_slot_memory = (
+        capability_flags.use_signature_indexed_slot_memory
     )
-    use_prefix_sequence_training = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_signature_indexed_slot_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_signature_indexed_slot_memory", False)
-    )
-    use_delta_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_delta_signature", False)
-    )
+    use_delta_signature = capability_flags.use_delta_signature
     build_explicit_prefix_eval_inputs = (
-        use_prefix_sequence_training and not use_visual_prefix_memory
+        capability_flags.build_explicit_prefix_eval_inputs
     )
     signature_backend = None
     if use_path_signature:
@@ -862,6 +852,7 @@ def run_dataset_evaluation(
             f"cameras={visual_keys}"
         )
     elif use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
         print(
             "[info] visual prefix memory eval enabled: "
             + (
@@ -870,6 +861,14 @@ def run_dataset_evaluation(
                 else "the policy updates recurrent memory from the true current observation at each step"
             )
         )
+        if initial_memory_debug is not None:
+            print(
+                "[info] visual prefix memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                "signature_indexed_slot_memory="
+                f"{bool(initial_memory_debug.get('signature_indexed_slot_memory', False))}"
+            )
 
     action_dim: int | None = None
     total_abs_error: np.ndarray | None = None
@@ -1143,18 +1142,31 @@ def run_dataset_evaluation(
             "per_dim_mae": (episode_abs_error / evaluated_steps).tolist(),
             "per_dim_rmse": np.sqrt(episode_sq_error / evaluated_steps).tolist(),
         }
+        memory_debug_stats = (
+            get_visual_memory_debug_stats(policy) if use_visual_prefix_memory else None
+        )
+        if memory_debug_stats is not None:
+            result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
         cosine_text = (
             "n/a"
             if result["cosine_similarity"] is None
             else f"{result['cosine_similarity']:.4f}"
         )
+        memory_debug_text = ""
+        if memory_debug_stats is not None:
+            memory_debug_text = (
+                " "
+                f"memory_updates={int(memory_debug_stats.get('update_count', 0))} "
+                f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
+            )
         progress_write(
             step_progress,
             f"[{episode_pos:03d}/{len(episode_groups):03d}] "
             f"episode={episode_index} steps={evaluated_steps} "
             f"mae={result['mae']:.6f} rmse={result['rmse']:.6f} "
             f"l2={result['mean_l2_error']:.6f} cosine={cosine_text}"
+            f"{memory_debug_text}"
         )
 
     if step_progress is not None:
@@ -1190,6 +1202,10 @@ def run_dataset_evaluation(
         },
         "results": results,
     }
+    if use_visual_prefix_memory:
+        memory_debug_stats = get_visual_memory_debug_stats(policy)
+        if memory_debug_stats is not None:
+            summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
     print(f"\nSummary: {summary_path}")
@@ -1211,6 +1227,7 @@ def main(argv: list[str] | None = None) -> None:
         ensure_streaming_act_importable(repo_root)
     elif args.policy == "prism_diffusion":
         ensure_prism_diffusion_importable(repo_root)
+        ensure_streaming_act_importable(repo_root)
 
     try:
         from lerobot.configs.policies import PreTrainedConfig
@@ -1313,7 +1330,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
                 )
     if (
-        args.policy == "streaming_act"
+        hasattr(policy, "get_visual_prefix_memory_debug_stats")
         and getattr(cfg, "use_visual_prefix_memory", False)
         and cfg.n_action_steps > 1
     ):

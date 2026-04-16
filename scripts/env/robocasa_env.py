@@ -28,6 +28,10 @@ from eval_helpers import (
     resolve_signature_backend,
     write_summary,
 )
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    resolve_policy_capability_flags,
+)
 
 
 MAIN_ROOT = Path(__file__).resolve().parents[2]
@@ -688,16 +692,15 @@ class RoboCasaACTPolicyAdapter:
         self.policy_image_keys = [policy_key for policy_key, _env_key, _shape in self.visual_specs]
         self.state_feature_key, self.state_shape = _resolve_state_feature_key(cfg)
         self.required_task_feature_keys = _resolve_required_task_feature_keys(cfg)
-        self.use_path_signature = bool(getattr(cfg, "use_path_signature", False))
-        self.use_prefix_sequence_training = bool(
-            getattr(cfg, "use_prefix_sequence_training", False)
+        capability_flags = resolve_policy_capability_flags(cfg)
+        self.use_path_signature = capability_flags.use_path_signature
+        self.use_prefix_sequence_training = (
+            capability_flags.use_prefix_sequence_training
         )
-        self.use_visual_prefix_memory = bool(
-            getattr(cfg, "use_visual_prefix_memory", False)
-        )
-        self.use_delta_signature = bool(getattr(cfg, "use_delta_signature", False))
-        self.build_explicit_prefix_eval_inputs = bool(
-            self.use_prefix_sequence_training and not self.use_visual_prefix_memory
+        self.use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+        self.use_delta_signature = capability_flags.use_delta_signature
+        self.build_explicit_prefix_eval_inputs = (
+            capability_flags.build_explicit_prefix_eval_inputs
         )
         self.signature_backend = signature_backend
         _validate_supported_input_features(cfg)
@@ -715,7 +718,7 @@ class RoboCasaACTPolicyAdapter:
             )
         if self.use_path_signature and self.signature_backend is None:
             raise RuntimeError(
-                "RoboCasa streaming_act eval requires a resolved signature backend "
+                "RoboCasa eval requires a resolved signature backend "
                 "when `use_path_signature=True`."
             )
         self.reset()
@@ -1095,6 +1098,11 @@ def evaluate_policy(
     postprocessor,
     policy_dir: Path,
 ) -> None:
+    if policy_type == "prism_diffusion":
+        raise NotImplementedError(
+            "RoboCasa env eval does not yet support `prism_diffusion`. "
+            "No fallback is attempted; use dataset evaluation or another online env."
+        )
     if policy_type not in {"act", "streaming_act"}:
         raise NotImplementedError(
             "RoboCasa env eval currently supports `act` and `streaming_act` checkpoints."
@@ -1128,27 +1136,18 @@ def evaluate_policy(
         )
 
     _validate_supported_input_features(cfg)
-    use_path_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
-    )
-    use_prefix_sequence_training = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_delta_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
-    )
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_delta_signature = capability_flags.use_delta_signature
     signature_backend = None
     if use_path_signature:
         signature_backend = resolve_signature_backend(
             getattr(args, "signature_backend", "auto")
         )
         print(
-            "[load] RoboCasa streaming signatures: "
+            "[load] RoboCasa online signatures: "
             f"backend={signature_backend}, history={cfg.history_length}, "
             f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
         )
@@ -1159,6 +1158,15 @@ def evaluate_policy(
             f"mode={mode_text}, max_steps={cfg.prefix_train_max_steps}, "
             f"stride={cfg.prefix_frame_stride}, delta_signature={use_delta_signature}"
         )
+    if use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
+        if initial_memory_debug is not None:
+            print(
+                "[load] RoboCasa visual memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                f"updates={int(initial_memory_debug.get('update_count', 0))}"
+            )
     visual_specs = _resolve_visual_features(cfg)
     camera_names, camera_width, camera_height = _resolve_camera_setup(visual_specs)
     video_image_key = _choose_video_image_key(visual_specs)
@@ -1303,6 +1311,13 @@ def evaluate_policy(
                     task_success_count += int(result.success)
                     task_total_reward += float(result.total_reward)
                     task_total_steps += int(result.num_steps)
+                    memory_debug_stats = (
+                        get_visual_memory_debug_stats(policy)
+                        if use_visual_prefix_memory
+                        else None
+                    )
+                    if memory_debug_stats is not None:
+                        result.final_info["visual_memory_debug"] = memory_debug_stats
                     if result.video_path is not None:
                         overall_video_paths.append(result.video_path)
                     overall_rollouts += 1

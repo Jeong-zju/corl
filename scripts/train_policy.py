@@ -23,6 +23,7 @@ from dataset_utils import (
     save_dataset_split,
     validate_dataset_root,
 )
+from policy_capabilities import policy_supports_signature_features
 from policy_defaults import load_policy_mode_defaults_for_dataset
 
 warnings.filterwarnings(
@@ -256,6 +257,27 @@ def teardown_wandb_safely(exit_code: int) -> None:
         wandb.teardown(exit_code=exit_code)
     except BaseException as exc:
         print(f"[WARN] wandb teardown failed during shutdown: {exc}")
+
+
+def ensure_writable_hf_cache_env(repo_root: Path) -> None:
+    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+    hf_home = cache_root / "home"
+    hf_datasets_cache = cache_root / "datasets"
+    xdg_cache_home = cache_root / "xdg"
+    torch_home = cache_root / "torch"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    hf_datasets_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache_home.mkdir(parents=True, exist_ok=True)
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_datasets_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache_home))
+    if "TORCH_HOME" not in os.environ:
+        cached_torch_home = Path.home() / ".cache" / "torch"
+        if (cached_torch_home / "hub" / "checkpoints").exists():
+            os.environ["TORCH_HOME"] = str(cached_torch_home)
+        else:
+            os.environ["TORCH_HOME"] = str(torch_home)
 
 
 def configure_torch_sharing_strategy(strategy: str | None) -> str | None:
@@ -1304,17 +1326,11 @@ def validate_prefix_sequence_dataset(
 
 def validate_visual_prefix_memory_support(
     *,
-    policy_name: str,
     use_visual_prefix_memory: bool,
     use_prefix_sequence_training: bool,
 ) -> None:
     if not use_visual_prefix_memory:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Visual prefix memory is currently implemented only for `streaming_act`. "
-            f"Got policy={policy_name!r}."
-        )
     if not use_prefix_sequence_training:
         raise ValueError(
             "`--enable-visual-prefix-memory` requires "
@@ -2604,6 +2620,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[2]
+    ensure_writable_hf_cache_env(repo_root)
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)
     elif args.policy == "prism_diffusion":
@@ -2663,7 +2680,7 @@ def main(argv: list[str] | None = None) -> None:
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
     PrismDiffusionConfig = None
-    if args.policy in {"streaming_act", "prism_diffusion"}:
+    if policy_supports_signature_features(args.policy):
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
             configure_prefix_image_cache_runtime,
@@ -2752,7 +2769,6 @@ def main(argv: list[str] | None = None) -> None:
             use_delta_signature=use_delta_signature,
         )
         validate_visual_prefix_memory_support(
-            policy_name=args.policy,
             use_visual_prefix_memory=use_visual_prefix_memory,
             use_prefix_sequence_training=use_prefix_sequence_training,
         )
