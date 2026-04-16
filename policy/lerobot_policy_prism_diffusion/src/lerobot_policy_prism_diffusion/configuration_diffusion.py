@@ -20,6 +20,15 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot_policy_streaming_act.prefix_sequence import (
+    DELTA_SIGNATURE_KEY,
+    PATH_SIGNATURE_KEY,
+    PREFIX_DELTA_SIGNATURE_KEY,
+    PREFIX_MASK_KEY,
+    PREFIX_PATH_SIGNATURE_KEY,
+    PREFIX_STATE_KEY,
+    is_prefix_image_key,
+)
 
 
 @PreTrainedConfig.register_subclass("prism_diffusion")
@@ -238,6 +247,78 @@ class PrismDiffusionConfig(PreTrainedConfig):
                 "The horizon should be an integer multiple of the downsampling factor (which is determined "
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
+        if self.use_path_signature:
+            if self.history_length <= 0:
+                raise ValueError(f"`history_length` must be > 0. Got {self.history_length}.")
+            if self.signature_dim <= 0:
+                raise ValueError(f"`signature_dim` must be > 0. Got {self.signature_dim}.")
+            if self.signature_depth <= 0:
+                raise ValueError(f"`signature_depth` must be > 0. Got {self.signature_depth}.")
+            if self.signature_hidden_dim <= 0:
+                raise ValueError(f"`signature_hidden_dim` must be > 0. Got {self.signature_hidden_dim}.")
+            if not (0.0 <= self.signature_dropout <= 1.0):
+                raise ValueError(
+                    f"`signature_dropout` must be in [0, 1]. Got {self.signature_dropout}."
+                )
+        if self.use_delta_signature and not self.use_path_signature:
+            raise ValueError(
+                "`use_delta_signature=True` requires `use_path_signature=True` because "
+                "delta signatures are differences between path signatures."
+            )
+        if self.use_prefix_sequence_training:
+            if self.prefix_train_max_steps <= 0:
+                raise ValueError(
+                    "`prefix_train_max_steps` must be > 0 when "
+                    f"`use_prefix_sequence_training=True`. Got {self.prefix_train_max_steps}."
+                )
+            if self.prefix_frame_stride <= 0:
+                raise ValueError(
+                    "`prefix_frame_stride` must be > 0 when "
+                    f"`use_prefix_sequence_training=True`. Got {self.prefix_frame_stride}."
+                )
+        if self.use_visual_prefix_memory:
+            if not self.use_prefix_sequence_training:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires `use_prefix_sequence_training=True` "
+                    "so training can reconstruct PRISM memory via prefix scan."
+                )
+            if self.slot_memory_num_slots <= 0:
+                raise ValueError(
+                    "`slot_memory_num_slots` must be > 0 when PRISM memory is enabled. "
+                    f"Got {self.slot_memory_num_slots}."
+                )
+        if self.use_signature_indexed_slot_memory:
+            if not self.use_visual_prefix_memory:
+                raise ValueError(
+                    "`use_signature_indexed_slot_memory=True` requires `use_visual_prefix_memory=True`."
+                )
+            if not self.use_path_signature:
+                raise ValueError(
+                    "`use_signature_indexed_slot_memory=True` requires `use_path_signature=True`."
+                )
+            if self.slot_memory_routing_hidden_dim <= 0:
+                raise ValueError(
+                    "`slot_memory_routing_hidden_dim` must be > 0 when slot memory routing is enabled. "
+                    f"Got {self.slot_memory_routing_hidden_dim}."
+                )
+            if self.slot_memory_use_delta_routing and not self.use_delta_signature:
+                raise ValueError(
+                    "`slot_memory_use_delta_routing=True` requires `use_delta_signature=True`."
+                )
+            if self.slot_memory_balance_loss_coef < 0.0:
+                raise ValueError(
+                    "`slot_memory_balance_loss_coef` must be >= 0.0. "
+                    f"Got {self.slot_memory_balance_loss_coef}."
+                )
+            if self.slot_memory_consistency_loss_coef < 0.0:
+                raise ValueError(
+                    "`slot_memory_consistency_loss_coef` must be >= 0.0. "
+                    f"Got {self.slot_memory_consistency_loss_coef}."
+                )
+        if self.prism_adapter_hidden_dim <= 0:
+            raise ValueError(
+                f"`prism_adapter_hidden_dim` must be > 0. Got {self.prism_adapter_hidden_dim}."
+            )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
@@ -273,6 +354,133 @@ class PrismDiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
+        if self.use_path_signature:
+            path_signature_feature = self.path_signature_feature
+            if path_signature_feature is None:
+                raise ValueError(
+                    f"`use_path_signature=True` requires input feature `{PATH_SIGNATURE_KEY}`."
+                )
+            expected_shape = (self.signature_dim,)
+            if tuple(path_signature_feature.shape) != expected_shape:
+                raise ValueError(
+                    "Path-signature feature shape mismatch. "
+                    f"Expected {expected_shape}, got {tuple(path_signature_feature.shape)}."
+                )
+        if self.use_delta_signature:
+            delta_signature_feature = self.delta_signature_feature
+            if delta_signature_feature is None:
+                raise ValueError(
+                    f"`use_delta_signature=True` requires input feature `{DELTA_SIGNATURE_KEY}`."
+                )
+            expected_shape = (self.signature_dim,)
+            if tuple(delta_signature_feature.shape) != expected_shape:
+                raise ValueError(
+                    "Delta-signature feature shape mismatch. "
+                    f"Expected {expected_shape}, got {tuple(delta_signature_feature.shape)}."
+                )
+        if self.use_prefix_sequence_training:
+            if self.robot_state_feature is None:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires a current `observation.state` feature."
+                )
+            prefix_state_feature = self.prefix_state_feature
+            if prefix_state_feature is None:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires input feature "
+                    f"`{PREFIX_STATE_KEY}`."
+                )
+            expected_prefix_state_shape = (self.prefix_train_max_steps, self.robot_state_feature.shape[0])
+            if tuple(prefix_state_feature.shape) != expected_prefix_state_shape:
+                raise ValueError(
+                    "Prefix-state feature shape mismatch. "
+                    f"Expected {expected_prefix_state_shape}, got {tuple(prefix_state_feature.shape)}."
+                )
+            prefix_mask_feature = self.prefix_mask_feature
+            if prefix_mask_feature is None:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires input feature "
+                    f"`{PREFIX_MASK_KEY}`."
+                )
+            if tuple(prefix_mask_feature.shape) != (self.prefix_train_max_steps,):
+                raise ValueError(
+                    "Prefix-mask feature shape mismatch. "
+                    f"Expected {(self.prefix_train_max_steps,)}, got {tuple(prefix_mask_feature.shape)}."
+                )
+            if not self.prefix_image_features:
+                raise ValueError(
+                    "`use_prefix_sequence_training=True` requires at least one "
+                    "`observation.prefix_images.*` feature."
+                )
+            if len(self.prefix_image_features) != len(self.image_features):
+                raise ValueError(
+                    "Prefix image feature count must match the number of current observation cameras. "
+                    f"Got prefix={len(self.prefix_image_features)} vs current={len(self.image_features)}."
+                )
+
+            current_image_shapes: dict[str, tuple[int, ...]] = {}
+            for key, feature in self.image_features.items():
+                if key.startswith("observation.images."):
+                    suffix = key.removeprefix("observation.images.")
+                elif key == "observation.image":
+                    suffix = "main"
+                else:
+                    raise ValueError(
+                        "Unsupported current image feature name for prefix-sequence mode. "
+                        f"Got `{key}`."
+                    )
+                current_image_shapes[suffix] = tuple(feature.shape)
+
+            for prefix_key, prefix_feature in self.prefix_image_features.items():
+                suffix = prefix_key.removeprefix("observation.prefix_images.")
+                current_shape = current_image_shapes.get(suffix)
+                if current_shape is None:
+                    raise ValueError(
+                        "Prefix image feature does not map to any regular observation image. "
+                        f"Got prefix key `{prefix_key}`."
+                    )
+                expected_prefix_shape = (self.prefix_train_max_steps, *current_shape)
+                if tuple(prefix_feature.shape) != expected_prefix_shape:
+                    raise ValueError(
+                        "Prefix image feature shape mismatch. "
+                        f"Expected {expected_prefix_shape} for `{prefix_key}`, "
+                        f"got {tuple(prefix_feature.shape)}."
+                    )
+
+            if self.use_path_signature:
+                prefix_path_signature_feature = self.prefix_path_signature_feature
+                if prefix_path_signature_feature is None:
+                    raise ValueError(
+                        "`use_prefix_sequence_training=True` requires input feature "
+                        f"`{PREFIX_PATH_SIGNATURE_KEY}` when `use_path_signature=True`."
+                    )
+                expected_shape = (self.prefix_train_max_steps, self.signature_dim)
+                if tuple(prefix_path_signature_feature.shape) != expected_shape:
+                    raise ValueError(
+                        "Prefix path-signature feature shape mismatch. "
+                        f"Expected {expected_shape}, got {tuple(prefix_path_signature_feature.shape)}."
+                    )
+            if self.use_delta_signature:
+                prefix_delta_signature_feature = self.prefix_delta_signature_feature
+                if prefix_delta_signature_feature is None:
+                    raise ValueError(
+                        "`use_prefix_sequence_training=True` requires input feature "
+                        f"`{PREFIX_DELTA_SIGNATURE_KEY}` when `use_delta_signature=True`."
+                    )
+                expected_shape = (self.prefix_train_max_steps, self.signature_dim)
+                if tuple(prefix_delta_signature_feature.shape) != expected_shape:
+                    raise ValueError(
+                        "Prefix delta-signature feature shape mismatch. "
+                        f"Expected {expected_shape}, got {tuple(prefix_delta_signature_feature.shape)}."
+                    )
+        if self.use_visual_prefix_memory:
+            if not self.image_features:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires at least one regular observation image feature."
+                )
+            if self.robot_state_feature is None:
+                raise ValueError(
+                    "`use_visual_prefix_memory=True` requires `observation.state`."
+                )
 
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
@@ -283,6 +491,50 @@ class PrismDiffusionConfig(PreTrainedConfig):
             for key, ft in self.input_features.items()
             if ft.type is FeatureType.VISUAL
             and not key.startswith("observation.prefix_images.")
+        }
+
+    @property
+    def path_signature_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(PATH_SIGNATURE_KEY)
+
+    @property
+    def delta_signature_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(DELTA_SIGNATURE_KEY)
+
+    @property
+    def prefix_state_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_STATE_KEY)
+
+    @property
+    def prefix_path_signature_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_PATH_SIGNATURE_KEY)
+
+    @property
+    def prefix_delta_signature_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_DELTA_SIGNATURE_KEY)
+
+    @property
+    def prefix_mask_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        return self.input_features.get(PREFIX_MASK_KEY)
+
+    @property
+    def prefix_image_features(self) -> dict[str, PolicyFeature]:
+        if not self.input_features:
+            return {}
+        return {
+            key: ft for key, ft in self.input_features.items() if is_prefix_image_key(key)
         }
 
     @property
