@@ -62,6 +62,11 @@ SUPPORTED_TASK_FEATURE_KEYS = {
 }
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+DEFAULT_PREFIX_STATE_KEY = "observation.prefix_state"
+DEFAULT_PREFIX_MASK_KEY = "observation.prefix_mask"
+DEFAULT_PREFIX_PATH_SIGNATURE_KEY = "observation.prefix_path_signature"
+DEFAULT_PREFIX_DELTA_SIGNATURE_KEY = "observation.prefix_delta_signature"
+DEFAULT_PREFIX_IMAGES_PREFIX = "observation.prefix_images."
 
 
 def _maybe_create_tqdm(
@@ -169,6 +174,19 @@ def _resolve_required_task_feature_keys(cfg) -> list[str]:
     ]
 
 
+def _is_supported_aux_input_feature_key(key: str) -> bool:
+    # Some saved checkpoint schemas keep signature/prefix placeholders in
+    # `input_features` even when the runtime policy ignores missing values.
+    return key in {
+        DEFAULT_PATH_SIGNATURE_KEY,
+        DEFAULT_DELTA_SIGNATURE_KEY,
+        DEFAULT_PREFIX_STATE_KEY,
+        DEFAULT_PREFIX_MASK_KEY,
+        DEFAULT_PREFIX_PATH_SIGNATURE_KEY,
+        DEFAULT_PREFIX_DELTA_SIGNATURE_KEY,
+    } or key.startswith(DEFAULT_PREFIX_IMAGES_PREFIX)
+
+
 def _validate_supported_input_features(cfg) -> None:
     input_features = getattr(cfg, "input_features", None)
     if not isinstance(input_features, Mapping):
@@ -180,16 +198,17 @@ def _validate_supported_input_features(cfg) -> None:
     if state_key is not None:
         supported.add(state_key)
     supported.update(_resolve_required_task_feature_keys(cfg))
-    if bool(getattr(cfg, "use_path_signature", False)):
-        supported.add(DEFAULT_PATH_SIGNATURE_KEY)
-    if bool(getattr(cfg, "use_delta_signature", False)):
-        supported.add(DEFAULT_DELTA_SIGNATURE_KEY)
+    supported.update(
+        str(key)
+        for key in input_features
+        if _is_supported_aux_input_feature_key(str(key))
+    )
 
     unsupported = [str(key) for key in input_features if str(key) not in supported]
     if unsupported:
         raise NotImplementedError(
-            "RoboCasa eval currently supports image, state, task-id, and optional "
-            "path-signature inputs only. "
+            "RoboCasa eval currently supports image, state, task-id, signature, "
+            "and prefix-memory inputs only. "
             f"Unsupported input features: {unsupported}"
         )
 
@@ -510,27 +529,67 @@ def _resolve_task_dataset_root(
 def _estimate_conservative_max_steps_from_dataset(
     dataset_root: Path,
 ) -> tuple[int, int, int]:
-    episodes_path = dataset_root / LEGACY_EPISODES_JSONL_PATH
-    if not episodes_path.exists():
-        raise FileNotFoundError(
-            "RoboCasa eval could not find episode length metadata at "
-            f"{episodes_path}."
-        )
-
     lengths: list[int] = []
-    for raw_line in episodes_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        payload = json.loads(line)
-        length = int(payload.get("length", 0))
-        if length > 0:
-            lengths.append(length)
+
+    episodes_meta_dir = dataset_root / "meta" / "episodes"
+    episode_parquet_paths = sorted(episodes_meta_dir.rglob("*.parquet"))
+    if episode_parquet_paths:
+        try:
+            import pyarrow.parquet as pq
+        except ModuleNotFoundError:
+            pq = None
+        if pq is not None:
+            for parquet_path in episode_parquet_paths:
+                episode_table = pq.read_table(parquet_path, columns=["length"])
+                parquet_lengths = np.asarray(
+                    episode_table["length"].to_pylist(),
+                    dtype=np.int64,
+                )
+                lengths.extend(int(length) for length in parquet_lengths if int(length) > 0)
 
     if not lengths:
-        raise ValueError(
-            "RoboCasa eval could not infer episode lengths from "
-            f"{episodes_path}."
+        episodes_path = dataset_root / LEGACY_EPISODES_JSONL_PATH
+        if episodes_path.exists():
+            for raw_line in episodes_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                length = int(payload.get("length", 0))
+                if length > 0:
+                    lengths.append(length)
+
+    if not lengths:
+        extras_root = dataset_root / "extras"
+        for states_path in sorted(extras_root.glob("episode_*/states.npz")):
+            with np.load(states_path) as payload:
+                states = payload.get("states")
+                if states is None or states.ndim == 0:
+                    continue
+                length = int(states.shape[0])
+                if length > 0:
+                    lengths.append(length)
+
+    if not lengths:
+        info_path = dataset_root / "meta" / "info.json"
+        if info_path.exists():
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            total_frames = int(info.get("total_frames", 0))
+            total_episodes = int(info.get("total_episodes", 0))
+            if (
+                total_frames > 0
+                and total_episodes > 0
+                and total_frames % total_episodes == 0
+            ):
+                inferred_length = total_frames // total_episodes
+                if inferred_length > 0:
+                    lengths.append(inferred_length)
+
+    if not lengths:
+        raise FileNotFoundError(
+            "RoboCasa eval could not infer episode lengths. Checked "
+            f"{episodes_meta_dir}, {dataset_root / LEGACY_EPISODES_JSONL_PATH}, "
+            f"{dataset_root / 'extras'}, and {dataset_root / 'meta' / 'info.json'}."
         )
 
     longest_length = int(max(lengths))
