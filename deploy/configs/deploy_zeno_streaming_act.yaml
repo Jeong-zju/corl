@@ -1,6 +1,6 @@
 policy:
   type: streaming_act
-  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/streaming-act-sipm/20260414_003503/checkpoints/200000
+  path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-sipm/20260417_123454/checkpoints/200000
   device: cuda
   load_device: null
   n_action_steps: 50
@@ -21,7 +21,7 @@ policy:
   signature_backend: signatory
 
 runtime:
-  control_hz: 20.0
+  control_hz: 30.0
 
 image:
   width: 224
@@ -38,7 +38,7 @@ ros:
     joint_state_left: /robot/arm_left/joint_states_single
     joint_state_right: /robot/arm_right/joint_states_single
     odom: /ranger_base_node/odom
-    cmd_vel: /deploy/cmd_vel
+    cmd_vel: /robot/base/vla_cmd_vel
     cmd_joint_left: /robot/arm_left/vla_joint_cmd
     cmd_joint_right: /robot/arm_right/vla_joint_cmd
   joint_names_left:
@@ -63,6 +63,6 @@ ros:
 command:
   publish_base: true
   publish_arms: true
-  max_linear_x: 0.20
-  max_linear_y: 0.20
-  max_angular_z: 0.40
+  max_linear_x: 1.0
+  max_linear_y: 1.0
+  max_angular_z: 3.14
