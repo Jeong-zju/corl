@@ -13,3 +13,4 @@ depends/signatory/build/
 *.so
 discussions/
 plot/
+*bak*
