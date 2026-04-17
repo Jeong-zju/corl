@@ -36,6 +36,7 @@ train:
 eval:
   train_output_root: "outputs/train/robocasa/atomic/CloseFridge/diffusion"
   output_dir: "outputs/eval/robocasa/atomic/CloseFridge/diffusion/{run_tag}"
+  task: "CloseFridge"
   eval_split: "test"
   test_ratio: 0.2
   split_seed: 42
@@ -45,3 +46,9 @@ eval:
   seed: 42
   device: "cuda"
   n_action_steps: 50
+  robocasa_conda_env: "robocasa"
+  robocasa_split: "target"
+  num_rollouts: 20
+  max_steps: null
+  fps: 20
+  max_episodes_rendered: 4

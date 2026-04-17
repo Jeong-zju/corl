@@ -72,6 +72,24 @@ lerobot-train \
 ./bash/eval_policy.sh --dataset metaworld_mt50 --policy streaming_act --policy-path <ckpt_dir>
 ```
 
+* 统一 eval 接口说明
+
+评估入口、公共参数、RoboCasa task 自动解析规则见：
+
+```text
+EVAL_INTERFACE.md
+```
+
+RoboCasa 现在支持下面这几种统一写法：
+
+```bash
+./bash/eval_policy.sh --env robocasa --policy act --dataset robocasa/composite/ArrangeBreadBasket --policy-path <ckpt_dir>
+./bash/eval_policy.sh --env robocasa --policy diffusion --dataset robocasa/atomic/CloseFridge --policy-path <ckpt_dir>
+./bash/eval_policy.sh --env robocasa --policy streaming_act --dataset robocasa/composite --policy-path <ckpt_dir>
+./bash/eval_policy.sh --env robocasa --policy act --tasks ArrangeBreadBasket,PickPlaceCounterToSink --policy-path <ckpt_dir>
+./bash/eval_policy.sh --env robocasa --policy act --dataset robocasa/composite/ArrangeBreadBasket --robocasa-split all --policy-path <ckpt_dir>
+```
+
 * 开启 eval monitor
 
 ```bash

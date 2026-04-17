@@ -489,6 +489,11 @@ def evaluate_policy(
 ) -> None:
     import torch
 
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = int(getattr(args, "eval_max_steps", args.max_steps))
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = int(getattr(args, "eval_seed", args.seed))
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -559,13 +564,13 @@ def evaluate_policy(
                 f"updates={int(initial_memory_debug.get('update_count', 0))}"
             )
 
-    env = HShape2DEnv(seed=args.seed, success_threshold=args.success_threshold)
+    env = HShape2DEnv(seed=eval_seed, success_threshold=args.success_threshold)
     base_img = env.render_base_image(image_hw)
 
     results = []
     success_count = 0
 
-    for ep_idx, task_id in enumerate(env.build_task_schedule(args.num_rollouts, args.seed)):
+    for ep_idx, task_id in enumerate(env.build_task_schedule(eval_num_rollouts, eval_seed)):
         state_xy = tuple(float(v) for v in env.reset(task_id=task_id))
         if hasattr(policy, "reset"):
             policy.reset()
@@ -576,7 +581,7 @@ def evaluate_policy(
             video_path,
             image_hw[1],
             image_hw[0],
-            args.fps,
+            eval_fps,
         )
         if writer.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for rollout video writing.")
@@ -596,7 +601,7 @@ def evaluate_policy(
         previous_signature_vec = None
         success = False
 
-        for _step_idx in range(args.max_steps):
+        for _step_idx in range(eval_max_steps):
             frame = env.render_frame(base_img, state_xy)
             writer.stdin.write(frame.astype(np.uint8).tobytes())
 
@@ -771,7 +776,7 @@ def evaluate_policy(
                 f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
             )
         print(
-            f"[{ep_idx + 1:03d}/{args.num_rollouts:03d}] "
+            f"[{ep_idx + 1:03d}/{eval_num_rollouts:03d}] "
             f"task={TASK_ID_TO_NAME[task_id]} success={success} "
             f"steps={result['steps']} final_dist={final_distance:.3f} "
             f"video={video_path.name}{memory_debug_text}"
@@ -780,12 +785,12 @@ def evaluate_policy(
     summary = {
         "env": ENV_NAME,
         "policy_type": policy_type,
-        "num_rollouts": args.num_rollouts,
+        "num_rollouts": eval_num_rollouts,
         "success_count": success_count,
-        "success_rate": float(success_count / max(1, args.num_rollouts)),
-        "seed": args.seed,
-        "fps": args.fps,
-        "max_steps": args.max_steps,
+        "success_rate": float(success_count / max(1, eval_num_rollouts)),
+        "seed": eval_seed,
+        "fps": eval_fps,
+        "max_steps": eval_max_steps,
         "success_threshold": args.success_threshold,
         "policy_dir": str(policy_dir),
         "results": results,
@@ -796,8 +801,8 @@ def evaluate_policy(
             summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
-    print(f"\nSaved {args.num_rollouts} rollout videos to: {output_dir}")
+    print(f"\nSaved {eval_num_rollouts} rollout videos to: {output_dir}")
     print(f"Summary: {summary_path}")
     print(
-        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})"
+        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{eval_num_rollouts})"
     )

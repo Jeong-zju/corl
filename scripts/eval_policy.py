@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,14 @@ from policy_defaults import (
 
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedTaskSelector:
+    raw: str | None
+    items: tuple[str, ...]
+    canonical: str | None
 
 
 def maybe_create_tqdm(*, total: int, desc: str, unit: str):
@@ -128,6 +137,152 @@ def normalize_output_path_part(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip())
     normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
     return normalized or "item"
+
+
+def normalize_cli_text(value: str | os.PathLike[str] | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return None
+    if text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.rstrip("/")
+
+
+def normalize_csv_items(value: str | list[str] | tuple[str, ...] | set[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    raw_items = (
+        value
+        if isinstance(value, (list, tuple, set))
+        else str(value).split(",")
+    )
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        items.append(item)
+    return tuple(items)
+
+
+def cli_option_was_provided(
+    argv: list[str] | tuple[str, ...] | None,
+    *flags: str,
+) -> bool:
+    if argv is None:
+        return False
+    normalized_flags = tuple(str(flag) for flag in flags)
+    for token in argv:
+        token_s = str(token)
+        if token_s in normalized_flags:
+            return True
+        if any(token_s.startswith(f"{flag}=") for flag in normalized_flags):
+            return True
+    return False
+
+
+def build_normalized_task_selector(
+    value: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> NormalizedTaskSelector:
+    items = normalize_csv_items(value)
+    canonical = ",".join(items) if items else None
+    return NormalizedTaskSelector(
+        raw=None if value is None else str(value),
+        items=items,
+        canonical=canonical,
+    )
+
+
+def infer_robocasa_task_from_selector(
+    selector: str | os.PathLike[str] | None,
+) -> str | None:
+    normalized = normalize_cli_text(selector)
+    if normalized is None:
+        return None
+
+    parts = [
+        part
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if parts[:2] == ["main", "data"]:
+        parts = parts[2:]
+    elif parts[:1] == ["data"]:
+        parts = parts[1:]
+    if len(parts) < 3 or parts[0] != "robocasa":
+        return None
+    if parts[1] not in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    task_name = str(parts[2]).strip()
+    if not task_name or task_name in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    return task_name
+
+
+def resolve_robocasa_task_selector(args: argparse.Namespace) -> NormalizedTaskSelector:
+    explicit = build_normalized_task_selector(getattr(args, "task", None))
+    if explicit.items:
+        return explicit
+
+    defaults_tasks = build_normalized_task_selector(
+        getattr(args, "_policy_defaults_dataset_tasks", None)
+    )
+    if defaults_tasks.items:
+        return defaults_tasks
+
+    for selector in (
+        getattr(args, "dataset", None),
+        getattr(args, "dataset_repo_id", None),
+        getattr(args, "_policy_defaults_dataset_root", None),
+    ):
+        task_name = infer_robocasa_task_from_selector(selector)
+        if task_name is not None:
+            return build_normalized_task_selector(task_name)
+
+    return explicit
+
+
+def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.dataset = normalize_cli_text(getattr(args, "dataset", None))
+    args.dataset_repo_id = normalize_cli_text(getattr(args, "dataset_repo_id", None))
+
+    if args.env == "robocasa":
+        task_selector = resolve_robocasa_task_selector(args)
+    else:
+        task_selector = build_normalized_task_selector(getattr(args, "task", None))
+
+    args.eval_task_names = task_selector.items
+    args.eval_task_spec = task_selector.canonical
+    args.task = task_selector.canonical
+
+    args.eval_mode = "env" if args.env is not None else "dataset"
+    args.eval_num_rollouts = int(args.num_rollouts)
+    args.eval_max_steps = None if args.max_steps is None else int(args.max_steps)
+    args.eval_fps = int(args.fps)
+    args.eval_max_episodes_rendered = (
+        None
+        if args.max_episodes_rendered is None
+        else int(args.max_episodes_rendered)
+    )
+    args.eval_seed = None if getattr(args, "seed", None) is None else int(args.seed)
+    args.eval_split_name = str(args.eval_split)
+    args.eval_max_episodes = args.max_episodes
+    args.eval_max_steps_per_episode = args.max_steps_per_episode
+    args.eval_dataset_selector = args.dataset
+    args.eval_robocasa_conda_env = normalize_cli_text(
+        getattr(args, "robocasa_conda_env", None)
+    )
+    args.robocasa_conda_env = args.eval_robocasa_conda_env
+    args.eval_robocasa_split = str(getattr(args, "robocasa_split", "target"))
+    args.robocasa_split = args.eval_robocasa_split
+    return args
 
 
 def ensure_writable_hf_cache_env(repo_root: Path) -> None:
@@ -468,6 +623,16 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--robocasa-split",
+        type=str,
+        default=defaults.get("robocasa_split", "target"),
+        choices=["target", "pretrain", "all"],
+        help=(
+            "RoboCasa task split used by online env eval. "
+            "`target` is the default benchmark split."
+        ),
+    )
+    parser.add_argument(
         "--success-threshold",
         type=float,
         default=defaults.get("success_threshold", 0.0),
@@ -520,13 +685,31 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             None if defaults_path is None else str(defaults_path)
         ),
         _policy_defaults_dataset_root=dataset_train_defaults.get("dataset_root"),
+        _policy_defaults_dataset_tasks=dataset_train_defaults.get("dataset_tasks"),
+        _max_steps_default_source=(
+            "defaults" if "max_steps" in defaults else "builtin"
+        ),
     )
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = build_parser(argv)
-    args = parser.parse_args(argv)
+    normalized_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser(normalized_argv)
+    args = parser.parse_args(normalized_argv)
+    args._cli_provided_max_steps = cli_option_was_provided(
+        normalized_argv,
+        "--max-steps",
+    )
+
+    if (
+        args.env == "robocasa"
+        and not bool(getattr(args, "_cli_provided_max_steps", False))
+        and getattr(args, "_max_steps_default_source", "builtin") == "builtin"
+    ):
+        # RoboCasa prefers conservative horizon inference from the selected dataset
+        # whenever the user did not explicitly override rollout length.
+        args.max_steps = None
 
     output_dir_s = str(args.output_dir)
     if "{run_tag}" in output_dir_s:
@@ -538,7 +721,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, attr)
         if value is not None and not isinstance(value, Path):
             setattr(args, attr, Path(value))
-    return args
+    return normalize_eval_args(args)
 
 
 def select_visual_observation_keys(cfg) -> list[str]:

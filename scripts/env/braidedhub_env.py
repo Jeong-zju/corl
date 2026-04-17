@@ -2151,6 +2151,11 @@ def evaluate_policy(
 ) -> None:
     import torch
 
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = int(getattr(args, "eval_max_steps", args.max_steps))
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = int(getattr(args, "eval_seed", args.seed))
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2237,7 +2242,7 @@ def evaluate_policy(
     )
     env = BraidedHub2DEnv(
         map_config=map_config,
-        rng_seed=args.seed,
+        rng_seed=eval_seed,
         enable_randomize=enable_randomize,
         collision_mode=args.collision_mode,
     )
@@ -2259,7 +2264,7 @@ def evaluate_policy(
     task_branch_failure_counts = {
         int(task_id): 0 for task_id in sorted(TASK_ID_TO_GOAL_NAME)
     }
-    task_schedule = build_balanced_task_schedule(args.num_rollouts, args.seed)
+    task_schedule = build_balanced_task_schedule(eval_num_rollouts, eval_seed)
 
     for ep_idx, task_id in enumerate(task_schedule):
         task_spec = build_task_spec(task_id)
@@ -2282,7 +2287,7 @@ def evaluate_policy(
             video_path,
             image_hw[1],
             image_hw[0],
-            args.fps,
+            eval_fps,
         )
         if writer.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for rollout video writing.")
@@ -2308,7 +2313,7 @@ def evaluate_policy(
             "failure_reason": None,
         }
 
-        for _step_idx in range(args.max_steps):
+        for _step_idx in range(eval_max_steps):
             frame = render_lerobot_frame(
                 base_img,
                 config=map_config,
@@ -2536,7 +2541,7 @@ def evaluate_policy(
                 f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
             )
         print(
-            f"[{ep_idx + 1:03d}/{args.num_rollouts:03d}] "
+            f"[{ep_idx + 1:03d}/{eval_num_rollouts:03d}] "
             f"task={task_spec.task_code}->{task_spec.target_goal_name} "
             f"success={success} steps={result['steps']} "
             f"reached={result['reached_goal']} "
@@ -2559,13 +2564,13 @@ def evaluate_policy(
     summary = {
         "env": ENV_NAME,
         "policy_type": policy_type,
-        "num_rollouts": args.num_rollouts,
+        "num_rollouts": eval_num_rollouts,
         "success_count": success_count,
-        "success_rate": float(success_count / max(1, args.num_rollouts)),
+        "success_rate": float(success_count / max(1, eval_num_rollouts)),
         "wrong_branch_failures": branch_failure_count,
-        "seed": args.seed,
-        "fps": args.fps,
-        "max_steps": args.max_steps,
+        "seed": eval_seed,
+        "fps": eval_fps,
+        "max_steps": eval_max_steps,
         "max_action_step": args.max_action_step,
         "collision_mode": args.collision_mode,
         "collision_detections": int(
@@ -2585,10 +2590,10 @@ def evaluate_policy(
             summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
-    print(f"\nSaved {args.num_rollouts} rollout videos to: {output_dir}")
+    print(f"\nSaved {eval_num_rollouts} rollout videos to: {output_dir}")
     print(f"Summary: {summary_path}")
     print(
-        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})"
+        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{eval_num_rollouts})"
     )
     print(
         "Collision mode: "
@@ -2596,7 +2601,7 @@ def evaluate_policy(
         f"detections={summary['collision_detections']}, "
         f"rejections={summary['collision_rejections']}"
     )
-    print(f"Wrong-branch failures: {branch_failure_count}/{args.num_rollouts}")
+    print(f"Wrong-branch failures: {branch_failure_count}/{eval_num_rollouts}")
     for task_id in sorted(TASK_ID_TO_GOAL_NAME):
         task_summary = per_task[str(task_id)]
         print(

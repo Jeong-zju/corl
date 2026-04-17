@@ -83,6 +83,23 @@ def test_resolve_dataset_defaults_path_supports_close_fridge_diffusion_variants(
     assert defaults["output_root"].endswith(expected_output_suffix)
 
 
+def test_close_fridge_diffusion_eval_defaults_enable_robocasa_horizon_inference() -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="eval",
+        dataset_selector="robocasa/atomic/CloseFridge",
+        policy_name="diffusion",
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        "main/bash/defaults/robocasa/atomic/CloseFridge/diffusion.yaml"
+    )
+    assert defaults["task"] == "CloseFridge"
+    assert defaults["max_steps"] is None
+    assert defaults["robocasa_conda_env"] == "robocasa"
+    assert defaults["robocasa_split"] == "target"
+
+
 def test_resolve_dataset_defaults_path_keeps_broad_robocasa_collection_defaults() -> None:
     defaults, defaults_path = load_policy_mode_defaults_for_dataset(
         mode="train",
@@ -97,6 +114,23 @@ def test_resolve_dataset_defaults_path_keeps_broad_robocasa_collection_defaults(
     assert defaults["dataset_root"] == "data/robocasa/composite"
     assert defaults["dataset_repo_id"] == "robocasa/composite"
     assert defaults["dataset_tasks"] == ["ArrangeBreadBasket"]
+
+
+def test_resolve_dataset_defaults_path_keeps_broad_robocasa_atomic_defaults() -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="train",
+        dataset_selector="robocasa/atomic",
+        policy_name="streaming_act",
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        "main/bash/defaults/robocasa/atomic/streaming_act.yaml"
+    )
+    assert defaults["dataset_root"] == "data/robocasa/atomic"
+    assert defaults["dataset_repo_id"] == "robocasa/atomic"
+    assert defaults["dataset_tasks"] == ["CloseFridge"]
+    assert defaults["output_root"].endswith("robocasa/atomic/streaming-act-prism")
 
 
 def test_resolve_training_dataset_root_uses_exact_named_child_from_dataset_tasks(

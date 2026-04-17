@@ -144,7 +144,7 @@ def _resolve_visual_features(cfg) -> list[tuple[str, str, tuple[int, ...]]]:
         policy_key_s = str(policy_key)
         if not policy_key_s.startswith("observation.images."):
             raise NotImplementedError(
-                "RoboCasa ACT eval currently supports image inputs only under "
+                "RoboCasa eval currently supports image inputs only under "
                 "`observation.images.*`. "
                 f"Got unsupported visual feature {policy_key_s!r}."
             )
@@ -194,7 +194,7 @@ def _is_supported_aux_input_feature_key(key: str) -> bool:
 def _validate_supported_input_features(cfg) -> None:
     input_features = getattr(cfg, "input_features", None)
     if not isinstance(input_features, Mapping):
-        raise RuntimeError("RoboCasa ACT eval expected `cfg.input_features` to be present.")
+        raise RuntimeError("RoboCasa eval expected `cfg.input_features` to be present.")
 
     supported: set[str] = set()
     supported.update(key for key, _, _ in _resolve_visual_features(cfg))
@@ -236,7 +236,7 @@ def _resolve_camera_setup(
 
     if len(heights) > 1 or len(widths) > 1:
         raise RuntimeError(
-            "RoboCasa ACT eval expects all image features to share one resolution. "
+            "RoboCasa eval expects all image features to share one resolution. "
             f"Got heights={sorted(heights)}, widths={sorted(widths)}."
         )
 
@@ -643,6 +643,17 @@ def _resolve_task_max_steps(
     }
 
 
+def _resolve_task_output_dir(
+    *,
+    output_dir: Path,
+    task_name: str,
+    num_tasks: int,
+) -> Path:
+    if int(num_tasks) <= 1:
+        return output_dir
+    return output_dir / _normalize_output_path_part(task_name)
+
+
 class _TaskIndexResolver:
     def __init__(self, dataset_root: Path | None) -> None:
         self.dataset_root = dataset_root
@@ -670,7 +681,7 @@ class _TaskIndexResolver:
         return self._task_to_index.get(str(task_text).strip())
 
 
-class RoboCasaACTPolicyAdapter:
+class RoboCasaPolicyAdapter:
     def __init__(
         self,
         *,
@@ -706,12 +717,12 @@ class RoboCasaACTPolicyAdapter:
         _validate_supported_input_features(cfg)
         if self.state_feature_key is None:
             raise RuntimeError(
-                "RoboCasa ACT eval requires a state input feature such as "
+                "RoboCasa eval requires a state input feature such as "
                 "`observation.state`."
             )
         if self.required_task_feature_keys and not self.task_index_resolver.available:
             raise RuntimeError(
-                "This RoboCasa ACT checkpoint expects task-id conditioning "
+                "This RoboCasa checkpoint expects task-id conditioning "
                 f"features {self.required_task_feature_keys}, but no `meta/tasks.jsonl` "
                 "mapping was found. Pass `--dataset robocasa/...` or evaluate from a "
                 "training run that still has `dataset_split.json`."
@@ -931,7 +942,7 @@ class RoboCasaACTPolicyAdapter:
                 action = next(iter(action.values()))
             else:
                 raise RuntimeError(
-                    "RoboCasa ACT eval expected a single action tensor after "
+                    "RoboCasa eval expected a single action tensor after "
                     f"postprocessing, got keys={list(action)}."
                 )
         if torch.is_tensor(action):
@@ -941,7 +952,7 @@ class RoboCasaACTPolicyAdapter:
         action_np = np.asarray(action_np, dtype=np.float32).reshape(-1)
         if action_np.shape[0] != int(env.action_dim):
             raise RuntimeError(
-                "RoboCasa ACT action dimension mismatch: "
+                "RoboCasa policy action dimension mismatch: "
                 f"got {action_np.shape[0]}, expected {env.action_dim}."
             )
         return action_np
@@ -950,7 +961,7 @@ class RoboCasaACTPolicyAdapter:
 def _run_single_rollout(
     *,
     env,
-    policy_adapter: RoboCasaACTPolicyAdapter,
+    policy_adapter: RoboCasaPolicyAdapter,
     max_steps: int,
     seed: int | None,
     video_path: Path | None,
@@ -1098,28 +1109,43 @@ def evaluate_policy(
     postprocessor,
     policy_dir: Path,
 ) -> None:
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = getattr(args, "eval_max_steps", args.max_steps)
+    eval_max_episodes_rendered = getattr(
+        args,
+        "eval_max_episodes_rendered",
+        args.max_episodes_rendered,
+    )
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = getattr(args, "eval_seed", args.seed)
+    eval_task_names = tuple(
+        getattr(args, "eval_task_names", ())
+        or _parse_tasks(getattr(args, "task", None))
+    )
+
     if policy_type == "prism_diffusion":
         raise NotImplementedError(
             "RoboCasa env eval does not yet support `prism_diffusion`. "
             "No fallback is attempted; use dataset evaluation or another online env."
         )
-    if policy_type not in {"act", "streaming_act"}:
+    if policy_type not in {"act", "diffusion", "streaming_act"}:
         raise NotImplementedError(
-            "RoboCasa env eval currently supports `act` and `streaming_act` checkpoints."
+            "RoboCasa env eval currently supports `act`, `diffusion`, "
+            "and `streaming_act` checkpoints."
         )
-    if int(args.num_rollouts) <= 0:
+    if eval_num_rollouts <= 0:
         raise ValueError("`--num-rollouts` must be positive for RoboCasa eval.")
-    if args.max_steps is not None and int(args.max_steps) <= 0:
+    if eval_max_steps is not None and int(eval_max_steps) <= 0:
         raise ValueError("`--max-steps` must be positive for RoboCasa eval.")
-    if args.max_episodes_rendered is not None and int(args.max_episodes_rendered) < 0:
+    if eval_max_episodes_rendered is not None and int(eval_max_episodes_rendered) < 0:
         raise ValueError("`--max-episodes-rendered` must be >= 0 when provided.")
 
-    tasks = _parse_tasks(getattr(args, "task", None))
+    tasks = list(eval_task_names)
     conda_env = _normalize_conda_env_name(
-        getattr(args, "robocasa_conda_env", DEFAULT_ROBOCASA_CONDA_ENV)
+        getattr(args, "eval_robocasa_conda_env", getattr(args, "robocasa_conda_env", DEFAULT_ROBOCASA_CONDA_ENV))
     )
     robocasa_split = _normalize_robocasa_split(
-        getattr(args, "robocasa_split", None)
+        getattr(args, "eval_robocasa_split", getattr(args, "robocasa_split", None))
     )
 
     print(
@@ -1172,16 +1198,17 @@ def evaluate_policy(
     video_image_key = _choose_video_image_key(visual_specs)
     video_image_keys = _resolve_video_image_keys(visual_specs)
     max_videos_per_task = (
-        int(args.max_episodes_rendered)
-        if args.max_episodes_rendered is not None
-        else int(args.num_rollouts)
+        int(eval_max_episodes_rendered)
+        if eval_max_episodes_rendered is not None
+        else int(eval_num_rollouts)
     )
     # RoboCasaGymEnv zeros all camera observations when `enable_render=False`,
-    # so ACT image inputs and saved rollout videos both require rendering enabled.
+    # so policy image inputs and saved rollout videos both require rendering enabled.
     enable_render = bool(visual_specs) or bool(video_image_key)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    single_task_eval = len(tasks) == 1
 
     overall_success_count = 0
     overall_reward = 0.0
@@ -1192,7 +1219,7 @@ def evaluate_policy(
     resolved_max_steps_by_task: dict[str, int] = {}
     dataset_roots_by_task: dict[str, str] = {}
     eval_start_s = time.perf_counter()
-    total_rollout_count = int(len(tasks) * int(args.num_rollouts))
+    total_rollout_count = int(len(tasks) * eval_num_rollouts)
     overall_progress = _maybe_create_tqdm(
         total=total_rollout_count,
         desc="RoboCasa Eval",
@@ -1202,7 +1229,11 @@ def evaluate_policy(
 
     try:
         for task_name in tasks:
-            task_dir = output_dir / _normalize_output_path_part(task_name)
+            task_dir = _resolve_task_output_dir(
+                output_dir=output_dir,
+                task_name=task_name,
+                num_tasks=len(tasks),
+            )
             task_dataset_root = _resolve_task_dataset_root(
                 task_name=task_name,
                 args=args,
@@ -1210,7 +1241,7 @@ def evaluate_policy(
             )
             task_max_steps, task_max_steps_info = _resolve_task_max_steps(
                 requested_max_steps=(
-                    None if args.max_steps is None else int(args.max_steps)
+                    None if eval_max_steps is None else int(eval_max_steps)
                 ),
                 task_name=task_name,
                 task_dataset_root=task_dataset_root,
@@ -1220,7 +1251,7 @@ def evaluate_policy(
                 dataset_roots_by_task[str(task_name)] = str(task_dataset_root)
 
             task_index_resolver = _TaskIndexResolver(task_dataset_root)
-            policy_adapter = RoboCasaACTPolicyAdapter(
+            policy_adapter = RoboCasaPolicyAdapter(
                 policy=policy,
                 cfg=cfg,
                 preprocessor=preprocessor,
@@ -1255,11 +1286,11 @@ def evaluate_policy(
                 task_total_reward = 0.0
                 task_total_steps = 0
 
-                for rollout_index in range(int(args.num_rollouts)):
+                for rollout_index in range(eval_num_rollouts):
                     rollout_seed = (
                         None
-                        if getattr(args, "seed", None) is None
-                        else int(args.seed) + rollout_index
+                        if eval_seed is None
+                        else int(eval_seed) + rollout_index
                     )
                     save_video = bool(video_image_keys or video_image_key) and rollout_index < max_videos_per_task
                     video_path = (
@@ -1276,7 +1307,7 @@ def evaluate_policy(
                         total=int(task_max_steps),
                         desc=(
                             f"{task_name} "
-                            f"[{rollout_index + 1}/{int(args.num_rollouts)}]"
+                            f"[{rollout_index + 1}/{eval_num_rollouts}]"
                         ),
                         unit="step",
                         leave=False,
@@ -1291,7 +1322,7 @@ def evaluate_policy(
                             seed=rollout_seed,
                             video_path=video_path,
                             details_path=details_path,
-                            fps=int(args.fps),
+                            fps=eval_fps,
                             video_image_key=video_image_key,
                             video_image_keys=video_image_keys,
                             step_progress=step_progress,
@@ -1331,7 +1362,7 @@ def evaluate_policy(
                     _progress_write(
                         overall_progress,
                         "[eval][robocasa] "
-                        f"task={task_name} rollout={rollout_index + 1}/{int(args.num_rollouts)} "
+                        f"task={task_name} rollout={rollout_index + 1}/{eval_num_rollouts} "
                         f"steps={result.num_steps} reward={result.total_reward:.2f} "
                         f"success={int(result.success)} elapsed="
                         f"{_format_elapsed_s(time.perf_counter() - rollout_start_s)}",
@@ -1339,15 +1370,17 @@ def evaluate_policy(
 
                 task_eval = RoboCasaEvaluationResult(
                     task=str(task_name),
-                    num_rollouts=int(args.num_rollouts),
+                    num_rollouts=eval_num_rollouts,
                     max_steps=int(task_max_steps),
                     success_count=int(task_success_count),
-                    success_rate=float(task_success_count / max(1, int(args.num_rollouts))),
-                    average_reward=float(task_total_reward / max(1, int(args.num_rollouts))),
-                    average_steps=float(task_total_steps / max(1, int(args.num_rollouts))),
+                    success_rate=float(task_success_count / max(1, eval_num_rollouts)),
+                    average_reward=float(task_total_reward / max(1, eval_num_rollouts)),
+                    average_steps=float(task_total_steps / max(1, eval_num_rollouts)),
                     rollout_results=rollout_results,
                     output_dir=str(task_dir),
-                    summary_path=str(task_dir / "summary.json"),
+                    summary_path=str(output_dir / "summary.json")
+                    if single_task_eval
+                    else str(task_dir / "summary.json"),
                 )
                 task_summary = task_eval.to_summary_dict()
                 task_summary.update(
@@ -1363,7 +1396,8 @@ def evaluate_policy(
                         ],
                     }
                 )
-                write_summary(task_dir, task_summary)
+                if not single_task_eval:
+                    write_summary(task_dir, task_summary)
 
                 overall_success_count += int(task_success_count)
                 overall_reward += float(task_total_reward)
@@ -1413,15 +1447,15 @@ def evaluate_policy(
         "policy_type": policy_type,
         "policy_dir": str(policy_dir),
         "env": ENV_NAME,
-        "task_spec": str(args.task),
+        "task_spec": None if getattr(args, "eval_task_spec", None) is None else str(args.eval_task_spec),
         "tasks": tasks,
         "num_tasks": int(len(tasks)),
-        "rollouts_per_task": int(args.num_rollouts),
+        "rollouts_per_task": eval_num_rollouts,
         "total_rollouts": int(overall_rollouts),
-        "max_steps": None if args.max_steps is None else int(args.max_steps),
+        "max_steps": None if eval_max_steps is None else int(eval_max_steps),
         "resolved_max_steps_by_task": resolved_max_steps_by_task,
-        "seed": None if getattr(args, "seed", None) is None else int(args.seed),
-        "fps": int(args.fps),
+        "seed": None if eval_seed is None else int(eval_seed),
+        "fps": eval_fps,
         "robocasa_conda_env": conda_env,
         "robocasa_split": robocasa_split,
         "camera_names": camera_names,

@@ -3597,7 +3597,7 @@ def main(argv: list[str] | None = None) -> None:
     if int(args.eval_freq) > 0:
         print(
             "[WARN] `--eval-freq` is ignored in dataset-only mode because no simulator "
-            "environment is configured. Use `main/scripts/eval_policy.py` on the saved "
+            "environment is configured. Use `scripts/eval_policy.py` on the saved "
             "held-out test split instead."
         )
 
