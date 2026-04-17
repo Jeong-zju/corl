@@ -11,7 +11,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 if str(DEPLOY_ROOT) not in sys.path:
     sys.path.insert(0, str(DEPLOY_ROOT))
 
-from common import MAIN_ROOT, ensure_runtime_paths
+from common import ensure_runtime_paths
 from config import DeployConfig
 from policy_runtime.preprocess import (
     build_raw_policy_observation,
@@ -23,20 +23,11 @@ from policy_runtime.preprocess import (
 
 ensure_runtime_paths()
 
-from eval_helpers import resolve_policy_dir  # noqa: E402
-
-
-def ensure_streaming_act_importable() -> None:
-    import sys
-
-    streaming_act_src = MAIN_ROOT / "policy" / "lerobot_policy_streaming_act" / "src"
-    if not streaming_act_src.exists():
-        raise FileNotFoundError(
-            f"Streaming ACT package source not found: {streaming_act_src}"
-        )
-    sys.path.insert(0, str(streaming_act_src))
-
-
+from eval_helpers import (  # noqa: E402
+    import_local_streaming_act_policy_class,
+    load_streaming_act_config_from_pretrained_dir,
+    resolve_policy_dir,
+)
 class PolicyRuntime:
     def __init__(self, config: DeployConfig) -> None:
         self.deploy_config = config
@@ -65,12 +56,14 @@ class PolicyRuntime:
 
         policy_type = self.deploy_config.policy.type
         if policy_type == "streaming_act":
-            ensure_streaming_act_importable()
-            from lerobot_policy_streaming_act.modeling_streaming_act import (  # type: ignore
-                StreamingACTPolicy,
+            policy_cls = import_local_streaming_act_policy_class()
+        elif policy_type == "prism_diffusion":
+            raise ValueError(
+                "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
+                "The current deploy runtime supports only 'act' and 'streaming_act'. "
+                "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
+                "until deploy support is added."
             )
-
-            policy_cls = StreamingACTPolicy
         elif policy_type == "act":
             from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -80,10 +73,13 @@ class PolicyRuntime:
 
         self.policy_dir = resolve_policy_dir(policy_path)
         local_files_only = self.policy_dir.is_dir()
-        cfg = PreTrainedConfig.from_pretrained(
-            self.policy_dir,
-            local_files_only=local_files_only,
-        )
+        if policy_type == "streaming_act":
+            cfg = load_streaming_act_config_from_pretrained_dir(self.policy_dir)
+        else:
+            cfg = PreTrainedConfig.from_pretrained(
+                self.policy_dir,
+                local_files_only=local_files_only,
+            )
 
         load_device = (
             self.deploy_config.policy.load_device or self.deploy_config.policy.device

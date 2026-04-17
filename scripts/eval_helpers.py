@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import importlib
 import json
+import logging
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
+
+LOGGER = logging.getLogger(__name__)
 
 
 def compute_delta_signature_sequence_np(signatures: np.ndarray) -> np.ndarray:
@@ -114,6 +119,131 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         "- <base>/pretrained_model/model.safetensors\n"
         "- <base>/checkpoints/last/pretrained_model/model.safetensors"
     )
+
+
+def _ensure_local_streaming_act_modules(
+    repo_root: Path | None = None,
+):
+    repo_root = (
+        repo_root.resolve(strict=False)
+        if repo_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    streaming_act_src = repo_root / "main" / "policy" / "lerobot_policy_streaming_act" / "src"
+    if not streaming_act_src.exists():
+        raise FileNotFoundError(
+            f"Streaming ACT package source not found: {streaming_act_src}"
+        )
+
+    streaming_act_src_str = str(streaming_act_src)
+    if streaming_act_src_str not in sys.path:
+        sys.path.insert(0, streaming_act_src_str)
+
+    for module_name, module in list(sys.modules.items()):
+        if module_name != "lerobot_policy_streaming_act" and not module_name.startswith(
+            "lerobot_policy_streaming_act."
+        ):
+            continue
+
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            sys.modules.pop(module_name, None)
+            continue
+
+        module_path = Path(module_file).resolve(strict=False)
+        if not module_path.is_relative_to(streaming_act_src):
+            sys.modules.pop(module_name, None)
+
+    configuration_module = importlib.import_module(
+        "lerobot_policy_streaming_act.configuration_streaming_act"
+    )
+    modeling_module = importlib.import_module(
+        "lerobot_policy_streaming_act.modeling_streaming_act"
+    )
+    return (
+        configuration_module.StreamingACTConfig,
+        modeling_module.StreamingACTPolicy,
+    )
+
+
+def import_local_streaming_act_policy_class(repo_root: Path | None = None):
+    _, policy_cls = _ensure_local_streaming_act_modules(repo_root=repo_root)
+    return policy_cls
+
+
+def _parse_config_with_class(
+    *,
+    config_cls,
+    config_path: Path,
+    drop_unknown_fields: bool,
+):
+    import draccus
+    from dataclasses import fields
+
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    raw_config.pop("type", None)
+
+    dropped_fields: tuple[str, ...] = ()
+    if drop_unknown_fields:
+        valid_fields = {field.name for field in fields(config_cls)}
+        dropped_fields = tuple(sorted(key for key in raw_config if key not in valid_fields))
+        if dropped_fields:
+            raw_config = {
+                key: value for key, value in raw_config.items() if key in valid_fields
+            }
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            json.dump(raw_config, handle)
+            temp_path = Path(handle.name)
+
+        with draccus.config_type("json"):
+            cfg = draccus.parse(config_cls, str(temp_path), args=[])
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    return cfg, dropped_fields
+
+
+def load_streaming_act_config_from_pretrained_dir(
+    policy_dir: Path,
+    *,
+    repo_root: Path | None = None,
+):
+    config_cls, _ = _ensure_local_streaming_act_modules(repo_root=repo_root)
+    config_path = Path(policy_dir) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Policy config not found: {config_path}")
+
+    try:
+        cfg, _ = _parse_config_with_class(
+            config_cls=config_cls,
+            config_path=config_path,
+            drop_unknown_fields=False,
+        )
+        return cfg
+    except Exception as exc:
+        fallback_cfg, dropped_fields = _parse_config_with_class(
+            config_cls=config_cls,
+            config_path=config_path,
+            drop_unknown_fields=True,
+        )
+        if not dropped_fields:
+            raise exc
+
+        LOGGER.warning(
+            "Ignored unsupported Streaming ACT config fields while loading %s: %s",
+            config_path,
+            ", ".join(dropped_fields),
+        )
+        return fallback_cfg
 
 
 def find_latest_run_dir(train_root: Path) -> Path | None:
