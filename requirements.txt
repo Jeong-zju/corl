@@ -1,0 +1,32 @@
+# Generated from environment.yml for pip-based installs.
+# Use Python 3.12 for best compatibility.
+# Install `ffmpeg` separately at the system level before use.
+# `pip>=26` was omitted because installer version pinning is usually handled
+# outside the project requirements file.
+
+numpy>=2.2,<2.3
+pandas>=3.0,<3.1
+pyarrow>=23,<24
+matplotlib>=3.10,<3.11
+scikit-learn>=1.8,<1.9
+pyyaml>=6,<7
+pyzmq>=26,<27
+accelerate>=1.13,<2
+datasets>=4.7,<5
+einops>=0.8,<0.9
+fastapi>=0.115,<1.0
+fsspec>=2026.2,<2027
+huggingface-hub>=1.9,<2
+jinja2>=3.1,<4.0
+lerobot==0.5.0
+mujoco>=3.6,<3.7
+opencv-python-headless>=4.11,<4.13
+robot-descriptions>=1.23,<2
+rosbags>=0.11,<0.12
+torch==2.9.1
+torchcodec>=0.9,<0.10
+torchvision==0.24.1
+tqdm>=4.67,<5
+uvicorn[standard]>=0.30,<1.0
+wandb>=0.24,<0.25
+-e ./policy/lerobot_policy_streaming_act
