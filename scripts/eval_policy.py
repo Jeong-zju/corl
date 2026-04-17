@@ -29,6 +29,8 @@ from eval_helpers import (
     compute_signatory_signature_np,
     compute_simple_signature_np,
     ensure_prefix_sequence_batch_dims,
+    import_local_streaming_act_policy_class,
+    load_streaming_act_config_from_pretrained_dir,
     resolve_eval_policy_path,
     resolve_signature_backend,
     write_summary,
@@ -1423,14 +1425,7 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
 
     if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_streaming_act import (
-            StreamingACTConfig,
-        )
-        from lerobot_policy_streaming_act.modeling_streaming_act import (
-            StreamingACTPolicy,
-        )
-
-        policy_cls = StreamingACTPolicy
+        policy_cls = import_local_streaming_act_policy_class(repo_root=repo_root)
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
             PrismDiffusionConfig,
@@ -1463,10 +1458,16 @@ def main(argv: list[str] | None = None) -> None:
     local_files_only = policy_dir.is_dir()
     config_load_start_s = time.perf_counter()
     print(f"[load] Loading policy config for device={args.device}...")
-    cfg = PreTrainedConfig.from_pretrained(
-        policy_dir,
-        local_files_only=local_files_only,
-    )
+    if args.policy == "streaming_act":
+        cfg = load_streaming_act_config_from_pretrained_dir(
+            policy_dir,
+            repo_root=repo_root,
+        )
+    else:
+        cfg = PreTrainedConfig.from_pretrained(
+            policy_dir,
+            local_files_only=local_files_only,
+        )
     checkpoint_device = getattr(cfg, "device", None)
     if checkpoint_device != args.device:
         print(
