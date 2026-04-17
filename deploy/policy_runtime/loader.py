@@ -47,7 +47,7 @@ class PolicyRuntime:
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Missing LeRobot deployment dependencies. "
-                "Please install the `main/environment.yml` environment first."
+                "Please install the repository `environment.yml` environment first."
             ) from exc
 
         policy_path = self.deploy_config.policy.path
