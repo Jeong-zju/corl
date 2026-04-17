@@ -1,9 +1,9 @@
 policy:
   type: act
-  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/act/20260408_153316/checkpoints/last
+  path: ../../outputs/train/zeno-ai/wholebody_hanger_stage3_v30/act/20260411_160915/checkpoints/200000
   device: cuda
   load_device: null
-  n_action_steps: 1
+  n_action_steps: 50
   state_dim: 17
   action_dim: 17
   arm_dof: 7
@@ -14,11 +14,6 @@ policy:
     left: observation.images.realsense_left
     right: observation.images.realsense_right
     top: observation.images.realsense_top
-  use_path_signature: true
-  use_delta_signature: true
-  signature_depth: 3
-  signature_dim: 5219
-  signature_backend: auto
 
 runtime:
   control_hz: 20.0
