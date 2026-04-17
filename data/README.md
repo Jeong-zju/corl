@@ -1,11 +1,12 @@
 # 数据目录说明
 
-`main/data/` 里现在主要维护四个工具：
+`main/data/` 里现在主要维护五个工具：
 
 - `convert_legacy_dataset_to_v30.py`：把 legacy 的 LeRobot v2.1 数据集转换成 v3.0 数据集，并带进度条展示转换过程。
 - `convert_rosbag_to_lerobot.py`：通过 YAML 配置把 ROS bag 转成 LeRobot v3.0 数据集，适合像 hanger 这样需要自定义图像 key 映射和 state/action 拼接规则的数据。
 - `process_dataset.py`：为已有的 LeRobot 数据集计算全前缀 `path signature` / `delta signature`，把结果写到独立的 signature cache，并同步更新数据集元信息。
 - `hfd.sh`：从 Hugging Face 下载 model 或 dataset 仓库快照，适合拉取原始数据集到本地。
+- `upload_dataset_to_hf.py`：把本地数据集目录上传到 Hugging Face dataset 仓库，支持自动建仓、路径过滤，以及大目录的可恢复上传。
 
 ## 环境准备
 
@@ -78,6 +79,11 @@ python data/convert_legacy_dataset_to_v30.py \
 - `curl`
 - `aria2c` 或 `wget`
 - `jq`（可选；有的话鉴权检查更稳）
+
+如果要用 `upload_dataset_to_hf.py`，还需要：
+
+- `huggingface-hub`
+- 已执行 `huggingface-cli login` / `hf auth login`，或者提供 `HF_TOKEN` / `--token`
 
 ## `convert_rosbag_to_lerobot.py`
 
@@ -317,4 +323,99 @@ python data/process_dataset.py --help
 
 ```bash
 bash data/hfd.sh --help
+```
+
+## `upload_dataset_to_hf.py`
+
+`upload_dataset_to_hf.py` 用来把 `main/data/` 下的本地数据集目录上传到 Hugging Face 的 `dataset` 仓库。
+
+它会：
+
+1. 解析本地数据集路径，支持 `zeno-ai/xxx`、`data/xxx`、`main/data/xxx` 和绝对路径
+2. 自动创建 Hugging Face dataset repo（已存在时复用）
+3. 默认使用 `upload_folder()` 单次提交上传
+4. 对超大目录可切换到 `upload_large_folder()`，支持断点续传式重试
+5. 在真正上传前打印一份解析后的上传计划，方便确认目标路径和 repo id
+
+### 常见用法
+
+上传 `main/data/zeno-ai/CleanTableTopDelayedToolChoice` 到同名 dataset repo：
+
+```bash
+python data/upload_dataset_to_hf.py zeno-ai/CleanTableTopDelayedToolChoice
+```
+
+显式指定目标 repo：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  zeno-ai/CleanTableTopDelayedToolChoice \
+  --repo-id zeno-ai/CleanTableTopDelayedToolChoice
+```
+
+先只查看解析结果，不真正上传：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  zeno-ai/CleanTableTopDelayedToolChoice \
+  --dry-run
+```
+
+只上传部分文件：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  zeno-ai/CleanTableTopDelayedToolChoice \
+  --include "meta/*" "data/**/*" \
+  --exclude "*.mp4"
+```
+
+上传到远端仓库的子目录：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  zeno-ai/CleanTableTopDelayedToolChoice \
+  --repo-id zeno-ai/clean-tabletop-staging \
+  --path-in-repo runs/2026-04-17
+```
+
+对超大目录使用可恢复的大目录上传：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  zeno-ai/CleanTableTopDelayedToolChoice \
+  --repo-id zeno-ai/clean-tabletop-staging \
+  --large-folder \
+  --num-workers 16
+```
+
+### repo id 推断规则
+
+- 如果本地路径形如 `main/data/<name>`，默认 repo id 会取 `<name>`。
+- 如果本地路径形如 `main/data/<namespace>/<name>`，默认 repo id 会取 `<namespace>/<name>`。
+- 如果本地路径比这更深，例如 `main/data/robocasa/composite/ArrangeBreadBasket`，请显式传 `--repo-id`，避免远端命名和本地层级不一致。
+
+### 常用参数
+
+- `--repo-id`：显式指定 Hugging Face dataset repo id。
+- `--private` / `--public`：设置新建仓库的可见性；仓库已存在时不会改动原设置。
+- `--revision`：上传到指定分支、tag 或 revision，默认 `main`。
+- `--path-in-repo`：把本地目录上传到远端仓库的某个子目录。
+- `--include`：只上传匹配这些 glob 的文件。
+- `--exclude`：跳过匹配这些 glob 的文件。
+- `--token`：显式传 Hugging Face token；不传时走本地登录态或 `HF_TOKEN`。
+- `--large-folder`：改用 `upload_large_folder()`，适合超大目录。
+- `--num-workers`：大目录上传时的 worker 数。
+- `--dry-run`：只打印解析后的上传计划，不真正创建 repo / 上传。
+
+### 注意事项
+
+- `--large-folder` 不支持 `--path-in-repo`、`--commit-message`、`--commit-description`，因为底层 API 本身就有限制。
+- 大目录上传会拆成多个 commit；普通上传则默认是单次 commit。
+- 脚本默认 repo 类型固定为 Hugging Face `dataset`。
+
+### 查看帮助
+
+```bash
+python data/upload_dataset_to_hf.py --help
 ```
