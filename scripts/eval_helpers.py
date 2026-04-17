@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def compute_delta_signature_sequence_np(signatures: np.ndarray) -> np.ndarray:
@@ -69,22 +70,11 @@ def resolve_single_visual_observation_feature(cfg) -> tuple[str, tuple[int, ...]
 
 
 def _resolve_path_candidates(raw: Path) -> list[Path]:
-    repo_root = Path(__file__).resolve().parents[2]
     candidates = []
     if raw.is_absolute():
         candidates.append(raw)
     else:
-        candidates.extend([Path.cwd() / raw, repo_root / raw, repo_root / "main" / raw])
-
-    for candidate in list(candidates):
-        candidate_str = str(candidate)
-        repo_root_str = str(repo_root)
-        if candidate_str.startswith(f"{repo_root_str}/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/outputs/") :]
-            candidates.append(repo_root / "main" / "outputs" / suffix)
-        if candidate_str.startswith(f"{repo_root_str}/main/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/main/outputs/") :]
-            candidates.append(repo_root / "outputs" / suffix)
+        candidates.extend([Path.cwd() / raw, PROJECT_ROOT / raw])
 
     ordered = []
     seen = set()
@@ -127,9 +117,11 @@ def _ensure_local_streaming_act_modules(
     repo_root = (
         repo_root.resolve(strict=False)
         if repo_root is not None
-        else Path(__file__).resolve().parents[2]
+        else PROJECT_ROOT
     )
-    streaming_act_src = repo_root / "main" / "policy" / "lerobot_policy_streaming_act" / "src"
+    streaming_act_src = (
+        repo_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    )
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"

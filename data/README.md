@@ -1,6 +1,6 @@
 # 数据目录说明
 
-`main/data/` 里现在主要维护五个工具：
+`data/` 里现在主要维护五个工具：
 
 - `convert_legacy_dataset_to_v30.py`：把 legacy 的 LeRobot v2.1 数据集转换成 v3.0 数据集，并带进度条展示转换过程。
 - `convert_rosbag_to_lerobot.py`：通过 YAML 配置把 ROS bag 转成 LeRobot v3.0 数据集，适合像 hanger 这样需要自定义图像 key 映射和 state/action 拼接规则的数据。
@@ -161,7 +161,7 @@ python data/convert_rosbag_to_lerobot.py \
 
 - 数据集绝对路径
 - 相对当前工作目录的路径
-- 相对 `main/data/` 的数据集 id，比如 `robocasa/composite/ArrangeBreadBasket`
+- 相对 `data/` 的数据集 id，比如 `robocasa/composite/ArrangeBreadBasket`
 
 也可以不用位置参数，改传 `--dataset ...`。
 
@@ -194,7 +194,7 @@ python data/convert_rosbag_to_lerobot.py \
 
 ### 常见用法
 
-对 `main/data/robocasa/composite/ArrangeBreadBasket` 原地生成 signature cache：
+对 `data/robocasa/composite/ArrangeBreadBasket` 原地生成 signature cache：
 
 ```bash
 python data/process_dataset.py robocasa/composite/ArrangeBreadBasket
@@ -327,11 +327,11 @@ bash data/hfd.sh --help
 
 ## `upload_dataset_to_hf.py`
 
-`upload_dataset_to_hf.py` 用来把 `main/data/` 下的本地数据集目录上传到 Hugging Face 的 `dataset` 仓库。
+`upload_dataset_to_hf.py` 用来把 `data/` 下的本地数据集目录上传到 Hugging Face 的 `dataset` 仓库。
 
 它会：
 
-1. 解析本地数据集路径，支持 `zeno-ai/xxx`、`data/xxx`、`main/data/xxx` 和绝对路径
+1. 解析本地数据集路径，支持 `zeno-ai/xxx`、`data/xxx` 和绝对路径
 2. 自动创建 Hugging Face dataset repo（已存在时复用）
 3. 默认使用 `upload_folder()` 单次提交上传
 4. 对超大目录可切换到 `upload_large_folder()`，支持断点续传式重试
@@ -339,7 +339,7 @@ bash data/hfd.sh --help
 
 ### 常见用法
 
-上传 `main/data/zeno-ai/CleanTableTopDelayedToolChoice` 到同名 dataset repo：
+上传 `data/zeno-ai/CleanTableTopDelayedToolChoice` 到同名 dataset repo：
 
 ```bash
 python data/upload_dataset_to_hf.py zeno-ai/CleanTableTopDelayedToolChoice
@@ -391,9 +391,9 @@ python data/upload_dataset_to_hf.py \
 
 ### repo id 推断规则
 
-- 如果本地路径形如 `main/data/<name>`，默认 repo id 会取 `<name>`。
-- 如果本地路径形如 `main/data/<namespace>/<name>`，默认 repo id 会取 `<namespace>/<name>`。
-- 如果本地路径比这更深，例如 `main/data/robocasa/composite/ArrangeBreadBasket`，请显式传 `--repo-id`，避免远端命名和本地层级不一致。
+- 如果本地路径形如 `data/<name>`，默认 repo id 会取 `<name>`。
+- 如果本地路径形如 `data/<namespace>/<name>`，默认 repo id 会取 `<namespace>/<name>`。
+- 如果本地路径比这更深，例如 `data/robocasa/composite/ArrangeBreadBasket`，请显式传 `--repo-id`，避免远端命名和本地层级不一致。
 
 ### 常用参数
 

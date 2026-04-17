@@ -44,7 +44,6 @@ def test_resolve_local_upload_path_supports_main_data_relative_paths(tmp_path: P
     resolved = MODULE.resolve_local_upload_path(
         "zeno-ai/demo_dataset",
         cwd=repo_root,
-        repo_root=repo_root,
         main_root=main_root,
         data_root=data_root,
     )
@@ -52,16 +51,15 @@ def test_resolve_local_upload_path_supports_main_data_relative_paths(tmp_path: P
     assert resolved == dataset_root.resolve()
 
 
-def test_resolve_local_upload_path_supports_main_data_prefix(tmp_path: Path) -> None:
+def test_resolve_local_upload_path_supports_data_prefix(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     main_root = repo_root / "main"
     data_root = main_root / "data"
     dataset_root = _make_fake_dataset_root(data_root / "zeno-ai" / "demo_dataset")
 
     resolved = MODULE.resolve_local_upload_path(
-        "main/data/zeno-ai/demo_dataset",
+        "data/zeno-ai/demo_dataset",
         cwd=repo_root,
-        repo_root=repo_root,
         main_root=main_root,
         data_root=data_root,
     )
@@ -78,7 +76,6 @@ def test_resolve_local_upload_path_promotes_meta_info_to_dataset_root(tmp_path: 
     resolved = MODULE.resolve_local_upload_path(
         str(dataset_root / "meta" / "info.json"),
         cwd=repo_root,
-        repo_root=repo_root,
         main_root=main_root,
         data_root=data_root,
     )

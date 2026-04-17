@@ -14,7 +14,6 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAIN_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = MAIN_ROOT.parent
 SCRIPTS_ROOT = MAIN_ROOT / "scripts"
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
@@ -59,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Convert a legacy LeRobot v2.1 dataset into a v3.0 dataset under "
-            "`main/data/`, with tqdm-based progress visualization."
+            "`data/`, with tqdm-based progress visualization."
         )
     )
     parser.add_argument(
@@ -67,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         nargs="?",
         help=(
-            "Legacy dataset root path, a path inside `main/data/`, or a dataset id "
-            "relative to `main/data/`."
+            "Legacy dataset root path, a path inside `data/`, or a dataset id "
+            "relative to `data/`."
         ),
     )
     parser.add_argument(
@@ -84,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Output dataset directory. Defaults to a sibling directory named "
-            "`<dataset_name>_v30` under `main/data/`."
+            "`<dataset_name>_v30` under `data/`."
         ),
     )
     parser.add_argument(
@@ -147,8 +146,6 @@ def resolve_output_dir(source_root: Path, output_dir: str | None) -> Path:
         return raw.resolve()
 
     output_text = raw.as_posix()
-    if output_text.startswith("main/data/"):
-        return (REPO_ROOT / raw).resolve()
     if output_text.startswith("data/"):
         return (MAIN_ROOT / raw).resolve()
     return (MAIN_ROOT / "data" / raw).resolve()

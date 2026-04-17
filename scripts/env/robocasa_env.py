@@ -421,11 +421,7 @@ def _iter_exact_dataset_root_candidates(
         candidates.append(raw_path)
 
     if not raw_path.is_absolute():
-        if normalized_dataset_text.startswith("main/data/"):
-            candidates.append(
-                local_data_root / normalized_dataset_text[len("main/data/") :]
-            )
-        elif normalized_dataset_text.startswith("data/"):
+        if normalized_dataset_text.startswith("data/"):
             candidates.append(
                 local_data_root / normalized_dataset_text[len("data/") :]
             )

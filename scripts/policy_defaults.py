@@ -6,10 +6,9 @@ from typing import Any
 import yaml
 
 
-DEFAULTS_ROOT = Path(__file__).resolve().parents[1] / "bash" / "defaults"
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MAIN_ROOT = REPO_ROOT / "main"
-DATA_ROOT = MAIN_ROOT / "data"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULTS_ROOT = PROJECT_ROOT / "bash" / "defaults"
+DATA_ROOT = PROJECT_ROOT / "data"
 
 
 def defaults_file_path(env_name: str, policy_name: str) -> Path:
@@ -52,18 +51,13 @@ def _normalize_dataset_selector_candidates(dataset_selector: str) -> list[str]:
     if len(raw_path.parts) >= 2:
         add("_".join(raw_path.parts[-2:]))
 
-    if raw.startswith("main/data/"):
-        stripped = raw[len("main/data/") :]
-        add(stripped)
-        add(stripped.replace("/", "_"))
-        add(Path(stripped).name)
     if raw.startswith("data/"):
         stripped = raw[len("data/") :]
         add(stripped)
         add(stripped.replace("/", "_"))
         add(Path(stripped).name)
 
-    for root in (DATA_ROOT, MAIN_ROOT, REPO_ROOT):
+    for root in (DATA_ROOT, PROJECT_ROOT):
         try:
             relative = raw_path.resolve(strict=False).relative_to(root.resolve())
         except Exception:

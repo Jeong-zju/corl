@@ -49,6 +49,7 @@ from policy_defaults import (
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +78,10 @@ def format_elapsed_s(elapsed_s: float) -> str:
     return f"{elapsed_s:.1f}s"
 
 
-def ensure_streaming_act_importable(repo_root: Path) -> None:
-    streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
+def ensure_streaming_act_importable(project_root: Path) -> None:
+    streaming_act_src = (
+        project_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    )
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
@@ -86,8 +89,10 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def ensure_prism_diffusion_importable(repo_root: Path) -> None:
-    prism_diffusion_src = repo_root / "main/policy/lerobot_policy_prism_diffusion/src"
+def ensure_prism_diffusion_importable(project_root: Path) -> None:
+    prism_diffusion_src = (
+        project_root / "policy" / "lerobot_policy_prism_diffusion" / "src"
+    )
     if not prism_diffusion_src.exists():
         raise FileNotFoundError(
             f"PRISM Diffusion package source not found: {prism_diffusion_src}"
@@ -287,8 +292,8 @@ def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def ensure_writable_hf_cache_env(repo_root: Path) -> None:
-    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+def ensure_writable_hf_cache_env(project_root: Path) -> None:
+    cache_root = (project_root / ".cache" / "huggingface").resolve()
     hf_home = cache_root / "home"
     hf_datasets_cache = cache_root / "datasets"
     xdg_cache_home = cache_root / "xdg"
@@ -317,13 +322,10 @@ def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
         return None
     if raw.startswith("./"):
         raw = raw[2:]
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/main/data/"
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
 
     parts = [
         normalize_output_path_part(part)
@@ -339,8 +341,7 @@ def default_train_output_root(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "train"
+    base = PROJECT_ROOT / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
@@ -351,8 +352,7 @@ def default_eval_output_dir(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "eval"
+    base = PROJECT_ROOT / "outputs" / "eval"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return str(
@@ -1406,13 +1406,12 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
-    repo_root = Path(__file__).resolve().parents[2]
-    ensure_writable_hf_cache_env(repo_root)
+    ensure_writable_hf_cache_env(PROJECT_ROOT)
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
+        ensure_streaming_act_importable(PROJECT_ROOT)
     elif args.policy == "prism_diffusion":
-        ensure_prism_diffusion_importable(repo_root)
-        ensure_streaming_act_importable(repo_root)
+        ensure_prism_diffusion_importable(PROJECT_ROOT)
+        ensure_streaming_act_importable(PROJECT_ROOT)
 
     try:
         from lerobot.configs.policies import PreTrainedConfig
@@ -1425,7 +1424,7 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
 
     if args.policy == "streaming_act":
-        policy_cls = import_local_streaming_act_policy_class(repo_root=repo_root)
+        policy_cls = import_local_streaming_act_policy_class(repo_root=PROJECT_ROOT)
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
             PrismDiffusionConfig,
@@ -1461,7 +1460,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.policy == "streaming_act":
         cfg = load_streaming_act_config_from_pretrained_dir(
             policy_dir,
-            repo_root=repo_root,
+            repo_root=PROJECT_ROOT,
         )
     else:
         cfg = PreTrainedConfig.from_pretrained(

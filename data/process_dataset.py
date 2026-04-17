@@ -102,8 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         nargs="?",
         help=(
-            "Dataset root path, a path inside `main/data/`, or a dataset id relative "
-            "to `main/data/`."
+            "Dataset root path, a path inside `data/`, or a dataset id relative "
+            "to `data/`."
         ),
     )
     parser.add_argument(
@@ -112,8 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Dataset root path, a path inside `main/data/`, or a dataset id relative "
-            "to `main/data/`. This is an alias for the positional dataset argument."
+            "Dataset root path, a path inside `data/`, or a dataset id relative "
+            "to `data/`. This is an alias for the positional dataset argument."
         ),
     )
     parser.add_argument(
@@ -263,13 +263,10 @@ def resolve_output_dir(output_dir: str | None) -> Path | None:
 
     raw = Path(output_dir).expanduser()
     main_root = Path(__file__).resolve().parents[1]
-    repo_root = main_root.parent
     if raw.is_absolute():
         return raw.resolve()
 
     text = raw.as_posix()
-    if text.startswith("main/data/"):
-        return (repo_root / raw).resolve()
     if text.startswith("data/"):
         return (main_root / raw).resolve()
     return (main_root / "data" / raw).resolve()

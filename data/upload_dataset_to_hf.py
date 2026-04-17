@@ -9,7 +9,6 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAIN_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = MAIN_ROOT.parent
 DATA_ROOT = MAIN_ROOT / "data"
 
 
@@ -17,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Upload a local dataset directory to a Hugging Face dataset repository. "
-            "Relative dataset paths are resolved from `main/data/`."
+            "Relative dataset paths are resolved from `data/`."
         )
     )
     parser.add_argument(
@@ -25,8 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         nargs="?",
         help=(
-            "Local dataset directory, a path under `main/data/`, or a path using "
-            "`main/data/...` or `data/...` prefixes."
+            "Local dataset directory, a path under `data/`, or a path using "
+            "`data/...` prefixes."
         ),
     )
     parser.add_argument(
@@ -42,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Target Hugging Face dataset repo id. If omitted, the script tries to "
-            "infer it from a `main/data/<namespace>/<name>` path."
+            "infer it from a `data/<namespace>/<name>` path."
         ),
     )
     visibility = parser.add_mutually_exclusive_group()
@@ -170,7 +169,6 @@ def build_candidate_paths(
     dataset: str,
     *,
     cwd: Path | None = None,
-    repo_root: Path = REPO_ROOT,
     main_root: Path = MAIN_ROOT,
     data_root: Path = DATA_ROOT,
 ) -> list[Path]:
@@ -183,8 +181,6 @@ def build_candidate_paths(
     candidates: list[Path] = []
     if raw.exists() or normalized.startswith("."):
         candidates.append(working_directory / raw)
-    if normalized.startswith("main/data/"):
-        candidates.append(repo_root / raw)
     if normalized.startswith("data/"):
         candidates.append(main_root / raw)
     candidates.extend(
@@ -210,7 +206,6 @@ def resolve_local_upload_path(
     dataset: str,
     *,
     cwd: Path | None = None,
-    repo_root: Path = REPO_ROOT,
     main_root: Path = MAIN_ROOT,
     data_root: Path = DATA_ROOT,
 ) -> Path:
@@ -219,7 +214,6 @@ def resolve_local_upload_path(
     for candidate in build_candidate_paths(
         dataset,
         cwd=cwd,
-        repo_root=repo_root,
         main_root=main_root,
         data_root=data_root,
     ):
@@ -249,7 +243,7 @@ def resolve_local_upload_path(
         if len(matches) > 1:
             candidate_text = "\n".join(f"- {path}" for path in matches)
             raise FileNotFoundError(
-                "The dataset argument matched multiple local paths under `main/data/`. "
+                "The dataset argument matched multiple local paths under `data/`. "
                 "Please pass a more specific path or `--repo-id` explicitly.\n"
                 f"{candidate_text}"
             )
@@ -331,7 +325,7 @@ def resolve_repo_id(
     raise ValueError(
         "Could not infer a Hugging Face repo id from the local path. "
         "Pass `--repo-id` explicitly. Automatic inference only works for paths "
-        "under `main/data/<name>` or `main/data/<namespace>/<name>`."
+        "under `data/<name>` or `data/<namespace>/<name>`."
     )
 
 

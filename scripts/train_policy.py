@@ -50,6 +50,7 @@ PRETRAINED_MODEL_DIRNAME = "pretrained_model"
 TRAIN_CONFIG_FILENAME = "train_config.json"
 TRAINING_STATE_DIRNAME = "training_state"
 TRAINING_STEP_FILENAME = "training_step.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,11 +158,7 @@ def _iter_exact_dataset_root_candidates(
         candidates.append(raw_path)
 
     if not raw_path.is_absolute():
-        if normalized_dataset_text.startswith("main/data/"):
-            candidates.append(
-                local_data_root / normalized_dataset_text[len("main/data/") :]
-            )
-        elif normalized_dataset_text.startswith("data/"):
+        if normalized_dataset_text.startswith("data/"):
             candidates.append(
                 local_data_root / normalized_dataset_text[len("data/") :]
             )
@@ -402,8 +399,10 @@ def get_signature_cache_only_feature_keys(info: dict | None) -> set[str]:
     return keys
 
 
-def ensure_streaming_act_importable(repo_root: Path) -> None:
-    streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
+def ensure_streaming_act_importable(project_root: Path) -> None:
+    streaming_act_src = (
+        project_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    )
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
@@ -411,8 +410,10 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def ensure_prism_diffusion_importable(repo_root: Path) -> None:
-    prism_diffusion_src = repo_root / "main/policy/lerobot_policy_prism_diffusion/src"
+def ensure_prism_diffusion_importable(project_root: Path) -> None:
+    prism_diffusion_src = (
+        project_root / "policy" / "lerobot_policy_prism_diffusion" / "src"
+    )
     if not prism_diffusion_src.exists():
         raise FileNotFoundError(
             f"PRISM Diffusion package source not found: {prism_diffusion_src}"
@@ -432,8 +433,8 @@ def teardown_wandb_safely(exit_code: int) -> None:
         print(f"[WARN] wandb teardown failed during shutdown: {exc}")
 
 
-def ensure_writable_hf_cache_env(repo_root: Path) -> None:
-    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+def ensure_writable_hf_cache_env(project_root: Path) -> None:
+    cache_root = (project_root / ".cache" / "huggingface").resolve()
     hf_home = cache_root / "home"
     hf_datasets_cache = cache_root / "datasets"
     xdg_cache_home = cache_root / "xdg"
@@ -1663,14 +1664,7 @@ def parquet_has_columns(dataset_root: Path, required_keys: list[str]) -> bool:
 
 
 def default_train_output_root(policy_name: str) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return (
-        repo_root
-        / "main"
-        / "outputs"
-        / "train"
-        / default_policy_series_name(policy_name)
-    )
+    return PROJECT_ROOT / "outputs" / "train" / default_policy_series_name(policy_name)
 
 
 def default_policy_series_name(policy_name: str) -> str:
@@ -1692,13 +1686,10 @@ def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
         return None
     if raw.startswith("./"):
         raw = raw[2:]
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/main/data/"
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
 
     parts = [
         normalize_output_path_part(part)
@@ -1715,8 +1706,7 @@ def resolve_default_train_output_root(
     policy_name: str,
     dataset_selector: str | None,
 ) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "train"
+    base = PROJECT_ROOT / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
@@ -1724,23 +1714,12 @@ def resolve_default_train_output_root(
 
 
 def _resolve_train_output_root_candidates(raw: Path) -> list[Path]:
-    repo_root = Path(__file__).resolve().parents[2]
     candidates: list[Path] = []
 
     if raw.is_absolute():
         candidates.append(raw)
     else:
-        candidates.extend([Path.cwd() / raw, repo_root / raw, repo_root / "main" / raw])
-
-    for candidate in list(candidates):
-        candidate_str = str(candidate)
-        repo_root_str = str(repo_root)
-        if candidate_str.startswith(f"{repo_root_str}/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/outputs/") :]
-            candidates.append(repo_root / "main" / "outputs" / suffix)
-        if candidate_str.startswith(f"{repo_root_str}/main/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/main/outputs/") :]
-            candidates.append(repo_root / "outputs" / suffix)
+        candidates.extend([Path.cwd() / raw, PROJECT_ROOT / raw])
 
     ordered: list[Path] = []
     seen: set[Path] = set()
@@ -1973,11 +1952,11 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         required=True,
         default=known_args.dataset,
         help=(
-            "Dataset ID or path under main/data. This value is also used to resolve "
+            "Dataset ID or path under data. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
             "Examples: zeno-ai/day3_5_Exp1_processed, "
             "robocasa/composite/ArrangeBreadBasket, "
-            "./main/data/zeno-ai/day3_5_Exp1."
+            "./data/zeno-ai/day3_5_Exp1."
         ),
     )
     parser.add_argument(
@@ -2967,13 +2946,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    repo_root = Path(__file__).resolve().parents[2]
-    ensure_writable_hf_cache_env(repo_root)
+    ensure_writable_hf_cache_env(PROJECT_ROOT)
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
+        ensure_streaming_act_importable(PROJECT_ROOT)
     elif args.policy == "prism_diffusion":
-        ensure_prism_diffusion_importable(repo_root)
-        ensure_streaming_act_importable(repo_root)
+        ensure_prism_diffusion_importable(PROJECT_ROOT)
+        ensure_streaming_act_importable(PROJECT_ROOT)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
