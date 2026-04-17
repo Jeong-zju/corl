@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,8 @@ import pyarrow.parquet as pq
 import torch
 
 _CACHE_LAYOUT_VERSION = 1
+_CACHE_BUILD_LOCK_STALE_TIMEOUT_S = 6 * 60 * 60
+_CACHE_BUILD_LOCK_POLL_INTERVAL_S = 1.0
 
 
 def _maybe_create_tqdm(*, total: int, desc: str, unit: str):
@@ -80,6 +85,51 @@ def _build_dataset_manifest(dataset_root: Path) -> dict[str, Any]:
             for path in data_files
         ],
     }
+
+
+@contextmanager
+def _cache_build_lock(lock_path: Path, *, label: str):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    warned_waiting = False
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                lock_age_s = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if lock_age_s > _CACHE_BUILD_LOCK_STALE_TIMEOUT_S:
+                try:
+                    lock_path.unlink()
+                    print(
+                        "[WARN] "
+                        f"{label}: removed stale cache lock {lock_path} "
+                        f"(age={lock_age_s:.0f}s)"
+                    )
+                    continue
+                except FileNotFoundError:
+                    continue
+
+            if not warned_waiting:
+                print(f"[INFO] {label}: waiting for cache lock {lock_path}")
+                warned_waiting = True
+            time.sleep(_CACHE_BUILD_LOCK_POLL_INTERVAL_S)
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "created_at": dt.datetime.utcnow().isoformat() + "Z"}))
+        break
+
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _default_cache_root(dataset_root: Path, dataset_repo_id: str) -> Path:
@@ -475,6 +525,7 @@ def prepare_prefix_image_cache_runtime() -> PrefixImageCacheReader | None:
         dataset_repo_id=runtime.dataset_repo_id,
         cache_root=runtime.cache_root,
     )
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
     metadata = None if runtime.refresh else _load_cache_metadata(cache_dir)
 
     if metadata is not None and _metadata_matches_runtime(
@@ -501,7 +552,34 @@ def prepare_prefix_image_cache_runtime() -> PrefixImageCacheReader | None:
         runtime.camera_specs = camera_specs
         return runtime.reader
 
-    runtime.reader = _build_prefix_image_cache(runtime)
-    runtime.status = "ready"
-    runtime.camera_specs = camera_specs
-    return runtime.reader
+    lock_path = cache_dir / ".build.lock"
+    with _cache_build_lock(lock_path, label="prefix_image_cache"):
+        metadata = None if runtime.refresh else _load_cache_metadata(cache_dir)
+        if metadata is not None and _metadata_matches_runtime(
+            metadata,
+            runtime=runtime,
+            manifest=manifest,
+            camera_specs=camera_specs,
+        ):
+            runtime.reader = _open_prefix_image_cache_reader(
+                cache_dir,
+                metadata,
+                mode=runtime.mode,
+            )
+            print(
+                "[INFO] prefix_image_cache: hit "
+                f"(mode={runtime.mode}, dtype={runtime.cache_dtype}, path={cache_dir})"
+            )
+            if runtime.mode == "ram":
+                print(
+                    "[INFO] prefix_image_cache: preloaded RAM "
+                    f"({runtime.reader.estimated_bytes / (1024 ** 3):.2f} GiB)"
+                )
+            runtime.status = "ready"
+            runtime.camera_specs = camera_specs
+            return runtime.reader
+
+        runtime.reader = _build_prefix_image_cache(runtime)
+        runtime.status = "ready"
+        runtime.camera_specs = camera_specs
+        return runtime.reader

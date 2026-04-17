@@ -9,6 +9,15 @@ train:
   device: "cuda"
   use_amp: true
   amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 200000
   batch_size: 16
   num_workers: 8

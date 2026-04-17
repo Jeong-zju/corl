@@ -539,6 +539,50 @@ def resolve_accelerator_mixed_precision(
     return "no"
 
 
+def _read_distributed_env_int(
+    *env_names: str,
+    default: int,
+) -> int:
+    for env_name in env_names:
+        raw_value = os.environ.get(env_name)
+        if raw_value is None or not str(raw_value).strip():
+            continue
+        try:
+            return int(raw_value)
+        except ValueError:
+            print(
+                f"[WARN] Ignoring invalid distributed env var {env_name}={raw_value!r}."
+            )
+    return int(default)
+
+
+def resolve_distributed_world_size_from_env() -> int:
+    return max(1, _read_distributed_env_int("WORLD_SIZE", default=1))
+
+
+def resolve_distributed_process_index_from_env() -> int:
+    return max(
+        0,
+        _read_distributed_env_int(
+            "RANK",
+            "ACCELERATE_PROCESS_INDEX",
+            default=0,
+        ),
+    )
+
+
+def is_distributed_main_process_from_env() -> bool:
+    return resolve_distributed_process_index_from_env() == 0
+
+
+def resolve_train_run_stamp(now: dt.datetime | None = None) -> str:
+    shared_run_stamp = os.environ.get("CORL_TRAIN_RUN_STAMP")
+    if shared_run_stamp:
+        return str(shared_run_stamp)
+    moment = dt.datetime.now() if now is None else now
+    return moment.strftime("%Y%m%d_%H%M%S")
+
+
 def install_torch_dataloader_patch(
     *,
     persistent_workers: bool,
@@ -3505,7 +3549,8 @@ def main(argv: list[str] | None = None) -> None:
         if resume_scheduler_cfg is None:
             resume_scheduler_cfg = policy_cfg.get_scheduler_preset()
 
-    run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    distributed_world_size = resolve_distributed_world_size_from_env()
+    run_stamp = resolve_train_run_stamp()
     output_dir = (
         resume_run_state.run_dir.resolve()
         if resume_run_state is not None
@@ -3804,6 +3849,17 @@ def main(argv: list[str] | None = None) -> None:
         cpu=force_cpu,
         mixed_precision=resolved_mixed_precision,
     )
+    accelerator_world_size = max(
+        int(getattr(accelerator, "num_processes", distributed_world_size)),
+        1,
+    )
+    if accelerator.is_main_process:
+        print(
+            "- distributed: "
+            f"world_size={accelerator_world_size}, "
+            f"per_device_batch_size={int(args.batch_size)}, "
+            f"global_batch_size={int(args.batch_size) * accelerator_world_size}"
+        )
 
     resume_config_arg = None
     if resume_run_state is not None and not any(
@@ -3814,8 +3870,11 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         train(cfg, accelerator=accelerator)
-        saved_split_path = save_dataset_split(output_dir, split_spec)
-        print(f"Saved dataset split: {saved_split_path}")
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            saved_split_path = save_dataset_split(output_dir, split_spec)
+            print(f"Saved dataset split: {saved_split_path}")
+        accelerator.wait_for_everyone()
     except KeyboardInterrupt:
         print("\n[WARN] Training interrupted by user. Cleaning up wandb before exit.")
         teardown_wandb_safely(exit_code=130)

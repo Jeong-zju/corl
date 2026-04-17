@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,8 @@ PATH_SIGNATURE_KEY = "observation.path_signature"
 DELTA_SIGNATURE_KEY = "observation.delta_signature"
 SIGNATURE_FEATURE_KEYS = (PATH_SIGNATURE_KEY, DELTA_SIGNATURE_KEY)
 _CACHE_LAYOUT_VERSION = 1
+_CACHE_BUILD_LOCK_STALE_TIMEOUT_S = 6 * 60 * 60
+_CACHE_BUILD_LOCK_POLL_INTERVAL_S = 1.0
 
 
 def _sanitize_path_part(value: str) -> str:
@@ -136,6 +141,51 @@ def _build_dataset_manifest(dataset_root: Path) -> dict[str, Any]:
             for path in data_files
         ],
     }
+
+
+@contextmanager
+def _cache_build_lock(lock_path: Path, *, label: str):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    warned_waiting = False
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                lock_age_s = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if lock_age_s > _CACHE_BUILD_LOCK_STALE_TIMEOUT_S:
+                try:
+                    lock_path.unlink()
+                    print(
+                        "[WARN] "
+                        f"{label}: removed stale cache lock {lock_path} "
+                        f"(age={lock_age_s:.0f}s)"
+                    )
+                    continue
+                except FileNotFoundError:
+                    continue
+
+            if not warned_waiting:
+                print(f"[INFO] {label}: waiting for cache lock {lock_path}")
+                warned_waiting = True
+            time.sleep(_CACHE_BUILD_LOCK_POLL_INTERVAL_S)
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "created_at": dt.datetime.utcnow().isoformat() + "Z"}))
+        break
+
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _default_cache_root(dataset_root: Path, dataset_repo_id: str) -> Path:
@@ -415,99 +465,126 @@ def _prepare_signature_cache(runtime: SignatureCacheRuntimeConfig) -> SignatureC
             )
         return reader
 
-    print(
-        "[INFO] signature_cache: build "
-        f"(mode={runtime.mode}, dtype={runtime.cache_dtype}, path={cache_dir})"
-    )
-    build_start = dt.datetime.now()
-    info = _json_load(runtime.dataset_root / "meta/info.json")
-    stats_json = _json_load(runtime.dataset_root / "meta/stats.json")
-
-    files: dict[str, str] = {}
-    arrays: dict[str, np.memmap] = {}
-    total_bytes = 0
-
-    for key in runtime.feature_keys:
-        feature_spec = info.get("features", {}).get(key)
-        if feature_spec is None:
-            raise KeyError(f"Dataset feature `{key}` was not found in meta/info.json.")
-        shape = tuple(int(dim) for dim in feature_spec.get("shape", ()))
-        if len(shape) != 1 or shape[0] <= 0:
-            raise ValueError(f"Dataset feature `{key}` must have shape [signature_dim]. Got {shape}.")
-        filename = f"{_sanitize_path_part(key)}.{runtime.cache_dtype}.npy"
-        files[key] = filename
-        array_path = cache_dir / filename
-        arrays[key] = np.lib.format.open_memmap(
-            array_path,
-            mode="w+",
-            dtype=np.dtype(runtime.cache_dtype),
-            shape=(manifest["total_frames"], shape[0]),
-        )
-        total_bytes += int(arrays[key].size * arrays[key].dtype.itemsize)
-
-    seen = np.zeros(manifest["total_frames"], dtype=bool)
-    data_files = [runtime.dataset_root / entry["path"] for entry in manifest["data_files"]]
-    for parquet_path in data_files:
-        table = pq.read_table(parquet_path, columns=["index", *runtime.feature_keys])
-        absolute_indices = np.asarray(table.column("index").to_pylist(), dtype=np.int64)
-        if absolute_indices.size == 0:
-            continue
-        seen[absolute_indices] = True
-        for key in runtime.feature_keys:
-            feature_dim = arrays[key].shape[1]
-            raw = _fixed_size_list_column_to_numpy(table.column(key), feature_dim)
-            normalized = normalize_signature_array(
-                raw,
-                stats=stats_json[key],
-                normalization_mode=runtime.normalization_mode,
-                eps=runtime.eps,
+    lock_path = cache_dir / ".build.lock"
+    with _cache_build_lock(lock_path, label="signature_cache"):
+        metadata = None if runtime.refresh else _load_cache_metadata(cache_dir)
+        if metadata is not None and _metadata_matches_runtime(
+            metadata,
+            runtime=runtime,
+            manifest=manifest,
+        ):
+            reader = _open_signature_cache_reader(
+                cache_dir,
+                metadata,
+                mode=runtime.mode,
+                feature_keys=runtime.feature_keys,
             )
-            arrays[key][absolute_indices] = normalized.astype(runtime.cache_dtype, copy=False)
+            print(
+                "[INFO] signature_cache: hit "
+                f"(mode={runtime.mode}, dtype={runtime.cache_dtype}, path={cache_dir})"
+            )
+            if runtime.mode == "ram":
+                print(
+                    "[INFO] signature_cache: preloaded shared RAM "
+                    f"({reader.estimated_bytes / (1024 ** 2):.1f} MiB)"
+                )
+            return reader
 
-    if not bool(np.all(seen)):
-        missing = int((~seen).sum())
-        raise RuntimeError(
-            "Signature cache build detected missing absolute frame indices. "
-            f"missing={missing}"
-        )
-
-    for array in arrays.values():
-        array.flush()
-
-    metadata = {
-        "layout_version": _CACHE_LAYOUT_VERSION,
-        "dataset_root": str(runtime.dataset_root),
-        "dataset_repo_id": runtime.dataset_repo_id,
-        "feature_keys": list(runtime.feature_keys),
-        "feature_shapes": {key: list(arrays[key].shape[1:]) for key in runtime.feature_keys},
-        "cache_dtype": runtime.cache_dtype,
-        "pre_normalized": True,
-        "normalization_mode": _normalize_mode_name(runtime.normalization_mode),
-        "eps": float(runtime.eps),
-        "files": files,
-        "estimated_bytes": total_bytes,
-        "built_at": build_start.isoformat(),
-        "dataset_manifest": manifest,
-    }
-    (cache_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    reader = _open_signature_cache_reader(
-        cache_dir,
-        metadata,
-        mode=runtime.mode,
-        feature_keys=runtime.feature_keys,
-    )
-    elapsed = dt.datetime.now() - build_start
-    print(
-        "[INFO] signature_cache: ready "
-        f"(elapsed={elapsed.total_seconds():.1f}s, size={total_bytes / (1024 ** 2):.1f} MiB)"
-    )
-    if runtime.mode == "ram":
         print(
-            "[INFO] signature_cache: preloaded shared RAM "
-            f"({reader.estimated_bytes / (1024 ** 2):.1f} MiB)"
+            "[INFO] signature_cache: build "
+            f"(mode={runtime.mode}, dtype={runtime.cache_dtype}, path={cache_dir})"
         )
-    return reader
+        build_start = dt.datetime.now()
+        info = _json_load(runtime.dataset_root / "meta/info.json")
+        stats_json = _json_load(runtime.dataset_root / "meta/stats.json")
+
+        files: dict[str, str] = {}
+        arrays: dict[str, np.memmap] = {}
+        total_bytes = 0
+
+        for key in runtime.feature_keys:
+            feature_spec = info.get("features", {}).get(key)
+            if feature_spec is None:
+                raise KeyError(f"Dataset feature `{key}` was not found in meta/info.json.")
+            shape = tuple(int(dim) for dim in feature_spec.get("shape", ()))
+            if len(shape) != 1 or shape[0] <= 0:
+                raise ValueError(
+                    f"Dataset feature `{key}` must have shape [signature_dim]. Got {shape}."
+                )
+            filename = f"{_sanitize_path_part(key)}.{runtime.cache_dtype}.npy"
+            files[key] = filename
+            array_path = cache_dir / filename
+            arrays[key] = np.lib.format.open_memmap(
+                array_path,
+                mode="w+",
+                dtype=np.dtype(runtime.cache_dtype),
+                shape=(manifest["total_frames"], shape[0]),
+            )
+            total_bytes += int(arrays[key].size * arrays[key].dtype.itemsize)
+
+        seen = np.zeros(manifest["total_frames"], dtype=bool)
+        data_files = [runtime.dataset_root / entry["path"] for entry in manifest["data_files"]]
+        for parquet_path in data_files:
+            table = pq.read_table(parquet_path, columns=["index", *runtime.feature_keys])
+            absolute_indices = np.asarray(table.column("index").to_pylist(), dtype=np.int64)
+            if absolute_indices.size == 0:
+                continue
+            seen[absolute_indices] = True
+            for key in runtime.feature_keys:
+                feature_dim = arrays[key].shape[1]
+                raw = _fixed_size_list_column_to_numpy(table.column(key), feature_dim)
+                normalized = normalize_signature_array(
+                    raw,
+                    stats=stats_json[key],
+                    normalization_mode=runtime.normalization_mode,
+                    eps=runtime.eps,
+                )
+                arrays[key][absolute_indices] = normalized.astype(runtime.cache_dtype, copy=False)
+
+        if not bool(np.all(seen)):
+            missing = int((~seen).sum())
+            raise RuntimeError(
+                "Signature cache build detected missing absolute frame indices. "
+                f"missing={missing}"
+            )
+
+        for array in arrays.values():
+            array.flush()
+
+        metadata = {
+            "layout_version": _CACHE_LAYOUT_VERSION,
+            "dataset_root": str(runtime.dataset_root),
+            "dataset_repo_id": runtime.dataset_repo_id,
+            "feature_keys": list(runtime.feature_keys),
+            "feature_shapes": {key: list(arrays[key].shape[1:]) for key in runtime.feature_keys},
+            "cache_dtype": runtime.cache_dtype,
+            "pre_normalized": True,
+            "normalization_mode": _normalize_mode_name(runtime.normalization_mode),
+            "eps": float(runtime.eps),
+            "files": files,
+            "estimated_bytes": total_bytes,
+            "built_at": build_start.isoformat(),
+            "dataset_manifest": manifest,
+        }
+        (cache_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        reader = _open_signature_cache_reader(
+            cache_dir,
+            metadata,
+            mode=runtime.mode,
+            feature_keys=runtime.feature_keys,
+        )
+        elapsed = dt.datetime.now() - build_start
+        print(
+            "[INFO] signature_cache: ready "
+            f"(elapsed={elapsed.total_seconds():.1f}s, size={total_bytes / (1024 ** 2):.1f} MiB)"
+        )
+        if runtime.mode == "ram":
+            print(
+                "[INFO] signature_cache: preloaded shared RAM "
+                f"({reader.estimated_bytes / (1024 ** 2):.1f} MiB)"
+            )
+        return reader

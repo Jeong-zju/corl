@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
 from policy_defaults import load_policy_mode_defaults_for_dataset
-from train_policy import parse_args, resolve_resume_run_state
+from train_policy import parse_args, resolve_resume_run_state, resolve_train_run_stamp
 
 
 def _make_resumable_checkpoint(checkpoint_dir: Path, *, step: int) -> Path:
@@ -95,6 +96,16 @@ def test_parse_args_supports_resume_flag_and_defaults_expose_resume() -> None:
     assert defaults_path is not None
     assert "resume" in defaults
     assert defaults["resume"] is False
+    assert defaults["distributed"] == {
+        "enabled": False,
+        "launcher": "accelerate",
+        "num_processes": 1,
+        "gpu_ids": "all",
+        "num_machines": 1,
+        "machine_rank": 0,
+        "main_process_ip": None,
+        "main_process_port": None,
+    }
 
     args = parse_args(
         [
@@ -107,3 +118,16 @@ def test_parse_args_supports_resume_flag_and_defaults_expose_resume() -> None:
     )
 
     assert args.resume is True
+
+
+def test_resolve_train_run_stamp_prefers_shared_env(monkeypatch) -> None:
+    monkeypatch.setenv("CORL_TRAIN_RUN_STAMP", "20260417_123456")
+    assert resolve_train_run_stamp() == "20260417_123456"
+
+
+def test_resolve_train_run_stamp_falls_back_to_now(monkeypatch) -> None:
+    monkeypatch.delenv("CORL_TRAIN_RUN_STAMP", raising=False)
+    assert (
+        resolve_train_run_stamp(now=dt.datetime(2026, 4, 17, 12, 34, 56))
+        == "20260417_123456"
+    )
