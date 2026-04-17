@@ -30,6 +30,7 @@ from eval_helpers import (
     ensure_prefix_sequence_batch_dims,
     import_local_streaming_act_policy_class,
     load_streaming_act_config_from_pretrained_dir,
+    resolve_code_root,
     resolve_eval_policy_path,
     resolve_signature_backend,
     write_summary,
@@ -65,7 +66,8 @@ def format_elapsed_s(elapsed_s: float) -> str:
 
 
 def ensure_streaming_act_importable(repo_root: Path) -> None:
-    streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
+    code_root = resolve_code_root(repo_root)
+    streaming_act_src = code_root / "policy" / "lerobot_policy_streaming_act" / "src"
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
@@ -140,7 +142,8 @@ def normalize_output_path_part(value: str) -> str:
 
 
 def ensure_writable_hf_cache_env(repo_root: Path) -> None:
-    cache_root = (repo_root / "main" / ".cache" / "huggingface").resolve()
+    code_root = resolve_code_root(repo_root)
+    cache_root = (code_root / ".cache" / "huggingface").resolve()
     hf_home = cache_root / "home"
     hf_datasets_cache = cache_root / "datasets"
     xdg_cache_home = cache_root / "xdg"
@@ -169,11 +172,11 @@ def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
         return None
     if raw.startswith("./"):
         raw = raw[2:]
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/main/data/"
+    marker = "/data/"
     if marker in raw:
         raw = raw.split(marker, 1)[1]
 
@@ -191,8 +194,8 @@ def default_train_output_root(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "train"
+    code_root = resolve_code_root()
+    base = code_root / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
@@ -203,8 +206,8 @@ def default_eval_output_dir(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "eval"
+    code_root = resolve_code_root()
+    base = code_root / "outputs" / "eval"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return str(
@@ -278,7 +281,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=str,
         default=known_args.dataset,
         help=(
-            "Dataset ID or path under main/data. This value is also used to resolve "
+            "Dataset ID or path under data/. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
             "If omitted in dataset mode, reuse the dataset recorded in the nearest "
             "dataset_split.json next to the training run."
@@ -1259,7 +1262,7 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = resolve_code_root()
     ensure_writable_hf_cache_env(repo_root)
     if args.policy == "streaming_act":
         ensure_streaming_act_importable(repo_root)

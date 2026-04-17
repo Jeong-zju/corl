@@ -14,6 +14,45 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 
+def _iter_repo_root_candidates(preferred_root: Path | None = None) -> list[Path]:
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        ordered.append(resolved)
+
+    if preferred_root is not None:
+        resolved_root = preferred_root.resolve(strict=False)
+        add(resolved_root)
+        for parent in resolved_root.parents:
+            add(parent)
+
+    script_path = Path(__file__).resolve()
+    for parent in script_path.parents:
+        add(parent)
+
+    return ordered
+
+
+def resolve_code_root(preferred_root: Path | None = None) -> Path:
+    probed: list[Path] = []
+    for base in _iter_repo_root_candidates(preferred_root):
+        if (base / "scripts").is_dir() and (base / "policy").is_dir():
+            return base
+        probed.append(base)
+
+    probe_lines = "\n".join(f"- {path}" for path in probed)
+    raise FileNotFoundError(
+        "Could not resolve the code root. Expected an ancestor containing both "
+        "`scripts/` and `policy/`. Checked:\n"
+        f"{probe_lines}"
+    )
+
+
 def compute_delta_signature_sequence_np(signatures: np.ndarray) -> np.ndarray:
     signatures_array = np.asarray(signatures, dtype=np.float32)
     if signatures_array.ndim != 2:
@@ -69,22 +108,13 @@ def resolve_single_visual_observation_feature(cfg) -> tuple[str, tuple[int, ...]
 
 
 def _resolve_path_candidates(raw: Path) -> list[Path]:
-    repo_root = Path(__file__).resolve().parents[2]
+    code_root = resolve_code_root()
     candidates = []
     if raw.is_absolute():
         candidates.append(raw)
     else:
-        candidates.extend([Path.cwd() / raw, repo_root / raw, repo_root / "main" / raw])
-
-    for candidate in list(candidates):
-        candidate_str = str(candidate)
-        repo_root_str = str(repo_root)
-        if candidate_str.startswith(f"{repo_root_str}/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/outputs/") :]
-            candidates.append(repo_root / "main" / "outputs" / suffix)
-        if candidate_str.startswith(f"{repo_root_str}/main/outputs/"):
-            suffix = candidate_str[len(f"{repo_root_str}/main/outputs/") :]
-            candidates.append(repo_root / "outputs" / suffix)
+        candidates.append(Path.cwd() / raw)
+        candidates.append(code_root / raw)
 
     ordered = []
     seen = set()
@@ -124,12 +154,8 @@ def resolve_policy_dir(policy_path: Path) -> Path:
 def _ensure_local_streaming_act_modules(
     repo_root: Path | None = None,
 ):
-    repo_root = (
-        repo_root.resolve(strict=False)
-        if repo_root is not None
-        else Path(__file__).resolve().parents[2]
-    )
-    streaming_act_src = repo_root / "main" / "policy" / "lerobot_policy_streaming_act" / "src"
+    code_root = resolve_code_root(repo_root)
+    streaming_act_src = code_root / "policy" / "lerobot_policy_streaming_act" / "src"
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
