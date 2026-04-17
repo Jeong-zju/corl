@@ -1,9 +1,9 @@
 train:
   dataset_root: "data/zeno-ai/CleanTableTopDelayedToolChoice"
   dataset_repo_id: "zeno-ai/CleanTableTopDelayedToolChoice"
-  output_root: "outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-sipm"
+  output_root: "outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism"
   resume: false
-  job_name: "streaming-act-sipm"
+  job_name: "streaming-act-prism"
   wandb_project: "CleanTableTopDelayedToolChoice"
   wandb_mode: "online"
   device: "cuda"
@@ -11,7 +11,7 @@ train:
   amp_dtype: "auto"
   steps: 200000
   batch_size: 32
-  num_workers: 24
+  num_workers: 12
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   video_backend: "torchcodec"
@@ -31,6 +31,22 @@ train:
   wandb_service_wait: 10
   use_path_signature: true
   use_delta_signature: true
+  use_prefix_sequence_training: true
+  prefix_train_max_steps: 16
+  prefix_frame_stride: 5
+  prefix_pad_value: 0.0
+  use_visual_prefix_memory: true
+  use_signature_conditioned_visual_prefix_memory: false
+  use_signature_indexed_slot_memory: true
+  use_memory_conditioned_encoder_film: true
+  num_memory_slots: 1
+  slot_memory_num_slots: 4
+  slot_memory_routing_hidden_dim: 512
+  slot_memory_use_delta_routing: true
+  slot_memory_use_softmax_routing: true
+  slot_memory_use_readout_pooling: true
+  slot_memory_balance_loss_coef: 0.0
+  slot_memory_consistency_loss_coef: 0.0
   history_length: 0
   signature_dim: 0
   signature_depth: 3
@@ -38,10 +54,13 @@ train:
   signature_dropout: 0.1
   signature_cache_mode: "ram"
   signature_cache_dtype: "float16"
+  prefix_image_cache_mode: "off"
+  prefix_image_cache_dtype: "uint8"
 
 eval:
-  train_output_root: "outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-sipm"
-  output_dir: "outputs/eval/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-sipm/{run_tag}"
+  train_output_root: "outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism"
+  output_dir: "outputs/eval/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-\
+    prism/{run_tag}"
   eval_split: "test"
   test_ratio: 0
   split_seed: 42
