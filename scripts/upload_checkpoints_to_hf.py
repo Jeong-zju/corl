@@ -161,27 +161,50 @@ def list_run_dirs(train_output_root: Path) -> list[Path]:
     return run_dirs
 
 
-def resolve_latest_run_dir(train_output_root: Path) -> Path:
+def has_checkpoints_dir(run_dir: Path) -> bool:
+    return (run_dir / "checkpoints").is_dir()
+
+
+def resolve_latest_run_dir(
+    train_output_root: Path,
+    *,
+    require_checkpoints: bool,
+) -> Path:
     run_dirs = list_run_dirs(train_output_root)
     if not run_dirs:
         raise FileNotFoundError(
             f"No training run directories were found under: {train_output_root}"
         )
-    return run_dirs[0]
+    if not require_checkpoints:
+        return run_dirs[0]
+
+    for run_dir in run_dirs:
+        if has_checkpoints_dir(run_dir):
+            return run_dir
+
+    raise FileNotFoundError(
+        "No training run with a `checkpoints/` directory was found under "
+        f"{train_output_root}"
+    )
 
 
 def resolve_current_run_dir(args: argparse.Namespace) -> Path:
     if args.run_dir is not None:
         run_dir = resolve_path(args.run_dir)
+        if has_checkpoints_dir(run_dir) or args.watch:
+            return run_dir
     else:
-        run_dir = resolve_latest_run_dir(resolve_path(args.train_output_root))
+        run_dir = resolve_latest_run_dir(
+            resolve_path(args.train_output_root),
+            require_checkpoints=not args.watch,
+        )
+        if has_checkpoints_dir(run_dir) or args.watch:
+            return run_dir
 
     checkpoints_dir = run_dir / "checkpoints"
-    if not checkpoints_dir.is_dir():
-        raise FileNotFoundError(
-            f"Run directory does not contain `checkpoints/`: {run_dir}"
-        )
-    return run_dir
+    raise FileNotFoundError(
+        f"Run directory does not contain `checkpoints/`: {run_dir}"
+    )
 
 
 def resolve_state_file(run_dir: Path, raw_state_file: str | None) -> Path:
@@ -225,6 +248,8 @@ def checkpoint_is_ready(checkpoint_dir: Path, *, mode: str) -> bool:
 
 def list_ready_checkpoint_dirs(run_dir: Path, *, mode: str) -> list[Path]:
     checkpoints_dir = run_dir / "checkpoints"
+    if not checkpoints_dir.is_dir():
+        return []
     checkpoint_dirs = [
         path.resolve(strict=False)
         for path in checkpoints_dir.iterdir()
