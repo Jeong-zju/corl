@@ -71,6 +71,7 @@ class DeployRosNode:
         self.signature_runtime = OnlineSignatureRuntime(
             config.policy,
             loaded_policy_cfg=self.policy_runtime.cfg,
+            policy_dir=self.policy_runtime.policy_dir,
         )
         self.publishers = CommandPublishers(config)
         self.lock = threading.Lock()
@@ -323,6 +324,7 @@ class DeployRosNode:
                     if self.signature_runtime.history_length is None
                     else f"history={self.signature_runtime.history_length}"
                 )
+                + f", normalization={self.signature_runtime.normalization_summary}"
             )
         )
         self.rospy.loginfo(

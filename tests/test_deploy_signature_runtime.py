@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -93,6 +94,94 @@ def test_online_signature_runtime_uses_loaded_checkpoint_signature_settings() ->
     assert np.allclose(delta_t0, np.zeros_like(expected_t0))
     assert np.allclose(signature_t1, expected_t1)
     assert np.allclose(delta_t1, expected_t1 - expected_t0)
+
+
+def test_online_signature_runtime_normalizes_pre_normalized_signature_features(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "data" / "zeno-ai" / "CleanTableTopDelayedToolChoice"
+    stats_dir = dataset_root / "meta"
+    stats_dir.mkdir(parents=True)
+
+    state_t0 = np.asarray([1.0, 2.0], dtype=np.float32)
+    state_t1 = np.asarray([3.0, 5.0], dtype=np.float32)
+    raw_signature_t0 = compute_simple_signature_np(
+        np.repeat(state_t0[None, :], 3, axis=0),
+        2,
+    )
+    raw_signature_t1 = compute_simple_signature_np(
+        np.asarray(
+            [
+                state_t0,
+                state_t0,
+                state_t1,
+            ],
+            dtype=np.float32,
+        ),
+        2,
+    )
+    raw_delta_t0 = np.zeros_like(raw_signature_t0)
+    raw_delta_t1 = raw_signature_t1 - raw_signature_t0
+
+    path_mean = np.full_like(raw_signature_t0, 1.5, dtype=np.float32)
+    path_std = np.full_like(raw_signature_t0, 0.5, dtype=np.float32)
+    delta_mean = np.full_like(raw_signature_t0, -0.25, dtype=np.float32)
+    delta_std = np.full_like(raw_signature_t0, 2.0, dtype=np.float32)
+    stats_payload = {
+        "observation.path_signature": {
+            "mean": path_mean.tolist(),
+            "std": path_std.tolist(),
+        },
+        "observation.delta_signature": {
+            "mean": delta_mean.tolist(),
+            "std": delta_std.tolist(),
+        },
+    }
+    (stats_dir / "stats.json").write_text(json.dumps(stats_payload), encoding="utf-8")
+
+    run_root = tmp_path / "outputs" / "train" / "streaming-act-prism" / "20260418_010000"
+    policy_dir = run_root / "checkpoints" / "last" / "pretrained_model"
+    policy_dir.mkdir(parents=True)
+    (run_root / "dataset_split.json").write_text(
+        json.dumps(
+            {
+                "dataset_root": str(dataset_root),
+                "dataset_repo_id": "zeno-ai/CleanTableTopDelayedToolChoice",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = OnlineSignatureRuntime(
+        _make_policy_config(signature_backend="simple"),
+        loaded_policy_cfg=SimpleNamespace(
+            use_path_signature=True,
+            use_delta_signature=True,
+            history_length=3,
+            signature_depth=2,
+            signature_dim=None,
+            pre_normalized_observation_keys=(
+                "observation.path_signature",
+                "observation.delta_signature",
+            ),
+            normalization_mapping={"STATE": "MEAN_STD"},
+        ),
+        policy_dir=policy_dir,
+    )
+
+    signature_t0, delta_t0 = runtime.update(state_t0)
+    signature_t1, delta_t1 = runtime.update(state_t1)
+
+    expected_signature_t0 = (raw_signature_t0 - path_mean) / path_std
+    expected_signature_t1 = (raw_signature_t1 - path_mean) / path_std
+    expected_delta_t0 = (raw_delta_t0 - delta_mean) / delta_std
+    expected_delta_t1 = (raw_delta_t1 - delta_mean) / delta_std
+
+    assert runtime.normalization_summary.startswith("enabled(")
+    assert np.allclose(signature_t0, expected_signature_t0)
+    assert np.allclose(signature_t1, expected_signature_t1)
+    assert np.allclose(delta_t0, expected_delta_t0)
+    assert np.allclose(delta_t1, expected_delta_t1)
 
 
 def test_resolve_policy_dir_accepts_train_output_root_and_finds_latest_run(

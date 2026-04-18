@@ -776,6 +776,15 @@ def as_tensor_copy(value):
     return torch.as_tensor(value)
 
 
+def get_optional_dataset_item_value(item, key: str):
+    if key not in item:
+        return None
+    value = item[key]
+    if value is None:
+        return None
+    return value
+
+
 def tensor_to_numpy_vector(value) -> np.ndarray:
     import torch
 
@@ -810,6 +819,64 @@ def compute_online_signature_prefix(
     if signature_backend == "signatory":
         return compute_signatory_signature_np(window, sig_depth)
     return compute_simple_signature_np(window, sig_depth)
+
+
+def resolve_dataset_signature_inputs(
+    *,
+    item,
+    state_value,
+    state_history: deque[np.ndarray],
+    sig_depth: int,
+    signature_backend: str,
+    use_delta_signature: bool,
+    previous_signature_vec: np.ndarray | None,
+):
+    import torch
+
+    state_history.append(tensor_to_numpy_vector(state_value))
+
+    cached_path_signature = get_optional_dataset_item_value(
+        item, DEFAULT_PATH_SIGNATURE_KEY
+    )
+    used_cached_path_signature = cached_path_signature is not None
+    if used_cached_path_signature:
+        path_signature_tensor = as_tensor_copy(cached_path_signature)
+        signature_vec = tensor_to_numpy_vector(cached_path_signature)
+    else:
+        signature_vec = compute_online_signature_prefix(
+            state_history=state_history,
+            sig_depth=sig_depth,
+            signature_backend=signature_backend,
+        )
+        path_signature_tensor = torch.from_numpy(
+            signature_vec.astype(np.float32, copy=False)
+        )
+
+    delta_signature_tensor = None
+    used_cached_delta_signature = False
+    if use_delta_signature:
+        cached_delta_signature = get_optional_dataset_item_value(
+            item, DEFAULT_DELTA_SIGNATURE_KEY
+        )
+        used_cached_delta_signature = cached_delta_signature is not None
+        if used_cached_delta_signature:
+            delta_signature_tensor = as_tensor_copy(cached_delta_signature)
+        else:
+            delta_signature_vec = compute_delta_signature_step_np(
+                signature_vec,
+                previous_signature_vec,
+            )
+            delta_signature_tensor = torch.from_numpy(
+                delta_signature_vec.astype(np.float32, copy=False)
+            )
+
+    return (
+        path_signature_tensor,
+        signature_vec,
+        delta_signature_tensor,
+        used_cached_path_signature,
+        used_cached_delta_signature,
+    )
 
 
 def resolve_dataset_selection(
@@ -1084,6 +1151,8 @@ def run_dataset_evaluation(
         f"episodes={len(episode_groups)}, planned_steps={total_planned_steps}"
     )
     textual_progress_step = max(1, total_planned_steps // 20) if total_planned_steps > 0 else 1
+    warned_null_path_signature = False
+    warned_null_delta_signature = False
 
     for episode_pos, ((episode_index, rel_indices), planned_episode_steps) in enumerate(
         zip(episode_groups, planned_steps_per_episode),
@@ -1145,21 +1214,35 @@ def run_dataset_evaluation(
             signature_vec: np.ndarray | None = None
             if use_path_signature:
                 assert state_history is not None
-                state_history.append(tensor_to_numpy_vector(item[state_key]))
-                if DEFAULT_PATH_SIGNATURE_KEY in item:
-                    obs[DEFAULT_PATH_SIGNATURE_KEY] = as_tensor_copy(
-                        item[DEFAULT_PATH_SIGNATURE_KEY]
+                path_signature_value_present = DEFAULT_PATH_SIGNATURE_KEY in item
+                delta_signature_value_present = DEFAULT_DELTA_SIGNATURE_KEY in item
+                (
+                    path_signature_tensor,
+                    signature_vec,
+                    delta_signature_tensor,
+                    used_cached_path_signature,
+                    used_cached_delta_signature,
+                ) = resolve_dataset_signature_inputs(
+                    item=item,
+                    state_value=item[state_key],
+                    state_history=state_history,
+                    sig_depth=int(cfg.signature_depth),
+                    signature_backend=str(signature_backend),
+                    use_delta_signature=use_delta_signature,
+                    previous_signature_vec=previous_signature_vec,
+                )
+                obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature_tensor
+                if (
+                    path_signature_value_present
+                    and not used_cached_path_signature
+                    and not warned_null_path_signature
+                ):
+                    progress_write(
+                        step_progress,
+                        "[info] dataset path-signature values contain nulls; "
+                        "falling back to online computation for missing steps",
                     )
-                    signature_vec = tensor_to_numpy_vector(item[DEFAULT_PATH_SIGNATURE_KEY])
-                else:
-                    signature_vec = compute_online_signature_prefix(
-                        state_history=state_history,
-                        sig_depth=int(cfg.signature_depth),
-                        signature_backend=str(signature_backend),
-                    )
-                    obs[DEFAULT_PATH_SIGNATURE_KEY] = torch.from_numpy(
-                        signature_vec.astype(np.float32, copy=False)
-                    )
+                    warned_null_path_signature = True
                 if signature_vec.shape[0] != int(cfg.signature_dim):
                     raise RuntimeError(
                         "Signature dimension mismatch during offline evaluation: "
@@ -1167,18 +1250,19 @@ def run_dataset_evaluation(
                     )
 
                 if use_delta_signature:
-                    if DEFAULT_DELTA_SIGNATURE_KEY in item:
-                        obs[DEFAULT_DELTA_SIGNATURE_KEY] = as_tensor_copy(
-                            item[DEFAULT_DELTA_SIGNATURE_KEY]
+                    assert delta_signature_tensor is not None
+                    obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature_tensor
+                    if (
+                        delta_signature_value_present
+                        and not used_cached_delta_signature
+                        and not warned_null_delta_signature
+                    ):
+                        progress_write(
+                            step_progress,
+                            "[info] dataset delta-signature values contain nulls; "
+                            "falling back to online computation for missing steps",
                         )
-                    else:
-                        delta_signature_vec = compute_delta_signature_step_np(
-                            signature_vec,
-                            previous_signature_vec,
-                        )
-                        obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
-                            delta_signature_vec.astype(np.float32, copy=False)
-                        )
+                        warned_null_delta_signature = True
                     previous_signature_vec = signature_vec.astype(np.float32, copy=True)
 
             if build_explicit_prefix_eval_inputs:
