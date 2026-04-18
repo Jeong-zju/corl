@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -76,6 +78,131 @@ def progress_write(progress, message: str) -> None:
 
 def format_elapsed_s(elapsed_s: float) -> str:
     return f"{elapsed_s:.1f}s"
+
+
+def build_per_episode_metric_series(
+    per_episode_metrics: list[dict[str, object]],
+    *,
+    metric_key: str,
+) -> list[dict[str, object]]:
+    series: list[dict[str, object]] = []
+    for episode_metrics in per_episode_metrics:
+        metric_values = episode_metrics.get(metric_key, [])
+        if not isinstance(metric_values, list) or not metric_values:
+            continue
+        episode_index = episode_metrics.get("episode_index")
+        episode_values = np.asarray(
+            [float(value) for value in metric_values],
+            dtype=np.float32,
+        )
+        series.append(
+            {
+                "episode_index": None if episode_index is None else int(episode_index),
+                "step_index": np.arange(episode_values.shape[0], dtype=np.int32),
+                "values": episode_values,
+            }
+        )
+    return series
+
+
+def write_per_frame_metrics_json(
+    output_dir: Path,
+    per_episode_metrics: list[dict[str, object]],
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "per_frame_metrics.json"
+    payload = {"episodes": per_episode_metrics}
+    metrics_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return metrics_path
+
+
+def _load_matplotlib_pyplot():
+    fallback_dir = Path(tempfile.gettempdir()) / "matplotlib-corl"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(fallback_dir))
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    return plt
+
+
+def maybe_write_per_frame_mae_plot(
+    output_dir: Path,
+    per_episode_metrics: list[dict[str, object]],
+) -> Path | None:
+    plt = _load_matplotlib_pyplot()
+    if plt is None:
+        return None
+
+    series = build_per_episode_metric_series(
+        per_episode_metrics,
+        metric_key="frame_mae",
+    )
+    if not series:
+        return None
+
+    fig, ax = plt.subplots(figsize=(14, 7.2), layout="constrained")
+    cmap = plt.get_cmap("tab20", max(len(series), 1))
+    all_values: list[np.ndarray] = []
+    for idx, episode_series in enumerate(series):
+        episode_index = episode_series["episode_index"]
+        step_index = episode_series["step_index"]
+        values = episode_series["values"]
+        all_values.append(values)
+        ax.plot(
+            step_index,
+            values,
+            color=cmap(idx),
+            linewidth=1.2,
+            alpha=0.85,
+            label=(
+                f"episode={episode_index}"
+                if episode_index is not None
+                else f"episode_{idx}"
+            ),
+        )
+
+    all_mae_values = np.concatenate(all_values, axis=0)
+    overall_mean = float(all_mae_values.mean())
+    ax.axhline(
+        overall_mean,
+        color="#2ca02c",
+        linestyle="--",
+        linewidth=1.0,
+        alpha=0.8,
+        label=f"Overall mean = {overall_mean:.4f}",
+    )
+
+    max_steps = max(
+        int(episode_series["step_index"][-1]) + 1
+        for episode_series in series
+        if len(episode_series["step_index"]) > 0
+    )
+    ax.set_xlim(left=0, right=max(1, max_steps - 1))
+    ax.set_title("Dataset Eval Per-Episode Frame MAE")
+    ax.set_xlabel("Step index within episode")
+    ax.set_ylabel("MAE")
+    ax.grid(True, alpha=0.2, linewidth=0.5)
+    legend_columns = 1 if len(series) <= 10 else 2 if len(series) <= 20 else 3
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        ncol=legend_columns,
+        fontsize=8,
+    )
+
+    plot_path = output_dir / "per_frame_mae.png"
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
 
 
 def ensure_streaming_act_importable(project_root: Path) -> None:
@@ -1130,6 +1257,7 @@ def run_dataset_evaluation(
     total_cosine_count = 0
     total_steps = 0
     results: list[dict[str, object]] = []
+    per_frame_metrics: list[dict[str, object]] = []
     planned_steps_per_episode: list[int] = []
     for _, rel_indices in episode_groups:
         planned_steps = len(rel_indices)
@@ -1180,6 +1308,9 @@ def run_dataset_evaluation(
         episode_l2_error = 0.0
         episode_cosine = 0.0
         episode_cosine_count = 0
+        episode_frame_mae: list[float] = []
+        episode_frame_rmse: list[float] = []
+        episode_frame_l2_error: list[float] = []
 
         evaluated_steps = planned_episode_steps
 
@@ -1350,6 +1481,8 @@ def run_dataset_evaluation(
             abs_error = np.abs(error).astype(np.float32, copy=False)
             sq_error = np.square(error).astype(np.float32, copy=False)
             l2_error = float(np.linalg.norm(error))
+            frame_mae = float(abs_error.mean())
+            frame_rmse = float(np.sqrt(sq_error.mean()))
 
             pred_norm = float(np.linalg.norm(predicted_np))
             gt_norm = float(np.linalg.norm(ground_truth_np))
@@ -1391,6 +1524,9 @@ def run_dataset_evaluation(
             if cosine is not None:
                 episode_cosine += cosine
                 episode_cosine_count += 1
+            episode_frame_mae.append(frame_mae)
+            episode_frame_rmse.append(frame_rmse)
+            episode_frame_l2_error.append(l2_error)
 
         assert action_dim is not None
         assert episode_abs_error is not None
@@ -1417,6 +1553,15 @@ def run_dataset_evaluation(
         if memory_debug_stats is not None:
             result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
+        per_frame_metrics.append(
+            {
+                "episode_index": int(episode_index),
+                "steps": int(evaluated_steps),
+                "frame_mae": episode_frame_mae,
+                "frame_rmse": episode_frame_rmse,
+                "frame_l2_error": episode_frame_l2_error,
+            }
+        )
         cosine_text = (
             "n/a"
             if result["cosine_similarity"] is None
@@ -1447,6 +1592,11 @@ def run_dataset_evaluation(
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    per_frame_metrics_path = write_per_frame_metrics_json(output_dir, per_frame_metrics)
+    per_frame_mae_plot_path = maybe_write_per_frame_mae_plot(
+        output_dir,
+        per_frame_metrics,
+    )
     summary = {
         "policy_type": args.policy,
         "policy_dir": str(policy_dir),
@@ -1470,6 +1620,12 @@ def run_dataset_evaluation(
             "per_dim_rmse": np.sqrt(total_sq_error / total_steps).tolist(),
         },
         "results": results,
+        "artifacts": {
+            "per_frame_metrics_json": str(per_frame_metrics_path),
+            "per_frame_mae_plot": (
+                None if per_frame_mae_plot_path is None else str(per_frame_mae_plot_path)
+            ),
+        },
     }
     if use_visual_prefix_memory:
         memory_debug_stats = get_visual_memory_debug_stats(policy)
@@ -1478,6 +1634,11 @@ def run_dataset_evaluation(
     summary_path = write_summary(output_dir, summary)
 
     print(f"\nSummary: {summary_path}")
+    print(f"Per-frame metrics: {per_frame_metrics_path}")
+    if per_frame_mae_plot_path is not None:
+        print(f"Per-frame MAE plot: {per_frame_mae_plot_path}")
+    else:
+        print("[info] matplotlib unavailable; skipped per-frame MAE plot.")
     print(
         f"MAE: {summary['metrics']['mae']:.6f}, "
         f"RMSE: {summary['metrics']['rmse']:.6f}, "
