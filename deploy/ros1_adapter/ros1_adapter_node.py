@@ -66,9 +66,12 @@ class DeployRosNode:
         self.rospy = rospy
         self.config = config
         self.cache = SensorCache()
-        self.signature_runtime = OnlineSignatureRuntime(config.policy)
         self.policy_runtime = PolicyRuntime(config)
         self.policy_runtime.load()
+        self.signature_runtime = OnlineSignatureRuntime(
+            config.policy,
+            loaded_policy_cfg=self.policy_runtime.cfg,
+        )
         self.publishers = CommandPublishers(config)
         self.lock = threading.Lock()
         self.seq = 0
@@ -310,11 +313,24 @@ class DeployRosNode:
             self.seq += 1
 
     def spin(self) -> None:
+        signature_status = (
+            "disabled"
+            if not self.signature_runtime.enabled
+            else (
+                f"backend={self.signature_runtime.backend}, "
+                + (
+                    "history=full_prefix"
+                    if self.signature_runtime.history_length is None
+                    else f"history={self.signature_runtime.history_length}"
+                )
+            )
+        )
         self.rospy.loginfo(
-            "Deploy node started: policy=%s path=%s hz=%.2f",
+            "Deploy node started: policy=%s path=%s hz=%.2f signatures=%s",
             self.config.policy.type,
             self.config.policy.path,
             self.config.runtime.control_hz,
+            signature_status,
         )
         self.rospy.spin()
 

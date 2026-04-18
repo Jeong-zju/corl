@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from typing import Any
 
 import numpy as np
 
@@ -18,16 +19,43 @@ from eval_helpers import (  # noqa: E402
 
 
 class OnlineSignatureRuntime:
-    def __init__(self, policy_config: PolicyConfig) -> None:
+    def __init__(
+        self,
+        policy_config: PolicyConfig,
+        *,
+        loaded_policy_cfg: Any | None = None,
+    ) -> None:
         self._use_path = bool(
-            policy_config.type == "streaming_act" and policy_config.use_path_signature
+            getattr(loaded_policy_cfg, "use_path_signature", policy_config.use_path_signature)
         )
         self._use_delta = bool(
-            policy_config.type == "streaming_act" and policy_config.use_delta_signature
+            getattr(loaded_policy_cfg, "use_delta_signature", policy_config.use_delta_signature)
         )
-        self._signature_depth = int(policy_config.signature_depth)
-        self._signature_dim = policy_config.signature_dim
-        self._history: deque[np.ndarray] = deque()
+
+        raw_history_length = getattr(loaded_policy_cfg, "history_length", None)
+        if raw_history_length in {None, 0}:
+            self._history_length = None
+        else:
+            self._history_length = int(raw_history_length)
+
+        raw_signature_depth = getattr(
+            loaded_policy_cfg,
+            "signature_depth",
+            policy_config.signature_depth,
+        )
+        self._signature_depth = int(raw_signature_depth)
+
+        raw_signature_dim = getattr(
+            loaded_policy_cfg,
+            "signature_dim",
+            policy_config.signature_dim,
+        )
+        self._signature_dim = (
+            None if raw_signature_dim in {None, 0} else int(raw_signature_dim)
+        )
+
+        maxlen = self._history_length if self._history_length and self._history_length > 0 else None
+        self._history: deque[np.ndarray] = deque(maxlen=maxlen)
         self._previous_signature: np.ndarray | None = None
         self._backend = (
             resolve_signature_backend(policy_config.signature_backend)
@@ -43,6 +71,10 @@ class OnlineSignatureRuntime:
     def backend(self) -> str:
         return self._backend
 
+    @property
+    def history_length(self) -> int | None:
+        return self._history_length
+
     def reset(self) -> None:
         self._history.clear()
         self._previous_signature = None
@@ -53,14 +85,20 @@ class OnlineSignatureRuntime:
 
         state_vec = np.asarray(state, dtype=np.float32).reshape(-1)
         self._history.append(state_vec.astype(np.float32, copy=True))
+        window = np.stack(list(self._history), axis=0)
+        if self._history_length is not None and window.shape[0] < self._history_length:
+            pad_len = self._history_length - window.shape[0]
+            pad = np.repeat(window[:1], pad_len, axis=0)
+            window = np.concatenate([pad, window], axis=0)
+
         if self._backend == "signatory":
             signature = compute_signatory_signature_np(
-                np.stack(list(self._history), axis=0),
+                window,
                 self._signature_depth,
             )
         else:
             signature = compute_simple_signature_np(
-                np.stack(list(self._history), axis=0),
+                window,
                 self._signature_depth,
             )
 

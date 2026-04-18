@@ -130,15 +130,60 @@ def resolve_policy_dir(policy_path: Path) -> Path:
     raw = policy_path.expanduser()
     ordered = _resolve_path_candidates(raw)
 
+    def iter_weight_candidates(base: Path) -> list[Path]:
+        candidates = [
+            base,
+            base / "pretrained_model",
+            base / "checkpoints" / "last" / "pretrained_model",
+        ]
+        checkpoints_dir = base / "checkpoints"
+        if checkpoints_dir.is_dir():
+            checkpoint_dirs = sorted(
+                [path for path in checkpoints_dir.iterdir() if path.is_dir() and path.name != "last"],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for checkpoint_dir in checkpoint_dirs:
+                candidates.append(checkpoint_dir / "pretrained_model")
+                candidates.append(checkpoint_dir)
+
+        # Support deploy/eval configs that point to a train output root containing
+        # multiple timestamped run directories instead of one concrete checkpoint.
+        if not checkpoints_dir.is_dir() and not (base / "pretrained_model").is_dir():
+            latest_run_dir = find_latest_run_dir(base)
+            if latest_run_dir is not None and latest_run_dir != base:
+                candidates.extend(
+                    [
+                        latest_run_dir,
+                        latest_run_dir / "pretrained_model",
+                        latest_run_dir / "checkpoints" / "last" / "pretrained_model",
+                    ]
+                )
+                latest_run_checkpoints = latest_run_dir / "checkpoints"
+                if latest_run_checkpoints.is_dir():
+                    run_checkpoint_dirs = sorted(
+                        [
+                            path
+                            for path in latest_run_checkpoints.iterdir()
+                            if path.is_dir() and path.name != "last"
+                        ],
+                        key=lambda path: path.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for checkpoint_dir in run_checkpoint_dirs:
+                        candidates.append(checkpoint_dir / "pretrained_model")
+                        candidates.append(checkpoint_dir)
+        return candidates
+
     for base in ordered:
-        if (base / "model.safetensors").exists():
-            return base
-        nested = base / "pretrained_model"
-        if (nested / "model.safetensors").exists():
-            return nested
-        last_nested = base / "checkpoints" / "last" / "pretrained_model"
-        if (last_nested / "model.safetensors").exists():
-            return last_nested
+        seen: set[Path] = set()
+        for candidate in iter_weight_candidates(base):
+            resolved_candidate = candidate.resolve(strict=False)
+            if resolved_candidate in seen:
+                continue
+            seen.add(resolved_candidate)
+            if (resolved_candidate / "model.safetensors").exists():
+                return resolved_candidate
 
     probe_lines = "\n".join(f"- {path}" for path in ordered)
     raise FileNotFoundError(
@@ -147,7 +192,9 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         "Expected one of:\n"
         "- <base>/model.safetensors\n"
         "- <base>/pretrained_model/model.safetensors\n"
-        "- <base>/checkpoints/last/pretrained_model/model.safetensors"
+        "- <base>/checkpoints/last/pretrained_model/model.safetensors\n"
+        "- <base>/checkpoints/<step>/pretrained_model/model.safetensors\n"
+        "- <train_output_root>/<latest_run>/checkpoints/.../pretrained_model/model.safetensors"
     )
 
 
