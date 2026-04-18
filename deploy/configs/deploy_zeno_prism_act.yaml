@@ -1,6 +1,6 @@
 policy:
   type: streaming_act
-  path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism/20260417_190610/checkpoints/200000
+  path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-sipm/20260417_123454/checkpoints/150000
   device: cuda
   load_device: null
   n_action_steps: 50
