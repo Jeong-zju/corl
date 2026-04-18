@@ -63,6 +63,19 @@ def _normalize_values(
     raise ValueError(f"Unsupported signature normalization mode: {mode_name}.")
 
 
+def _clip_values_to_stats_support(
+    values: np.ndarray,
+    *,
+    stats: dict[str, np.ndarray],
+) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    min_value = stats.get("min")
+    max_value = stats.get("max")
+    if min_value is None or max_value is None:
+        return array
+    return np.clip(array, min_value, max_value)
+
+
 def _find_training_split_artifact(policy_dir: Path) -> Path | None:
     resolved = policy_dir.resolve(strict=False)
     for candidate in (resolved, *resolved.parents):
@@ -83,8 +96,9 @@ class SignatureNormalizationState:
         stats = self.feature_stats.get(feature_key)
         if stats is None:
             return np.asarray(values, dtype=np.float32)
+        clipped = _clip_values_to_stats_support(values, stats=stats)
         return _normalize_values(
-            values,
+            clipped,
             stats=stats,
             mode_name=self.mode_name,
             eps=self.eps,
@@ -94,7 +108,7 @@ class SignatureNormalizationState:
     def summary(self) -> str:
         enabled_keys = ",".join(sorted(self.feature_stats))
         return (
-            f"enabled(keys={enabled_keys}, mode={self.mode_name}, "
+            f"enabled(keys={enabled_keys}, mode={self.mode_name}, clip=minmax, "
             f"dataset_root={self.dataset_root})"
         )
 
