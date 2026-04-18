@@ -166,8 +166,9 @@ def _ensure_local_streaming_act_modules(
         sys.path.insert(0, streaming_act_src_str)
 
     for module_name, module in list(sys.modules.items()):
-        if module_name != "lerobot_policy_streaming_act" and not module_name.startswith(
-            "lerobot_policy_streaming_act."
+        if (
+            module_name != "lerobot_policy_streaming_act"
+            and not module_name.startswith("lerobot_policy_streaming_act.")
         ):
             continue
 
@@ -212,7 +213,9 @@ def _parse_config_with_class(
     dropped_fields: tuple[str, ...] = ()
     if drop_unknown_fields:
         valid_fields = {field.name for field in fields(config_cls)}
-        dropped_fields = tuple(sorted(key for key in raw_config if key not in valid_fields))
+        dropped_fields = tuple(
+            sorted(key for key in raw_config if key not in valid_fields)
+        )
         if dropped_fields:
             raw_config = {
                 key: value for key, value in raw_config.items() if key in valid_fields
@@ -368,7 +371,9 @@ def build_prefix_sequence_eval_inputs(
     else:
         resolved_image_keys = list(image_keys)
     if not resolved_image_keys:
-        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+        raise ValueError(
+            "At least one image key is required for prefix-sequence inputs."
+        )
 
     if prefix_image_histories is None:
         if prefix_image_history is None:
@@ -385,7 +390,9 @@ def build_prefix_sequence_eval_inputs(
     else:
         resolved_prefix_image_histories = prefix_image_histories
         missing_histories = [
-            key for key in resolved_image_keys if key not in resolved_prefix_image_histories
+            key
+            for key in resolved_image_keys
+            if key not in resolved_prefix_image_histories
         ]
         if missing_histories:
             raise KeyError(
@@ -441,14 +448,18 @@ def build_prefix_sequence_eval_inputs(
             pad_value=float(cfg.prefix_pad_value),
         )
         if not torch.equal(prefix_mask, prefix_signature_mask):
-            raise RuntimeError("Prefix state/signature masks diverged during online eval.")
+            raise RuntimeError(
+                "Prefix state/signature masks diverged during online eval."
+            )
     if delta_signature_key is not None:
         assert prefix_delta_signature_history is not None
-        prefix_delta_signature, prefix_delta_signature_mask = build_padded_prefix_from_history(
-            prefix_delta_signature_history,
-            prefix_train_max_steps=int(cfg.prefix_train_max_steps),
-            prefix_frame_stride=int(cfg.prefix_frame_stride),
-            pad_value=float(cfg.prefix_pad_value),
+        prefix_delta_signature, prefix_delta_signature_mask = (
+            build_padded_prefix_from_history(
+                prefix_delta_signature_history,
+                prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+                prefix_frame_stride=int(cfg.prefix_frame_stride),
+                pad_value=float(cfg.prefix_pad_value),
+            )
         )
         if not torch.equal(prefix_mask, prefix_delta_signature_mask):
             raise RuntimeError(
@@ -498,7 +509,9 @@ def ensure_prefix_sequence_batch_dims(
     else:
         resolved_image_keys = list(image_keys)
     if not resolved_image_keys:
-        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+        raise ValueError(
+            "At least one image key is required for prefix-sequence inputs."
+        )
 
     prefix_image_keys = [
         prefix_image_key_from_camera_key(current_image_key)

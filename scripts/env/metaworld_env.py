@@ -416,15 +416,18 @@ def _build_summary(
     per_group = eval_info.get("per_group", {})
     per_task = eval_info.get("per_task", [])
     video_paths = _flatten_video_paths(eval_info)
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = int(getattr(args, "eval_max_steps", args.max_steps))
+    eval_seed = int(getattr(args, "eval_seed", args.seed))
 
     return {
         "policy_type": args.policy,
         "policy_dir": str(policy_dir),
         "env": "metaworld",
         "task": task_spec,
-        "episodes_per_task": int(args.num_rollouts),
-        "max_steps": int(args.max_steps),
-        "seed": int(args.seed),
+        "episodes_per_task": eval_num_rollouts,
+        "max_steps": eval_max_steps,
+        "seed": eval_seed,
         "num_tasks": int(len(per_task) if isinstance(per_task, list) else 0),
         "num_episodes": int(overall.get("n_episodes", 0))
         if isinstance(overall, dict)
@@ -486,27 +489,39 @@ def evaluate_policy(
     from lerobot.envs.utils import close_envs
     from lerobot.scripts.lerobot_eval import eval_policy_all
 
-    if args.num_rollouts <= 0:
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = int(getattr(args, "eval_max_steps", args.max_steps))
+    eval_max_episodes_rendered = getattr(
+        args,
+        "eval_max_episodes_rendered",
+        args.max_episodes_rendered,
+    )
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = int(getattr(args, "eval_seed", args.seed))
+    task_spec = str(
+        getattr(args, "eval_task_spec", None) or args.task or DEFAULT_METAWORLD_TASKS
+    ).strip()
+
+    if eval_num_rollouts <= 0:
         raise ValueError("`--num-rollouts` must be positive for Meta-World eval.")
-    if args.max_steps <= 0:
+    if eval_max_steps <= 0:
         raise ValueError("`--max-steps` must be positive for Meta-World eval.")
-    if args.max_episodes_rendered is not None and args.max_episodes_rendered < 0:
+    if eval_max_episodes_rendered is not None and int(eval_max_episodes_rendered) < 0:
         raise ValueError("`--max-episodes-rendered` must be >= 0 when provided.")
 
     configure_headless_opengl_defaults()
     patch_lerobot_metaworld_env()
 
-    task_spec = str(args.task or DEFAULT_METAWORLD_TASKS).strip()
     max_episodes_rendered = (
-        int(args.max_episodes_rendered)
-        if args.max_episodes_rendered is not None
-        else int(args.num_rollouts)
+        int(eval_max_episodes_rendered)
+        if eval_max_episodes_rendered is not None
+        else int(eval_num_rollouts)
     )
 
     env_cfg = MetaworldEnvConfig(
         task=task_spec,
-        fps=int(args.fps),
-        episode_length=int(args.max_steps),
+        fps=eval_fps,
+        episode_length=eval_max_steps,
         obs_type="pixels_agent_pos",
         render_mode="rgb_array",
         max_parallel_tasks=1,
@@ -518,8 +533,8 @@ def evaluate_policy(
 
     print(
         "[load] Building Meta-World envs: "
-        f"task={task_spec}, episodes_per_task={args.num_rollouts}, "
-        f"max_steps={args.max_steps}, render_videos_per_task={max_episodes_rendered}"
+        f"task={task_spec}, episodes_per_task={eval_num_rollouts}, "
+        f"max_steps={eval_max_steps}, render_videos_per_task={max_episodes_rendered}"
     )
     envs = make_env(
         env_cfg,
@@ -527,7 +542,7 @@ def evaluate_policy(
         use_async_envs=False,
         trust_remote_code=False,
     )
-    _override_episode_length(envs, int(args.max_steps))
+    _override_episode_length(envs, eval_max_steps)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
         env_cfg=env_cfg,
         policy_cfg=cfg,
@@ -555,10 +570,10 @@ def evaluate_policy(
                 env_postprocessor=env_postprocessor,
                 preprocessor=wrapped_preprocessor,
                 postprocessor=postprocessor,
-                n_episodes=int(args.num_rollouts),
+                n_episodes=eval_num_rollouts,
                 max_episodes_rendered=max_episodes_rendered,
                 videos_dir=videos_dir,
-                start_seed=int(args.seed),
+                start_seed=eval_seed,
                 max_parallel_tasks=int(getattr(env_cfg, "max_parallel_tasks", 1)),
             )
     finally:

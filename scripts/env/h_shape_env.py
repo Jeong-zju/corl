@@ -20,6 +20,10 @@ from eval_helpers import (
     resolve_single_visual_observation_feature,
     write_summary,
 )
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    resolve_policy_capability_flags,
+)
 from policy_defaults import load_policy_mode_defaults
 
 
@@ -485,38 +489,31 @@ def evaluate_policy(
 ) -> None:
     import torch
 
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = int(getattr(args, "eval_max_steps", args.max_steps))
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = int(getattr(args, "eval_seed", args.seed))
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_key, image_shape = resolve_single_visual_observation_feature(cfg)
     image_hw = (int(image_shape[1]), int(image_shape[2]))
-    if bool(getattr(cfg, "use_first_frame_anchor", False)):
-        raise NotImplementedError(
-            "First-frame anchor evaluation is not implemented for `h_shape` yet. "
-            "Only `braidedhub` currently supports the shared-backbone raw-anchor path."
-        )
-
     if cfg.robot_state_feature is None:
         raise RuntimeError("Policy has no observation.state feature.")
     state_key = "observation.state"
     state_dim = int(cfg.robot_state_feature.shape[0])
 
-    use_path_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_path_signature", False)
-    )
-    use_prefix_sequence_training = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        policy_type == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_delta_signature = bool(
-        policy_type == "streaming_act" and getattr(cfg, "use_delta_signature", False)
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_delta_signature = capability_flags.use_delta_signature
+    use_signature_indexed_slot_memory = (
+        capability_flags.use_signature_indexed_slot_memory
     )
     build_explicit_prefix_eval_inputs = (
-        use_prefix_sequence_training and not use_visual_prefix_memory
+        capability_flags.build_explicit_prefix_eval_inputs
     )
     signature_key = DEFAULT_PATH_SIGNATURE_KEY
     signature_backend = None
@@ -548,19 +545,32 @@ def evaluate_policy(
             f"pad_value={cfg.prefix_pad_value}"
         )
     elif use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
         print(
             "[info] visual prefix memory online update enabled: "
-            "rollout uses fixed-size recurrent memory without rebuilding "
-            "explicit prefix-sequence tensors each step"
+            + (
+                "rollout uses signature-indexed slot memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+                if use_signature_indexed_slot_memory
+                else "rollout uses fixed-size recurrent memory without rebuilding "
+                "explicit prefix-sequence tensors each step"
+            )
         )
+        if initial_memory_debug is not None:
+            print(
+                "[info] visual prefix memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                f"updates={int(initial_memory_debug.get('update_count', 0))}"
+            )
 
-    env = HShape2DEnv(seed=args.seed, success_threshold=args.success_threshold)
+    env = HShape2DEnv(seed=eval_seed, success_threshold=args.success_threshold)
     base_img = env.render_base_image(image_hw)
 
     results = []
     success_count = 0
 
-    for ep_idx, task_id in enumerate(env.build_task_schedule(args.num_rollouts, args.seed)):
+    for ep_idx, task_id in enumerate(env.build_task_schedule(eval_num_rollouts, eval_seed)):
         state_xy = tuple(float(v) for v in env.reset(task_id=task_id))
         if hasattr(policy, "reset"):
             policy.reset()
@@ -571,7 +581,7 @@ def evaluate_policy(
             video_path,
             image_hw[1],
             image_hw[0],
-            args.fps,
+            eval_fps,
         )
         if writer.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for rollout video writing.")
@@ -591,7 +601,7 @@ def evaluate_policy(
         previous_signature_vec = None
         success = False
 
-        for _step_idx in range(args.max_steps):
+        for _step_idx in range(eval_max_steps):
             frame = env.render_frame(base_img, state_xy)
             writer.stdin.write(frame.astype(np.uint8).tobytes())
 
@@ -752,31 +762,47 @@ def evaluate_policy(
             "steps": int(len(trajectory) - 1),
             "sum_reward": float(episode_reward),
         }
+        memory_debug_stats = (
+            get_visual_memory_debug_stats(policy) if use_visual_prefix_memory else None
+        )
+        if memory_debug_stats is not None:
+            result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
+        memory_debug_text = ""
+        if memory_debug_stats is not None:
+            memory_debug_text = (
+                " "
+                f"memory_updates={int(memory_debug_stats.get('update_count', 0))} "
+                f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
+            )
         print(
-            f"[{ep_idx + 1:03d}/{args.num_rollouts:03d}] "
+            f"[{ep_idx + 1:03d}/{eval_num_rollouts:03d}] "
             f"task={TASK_ID_TO_NAME[task_id]} success={success} "
             f"steps={result['steps']} final_dist={final_distance:.3f} "
-            f"video={video_path.name}"
+            f"video={video_path.name}{memory_debug_text}"
         )
 
     summary = {
         "env": ENV_NAME,
         "policy_type": policy_type,
-        "num_rollouts": args.num_rollouts,
+        "num_rollouts": eval_num_rollouts,
         "success_count": success_count,
-        "success_rate": float(success_count / max(1, args.num_rollouts)),
-        "seed": args.seed,
-        "fps": args.fps,
-        "max_steps": args.max_steps,
+        "success_rate": float(success_count / max(1, eval_num_rollouts)),
+        "seed": eval_seed,
+        "fps": eval_fps,
+        "max_steps": eval_max_steps,
         "success_threshold": args.success_threshold,
         "policy_dir": str(policy_dir),
         "results": results,
     }
+    if use_visual_prefix_memory:
+        memory_debug_stats = get_visual_memory_debug_stats(policy)
+        if memory_debug_stats is not None:
+            summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
-    print(f"\nSaved {args.num_rollouts} rollout videos to: {output_dir}")
+    print(f"\nSaved {eval_num_rollouts} rollout videos to: {output_dir}")
     print(f"Summary: {summary_path}")
     print(
-        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{args.num_rollouts})"
+        f"Success rate: {summary['success_rate']:.3f} ({success_count}/{eval_num_rollouts})"
     )

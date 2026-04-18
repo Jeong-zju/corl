@@ -2,12 +2,22 @@ train:
   dataset_root: "data/zeno-ai/wholebody_hanger_stage3_v30"
   dataset_repo_id: "zeno-ai/wholebody_hanger_stage3_v30"
   output_root: "outputs/train/zeno-ai/wholebody_hanger_stage3_v30/act"
+  resume: false
   job_name: "act"
   wandb_project: "wholebody_hanger_stage3_v30"
   wandb_mode: "online"
   device: "cuda"
   use_amp: true
   amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 200000
   batch_size: 32
   num_workers: 24
@@ -16,7 +26,6 @@ train:
   video_backend: "torchcodec"
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
-  enable_filtered_hf_cache: true
   seed: 42
   log_freq: 2000
   save_freq: 50000
@@ -26,8 +35,6 @@ train:
   split_shuffle: true
   chunk_size: 100
   n_action_steps: 100
-  use_first_frame_anchor: false
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

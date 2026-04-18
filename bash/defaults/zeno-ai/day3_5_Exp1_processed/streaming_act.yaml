@@ -2,12 +2,22 @@ train:
   dataset_root: "data/zeno-ai/day3_5_Exp1_processed"
   dataset_repo_id: "zeno-ai/day3_5_Exp1_processed"
   output_root: "outputs/train/zeno-ai/day3_5_Exp1_processed/streaming-act-sipm"
+  resume: false
   job_name: "streaming-act-sipm"
   wandb_project: "day3_5_Exp1_processed"
   wandb_mode: "online"
   device: "cuda"
   use_amp: true
   amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 50000
   batch_size: 8
   num_workers: 24
@@ -26,8 +36,6 @@ train:
   split_shuffle: true
   chunk_size: 100
   n_action_steps: 100
-  use_first_frame_anchor: false
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

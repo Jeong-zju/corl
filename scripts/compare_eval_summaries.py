@@ -24,9 +24,10 @@ from typing import Any
 import numpy as np
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_EVAL_ROOT = REPO_ROOT / "main" / "outputs" / "eval"
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "main" / "outputs" / "eval_compare"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = PROJECT_ROOT / "data"
+DEFAULT_EVAL_ROOT = PROJECT_ROOT / "outputs" / "eval"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "eval_compare"
 
 
 @dataclass(frozen=True)
@@ -202,7 +203,7 @@ def normalize_dataset_candidates(value: str | Path | None) -> set[str]:
     if len(raw_path.parts) >= 2:
         add("_".join(raw_path.parts[-2:]))
 
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             stripped = raw[len(prefix) :]
             add(stripped)
@@ -211,7 +212,7 @@ def normalize_dataset_candidates(value: str | Path | None) -> set[str]:
             if len(Path(stripped).parts) >= 2:
                 add("_".join(Path(stripped).parts[-2:]))
 
-    for root in (REPO_ROOT / "main" / "data", REPO_ROOT / "main", REPO_ROOT):
+    for root in (DATA_ROOT, PROJECT_ROOT):
         try:
             relative = raw_path.resolve(strict=False).relative_to(root.resolve())
         except Exception:

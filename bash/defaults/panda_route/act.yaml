@@ -2,10 +2,20 @@ train:
   dataset_root: "data/zeno-ai/panda_route_onebit_cue_v30"
   dataset_repo_id: "zeno-ai/panda_route_onebit_cue_v30"
   output_root: "outputs/train/panda_route/act"
+  resume: false
   job_name: "act"
   wandb_project: "panda_route"
   wandb_mode: "online"
   device: "cuda"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 50000
   batch_size: 32
   num_workers: 4
@@ -15,7 +25,6 @@ train:
   eval_freq: -1
   chunk_size: 5
   n_action_steps: 5
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

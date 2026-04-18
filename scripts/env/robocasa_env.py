@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import math
 import re
@@ -18,7 +19,19 @@ from dataset_utils import (
     load_dataset_split,
     resolve_dataset_root,
 )
-from eval_helpers import write_summary
+from eval_helpers import (
+    build_prefix_sequence_eval_inputs,
+    compute_delta_signature_step_np,
+    compute_signatory_signature_np,
+    compute_simple_signature_np,
+    ensure_prefix_sequence_batch_dims,
+    resolve_signature_backend,
+    write_summary,
+)
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    resolve_policy_capability_flags,
+)
 
 
 MAIN_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +64,13 @@ SUPPORTED_TASK_FEATURE_KEYS = {
     TASK_NAME_FEATURE_KEY,
     TASK_DESCRIPTION_FEATURE_KEY,
 }
+DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
+DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+DEFAULT_PREFIX_STATE_KEY = "observation.prefix_state"
+DEFAULT_PREFIX_MASK_KEY = "observation.prefix_mask"
+DEFAULT_PREFIX_PATH_SIGNATURE_KEY = "observation.prefix_path_signature"
+DEFAULT_PREFIX_DELTA_SIGNATURE_KEY = "observation.prefix_delta_signature"
+DEFAULT_PREFIX_IMAGES_PREFIX = "observation.prefix_images."
 
 
 def _maybe_create_tqdm(
@@ -124,7 +144,7 @@ def _resolve_visual_features(cfg) -> list[tuple[str, str, tuple[int, ...]]]:
         policy_key_s = str(policy_key)
         if not policy_key_s.startswith("observation.images."):
             raise NotImplementedError(
-                "RoboCasa ACT eval currently supports image inputs only under "
+                "RoboCasa eval currently supports image inputs only under "
                 "`observation.images.*`. "
                 f"Got unsupported visual feature {policy_key_s!r}."
             )
@@ -158,10 +178,23 @@ def _resolve_required_task_feature_keys(cfg) -> list[str]:
     ]
 
 
+def _is_supported_aux_input_feature_key(key: str) -> bool:
+    # Some saved checkpoint schemas keep signature/prefix placeholders in
+    # `input_features` even when the runtime policy ignores missing values.
+    return key in {
+        DEFAULT_PATH_SIGNATURE_KEY,
+        DEFAULT_DELTA_SIGNATURE_KEY,
+        DEFAULT_PREFIX_STATE_KEY,
+        DEFAULT_PREFIX_MASK_KEY,
+        DEFAULT_PREFIX_PATH_SIGNATURE_KEY,
+        DEFAULT_PREFIX_DELTA_SIGNATURE_KEY,
+    } or key.startswith(DEFAULT_PREFIX_IMAGES_PREFIX)
+
+
 def _validate_supported_input_features(cfg) -> None:
     input_features = getattr(cfg, "input_features", None)
     if not isinstance(input_features, Mapping):
-        raise RuntimeError("RoboCasa ACT eval expected `cfg.input_features` to be present.")
+        raise RuntimeError("RoboCasa eval expected `cfg.input_features` to be present.")
 
     supported: set[str] = set()
     supported.update(key for key, _, _ in _resolve_visual_features(cfg))
@@ -169,11 +202,17 @@ def _validate_supported_input_features(cfg) -> None:
     if state_key is not None:
         supported.add(state_key)
     supported.update(_resolve_required_task_feature_keys(cfg))
+    supported.update(
+        str(key)
+        for key in input_features
+        if _is_supported_aux_input_feature_key(str(key))
+    )
 
     unsupported = [str(key) for key in input_features if str(key) not in supported]
     if unsupported:
         raise NotImplementedError(
-            "RoboCasa ACT eval currently supports image, state, and task-id inputs only. "
+            "RoboCasa eval currently supports image, state, task-id, signature, "
+            "and prefix-memory inputs only. "
             f"Unsupported input features: {unsupported}"
         )
 
@@ -197,7 +236,7 @@ def _resolve_camera_setup(
 
     if len(heights) > 1 or len(widths) > 1:
         raise RuntimeError(
-            "RoboCasa ACT eval expects all image features to share one resolution. "
+            "RoboCasa eval expects all image features to share one resolution. "
             f"Got heights={sorted(heights)}, widths={sorted(widths)}."
         )
 
@@ -289,6 +328,28 @@ def _normalize_robocasa_split(raw_value: str | None) -> str:
     return value
 
 
+def _compute_online_signature(
+    state_history: deque[np.ndarray],
+    history_length: int,
+    sig_depth: int,
+    signature_backend: str,
+) -> np.ndarray:
+    if history_length <= 0:
+        raise ValueError(f"history_length must be > 0, got {history_length}")
+    if len(state_history) == 0:
+        raise ValueError("state_history is empty; cannot compute path signature.")
+
+    window = np.stack(list(state_history), axis=0).astype(np.float32, copy=False)
+    if window.shape[0] < history_length:
+        pad_len = history_length - window.shape[0]
+        pad = np.repeat(window[:1], pad_len, axis=0)
+        window = np.concatenate([pad, window], axis=0)
+
+    if signature_backend == "signatory":
+        return compute_signatory_signature_np(window, sig_depth)
+    return compute_simple_signature_np(window, sig_depth)
+
+
 def _parse_tasks(task_arg: str | None) -> list[str]:
     raw = "" if task_arg is None else str(task_arg)
     tasks: list[str] = []
@@ -360,11 +421,7 @@ def _iter_exact_dataset_root_candidates(
         candidates.append(raw_path)
 
     if not raw_path.is_absolute():
-        if normalized_dataset_text.startswith("main/data/"):
-            candidates.append(
-                local_data_root / normalized_dataset_text[len("main/data/") :]
-            )
-        elif normalized_dataset_text.startswith("data/"):
+        if normalized_dataset_text.startswith("data/"):
             candidates.append(
                 local_data_root / normalized_dataset_text[len("data/") :]
             )
@@ -472,27 +529,67 @@ def _resolve_task_dataset_root(
 def _estimate_conservative_max_steps_from_dataset(
     dataset_root: Path,
 ) -> tuple[int, int, int]:
-    episodes_path = dataset_root / LEGACY_EPISODES_JSONL_PATH
-    if not episodes_path.exists():
-        raise FileNotFoundError(
-            "RoboCasa eval could not find episode length metadata at "
-            f"{episodes_path}."
-        )
-
     lengths: list[int] = []
-    for raw_line in episodes_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        payload = json.loads(line)
-        length = int(payload.get("length", 0))
-        if length > 0:
-            lengths.append(length)
+
+    episodes_meta_dir = dataset_root / "meta" / "episodes"
+    episode_parquet_paths = sorted(episodes_meta_dir.rglob("*.parquet"))
+    if episode_parquet_paths:
+        try:
+            import pyarrow.parquet as pq
+        except ModuleNotFoundError:
+            pq = None
+        if pq is not None:
+            for parquet_path in episode_parquet_paths:
+                episode_table = pq.read_table(parquet_path, columns=["length"])
+                parquet_lengths = np.asarray(
+                    episode_table["length"].to_pylist(),
+                    dtype=np.int64,
+                )
+                lengths.extend(int(length) for length in parquet_lengths if int(length) > 0)
 
     if not lengths:
-        raise ValueError(
-            "RoboCasa eval could not infer episode lengths from "
-            f"{episodes_path}."
+        episodes_path = dataset_root / LEGACY_EPISODES_JSONL_PATH
+        if episodes_path.exists():
+            for raw_line in episodes_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                length = int(payload.get("length", 0))
+                if length > 0:
+                    lengths.append(length)
+
+    if not lengths:
+        extras_root = dataset_root / "extras"
+        for states_path in sorted(extras_root.glob("episode_*/states.npz")):
+            with np.load(states_path) as payload:
+                states = payload.get("states")
+                if states is None or states.ndim == 0:
+                    continue
+                length = int(states.shape[0])
+                if length > 0:
+                    lengths.append(length)
+
+    if not lengths:
+        info_path = dataset_root / "meta" / "info.json"
+        if info_path.exists():
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            total_frames = int(info.get("total_frames", 0))
+            total_episodes = int(info.get("total_episodes", 0))
+            if (
+                total_frames > 0
+                and total_episodes > 0
+                and total_frames % total_episodes == 0
+            ):
+                inferred_length = total_frames // total_episodes
+                if inferred_length > 0:
+                    lengths.append(inferred_length)
+
+    if not lengths:
+        raise FileNotFoundError(
+            "RoboCasa eval could not infer episode lengths. Checked "
+            f"{episodes_meta_dir}, {dataset_root / LEGACY_EPISODES_JSONL_PATH}, "
+            f"{dataset_root / 'extras'}, and {dataset_root / 'meta' / 'info.json'}."
         )
 
     longest_length = int(max(lengths))
@@ -542,6 +639,17 @@ def _resolve_task_max_steps(
     }
 
 
+def _resolve_task_output_dir(
+    *,
+    output_dir: Path,
+    task_name: str,
+    num_tasks: int,
+) -> Path:
+    if int(num_tasks) <= 1:
+        return output_dir
+    return output_dir / _normalize_output_path_part(task_name)
+
+
 class _TaskIndexResolver:
     def __init__(self, dataset_root: Path | None) -> None:
         self.dataset_root = dataset_root
@@ -569,7 +677,7 @@ class _TaskIndexResolver:
         return self._task_to_index.get(str(task_text).strip())
 
 
-class RoboCasaACTPolicyAdapter:
+class RoboCasaPolicyAdapter:
     def __init__(
         self,
         *,
@@ -579,6 +687,7 @@ class RoboCasaACTPolicyAdapter:
         postprocessor,
         policy_dir: Path,
         task_index_resolver: _TaskIndexResolver,
+        signature_backend: str | None = None,
     ) -> None:
         self.policy = policy
         self.cfg = cfg
@@ -587,25 +696,61 @@ class RoboCasaACTPolicyAdapter:
         self.policy_dir = policy_dir
         self.task_index_resolver = task_index_resolver
         self.visual_specs = _resolve_visual_features(cfg)
+        self.policy_image_keys = [policy_key for policy_key, _env_key, _shape in self.visual_specs]
         self.state_feature_key, self.state_shape = _resolve_state_feature_key(cfg)
         self.required_task_feature_keys = _resolve_required_task_feature_keys(cfg)
+        capability_flags = resolve_policy_capability_flags(cfg)
+        self.use_path_signature = capability_flags.use_path_signature
+        self.use_prefix_sequence_training = (
+            capability_flags.use_prefix_sequence_training
+        )
+        self.use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+        self.use_delta_signature = capability_flags.use_delta_signature
+        self.build_explicit_prefix_eval_inputs = (
+            capability_flags.build_explicit_prefix_eval_inputs
+        )
+        self.signature_backend = signature_backend
         _validate_supported_input_features(cfg)
         if self.state_feature_key is None:
             raise RuntimeError(
-                "RoboCasa ACT eval requires a state input feature such as "
+                "RoboCasa eval requires a state input feature such as "
                 "`observation.state`."
             )
         if self.required_task_feature_keys and not self.task_index_resolver.available:
             raise RuntimeError(
-                "This RoboCasa ACT checkpoint expects task-id conditioning "
+                "This RoboCasa checkpoint expects task-id conditioning "
                 f"features {self.required_task_feature_keys}, but no `meta/tasks.jsonl` "
                 "mapping was found. Pass `--dataset robocasa/...` or evaluate from a "
                 "training run that still has `dataset_split.json`."
             )
+        if self.use_path_signature and self.signature_backend is None:
+            raise RuntimeError(
+                "RoboCasa eval requires a resolved signature backend "
+                "when `use_path_signature=True`."
+            )
+        self.reset()
 
     def reset(self) -> None:
         if hasattr(self.policy, "reset"):
             self.policy.reset()
+        if self.use_path_signature:
+            self.state_history = deque(maxlen=int(self.cfg.history_length))
+            self.previous_signature_vec: np.ndarray | None = None
+        else:
+            self.state_history = None
+            self.previous_signature_vec = None
+        if self.build_explicit_prefix_eval_inputs:
+            self.prefix_state_history: list[Any] = []
+            self.prefix_image_histories = {
+                image_key: [] for image_key in self.policy_image_keys
+            }
+            self.prefix_signature_history = [] if self.use_path_signature else None
+            self.prefix_delta_signature_history = [] if self.use_delta_signature else None
+        else:
+            self.prefix_state_history = None
+            self.prefix_image_histories = None
+            self.prefix_signature_history = None
+            self.prefix_delta_signature_history = None
 
     def _build_task_feature(
         self,
@@ -684,7 +829,105 @@ class RoboCasaACTPolicyAdapter:
         import torch
 
         obs = self._build_policy_observation(observation, env=env)
+        if self.use_path_signature:
+            assert self.state_history is not None
+            state_now = (
+                obs[self.state_feature_key]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+            self.state_history.append(state_now.copy())
+            signature_vec = _compute_online_signature(
+                state_history=self.state_history,
+                history_length=int(self.cfg.history_length),
+                sig_depth=int(self.cfg.signature_depth),
+                signature_backend=str(self.signature_backend),
+            )
+            if signature_vec.shape[0] != int(self.cfg.signature_dim):
+                raise RuntimeError(
+                    "Online signature dimension mismatch: "
+                    f"got {signature_vec.shape[0]}, expected cfg.signature_dim={self.cfg.signature_dim}."
+                )
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = torch.from_numpy(
+                signature_vec.astype(np.float32, copy=False)
+            )
+            if self.use_delta_signature:
+                delta_signature_vec = compute_delta_signature_step_np(
+                    signature_vec,
+                    self.previous_signature_vec,
+                )
+                obs[DEFAULT_DELTA_SIGNATURE_KEY] = torch.from_numpy(
+                    delta_signature_vec.astype(np.float32, copy=False)
+                )
+                self.previous_signature_vec = signature_vec.astype(np.float32, copy=True)
+
+        if self.build_explicit_prefix_eval_inputs:
+            assert self.prefix_state_history is not None
+            assert self.prefix_image_histories is not None
+            build_prefix_sequence_eval_inputs(
+                obs=obs,
+                cfg=self.cfg,
+                state_key=self.state_feature_key,
+                image_keys=self.policy_image_keys,
+                signature_key=(
+                    DEFAULT_PATH_SIGNATURE_KEY if self.use_path_signature else None
+                ),
+                delta_signature_key=(
+                    DEFAULT_DELTA_SIGNATURE_KEY if self.use_delta_signature else None
+                ),
+                prefix_state_history=self.prefix_state_history,
+                prefix_signature_history=self.prefix_signature_history,
+                prefix_delta_signature_history=self.prefix_delta_signature_history,
+                prefix_image_histories=self.prefix_image_histories,
+            )
+
         obs = self.preprocessor(obs)
+        if self.use_path_signature:
+            if DEFAULT_PATH_SIGNATURE_KEY not in obs:
+                raise KeyError(
+                    f"`{DEFAULT_PATH_SIGNATURE_KEY}` missing after preprocessing; "
+                    "cannot run policy with use_path_signature=True."
+                )
+            path_signature = obs[DEFAULT_PATH_SIGNATURE_KEY]
+            if path_signature.ndim == 1:
+                path_signature = path_signature.unsqueeze(0)
+            elif path_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_PATH_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                    f"got shape={tuple(path_signature.shape)}"
+                )
+            obs[DEFAULT_PATH_SIGNATURE_KEY] = path_signature.to(
+                device=obs[self.state_feature_key].device,
+                dtype=obs[self.state_feature_key].dtype,
+            )
+        if self.use_delta_signature:
+            if DEFAULT_DELTA_SIGNATURE_KEY not in obs:
+                raise KeyError(
+                    f"`{DEFAULT_DELTA_SIGNATURE_KEY}` missing after preprocessing; "
+                    "cannot run policy with use_delta_signature=True."
+                )
+            delta_signature = obs[DEFAULT_DELTA_SIGNATURE_KEY]
+            if delta_signature.ndim == 1:
+                delta_signature = delta_signature.unsqueeze(0)
+            elif delta_signature.ndim != 2:
+                raise RuntimeError(
+                    f"`{DEFAULT_DELTA_SIGNATURE_KEY}` must be 1D/2D after preprocessing, "
+                    f"got shape={tuple(delta_signature.shape)}"
+                )
+            obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature.to(
+                device=obs[self.state_feature_key].device,
+                dtype=obs[self.state_feature_key].dtype,
+            )
+        if self.build_explicit_prefix_eval_inputs:
+            ensure_prefix_sequence_batch_dims(
+                obs=obs,
+                state_key=self.state_feature_key,
+                image_keys=self.policy_image_keys,
+                use_path_signature=self.use_path_signature,
+                use_delta_signature=self.use_delta_signature,
+            )
         with torch.no_grad():
             action = self.policy.select_action(obs)
         action = self.postprocessor(action)
@@ -695,7 +938,7 @@ class RoboCasaACTPolicyAdapter:
                 action = next(iter(action.values()))
             else:
                 raise RuntimeError(
-                    "RoboCasa ACT eval expected a single action tensor after "
+                    "RoboCasa eval expected a single action tensor after "
                     f"postprocessing, got keys={list(action)}."
                 )
         if torch.is_tensor(action):
@@ -705,7 +948,7 @@ class RoboCasaACTPolicyAdapter:
         action_np = np.asarray(action_np, dtype=np.float32).reshape(-1)
         if action_np.shape[0] != int(env.action_dim):
             raise RuntimeError(
-                "RoboCasa ACT action dimension mismatch: "
+                "RoboCasa policy action dimension mismatch: "
                 f"got {action_np.shape[0]}, expected {env.action_dim}."
             )
         return action_np
@@ -714,7 +957,7 @@ class RoboCasaACTPolicyAdapter:
 def _run_single_rollout(
     *,
     env,
-    policy_adapter: RoboCasaACTPolicyAdapter,
+    policy_adapter: RoboCasaPolicyAdapter,
     max_steps: int,
     seed: int | None,
     video_path: Path | None,
@@ -862,23 +1105,43 @@ def evaluate_policy(
     postprocessor,
     policy_dir: Path,
 ) -> None:
-    if policy_type != "act":
+    eval_num_rollouts = int(getattr(args, "eval_num_rollouts", args.num_rollouts))
+    eval_max_steps = getattr(args, "eval_max_steps", args.max_steps)
+    eval_max_episodes_rendered = getattr(
+        args,
+        "eval_max_episodes_rendered",
+        args.max_episodes_rendered,
+    )
+    eval_fps = int(getattr(args, "eval_fps", args.fps))
+    eval_seed = getattr(args, "eval_seed", args.seed)
+    eval_task_names = tuple(
+        getattr(args, "eval_task_names", ())
+        or _parse_tasks(getattr(args, "task", None))
+    )
+
+    if policy_type == "prism_diffusion":
         raise NotImplementedError(
-            "RoboCasa env eval currently supports only `act` checkpoints."
+            "RoboCasa env eval does not yet support `prism_diffusion`. "
+            "No fallback is attempted; use dataset evaluation or another online env."
         )
-    if int(args.num_rollouts) <= 0:
+    if policy_type not in {"act", "diffusion", "streaming_act"}:
+        raise NotImplementedError(
+            "RoboCasa env eval currently supports `act`, `diffusion`, "
+            "and `streaming_act` checkpoints."
+        )
+    if eval_num_rollouts <= 0:
         raise ValueError("`--num-rollouts` must be positive for RoboCasa eval.")
-    if args.max_steps is not None and int(args.max_steps) <= 0:
+    if eval_max_steps is not None and int(eval_max_steps) <= 0:
         raise ValueError("`--max-steps` must be positive for RoboCasa eval.")
-    if args.max_episodes_rendered is not None and int(args.max_episodes_rendered) < 0:
+    if eval_max_episodes_rendered is not None and int(eval_max_episodes_rendered) < 0:
         raise ValueError("`--max-episodes-rendered` must be >= 0 when provided.")
 
-    tasks = _parse_tasks(getattr(args, "task", None))
+    tasks = list(eval_task_names)
     conda_env = _normalize_conda_env_name(
-        getattr(args, "robocasa_conda_env", DEFAULT_ROBOCASA_CONDA_ENV)
+        getattr(args, "eval_robocasa_conda_env", getattr(args, "robocasa_conda_env", DEFAULT_ROBOCASA_CONDA_ENV))
     )
     robocasa_split = _normalize_robocasa_split(
-        getattr(args, "robocasa_split", None)
+        getattr(args, "eval_robocasa_split", getattr(args, "robocasa_split", None))
     )
 
     print(
@@ -895,21 +1158,53 @@ def evaluate_policy(
         )
 
     _validate_supported_input_features(cfg)
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_delta_signature = capability_flags.use_delta_signature
+    signature_backend = None
+    if use_path_signature:
+        signature_backend = resolve_signature_backend(
+            getattr(args, "signature_backend", "auto")
+        )
+        print(
+            "[load] RoboCasa online signatures: "
+            f"backend={signature_backend}, history={cfg.history_length}, "
+            f"depth={cfg.signature_depth}, dim={cfg.signature_dim}"
+        )
+    if use_prefix_sequence_training:
+        mode_text = "online_visual_memory" if use_visual_prefix_memory else "full_prefix"
+        print(
+            "[load] RoboCasa prefix context: "
+            f"mode={mode_text}, max_steps={cfg.prefix_train_max_steps}, "
+            f"stride={cfg.prefix_frame_stride}, delta_signature={use_delta_signature}"
+        )
+    if use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
+        if initial_memory_debug is not None:
+            print(
+                "[load] RoboCasa visual memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                f"updates={int(initial_memory_debug.get('update_count', 0))}"
+            )
     visual_specs = _resolve_visual_features(cfg)
     camera_names, camera_width, camera_height = _resolve_camera_setup(visual_specs)
     video_image_key = _choose_video_image_key(visual_specs)
     video_image_keys = _resolve_video_image_keys(visual_specs)
     max_videos_per_task = (
-        int(args.max_episodes_rendered)
-        if args.max_episodes_rendered is not None
-        else int(args.num_rollouts)
+        int(eval_max_episodes_rendered)
+        if eval_max_episodes_rendered is not None
+        else int(eval_num_rollouts)
     )
     # RoboCasaGymEnv zeros all camera observations when `enable_render=False`,
-    # so ACT image inputs and saved rollout videos both require rendering enabled.
+    # so policy image inputs and saved rollout videos both require rendering enabled.
     enable_render = bool(visual_specs) or bool(video_image_key)
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    single_task_eval = len(tasks) == 1
 
     overall_success_count = 0
     overall_reward = 0.0
@@ -920,7 +1215,7 @@ def evaluate_policy(
     resolved_max_steps_by_task: dict[str, int] = {}
     dataset_roots_by_task: dict[str, str] = {}
     eval_start_s = time.perf_counter()
-    total_rollout_count = int(len(tasks) * int(args.num_rollouts))
+    total_rollout_count = int(len(tasks) * eval_num_rollouts)
     overall_progress = _maybe_create_tqdm(
         total=total_rollout_count,
         desc="RoboCasa Eval",
@@ -930,7 +1225,11 @@ def evaluate_policy(
 
     try:
         for task_name in tasks:
-            task_dir = output_dir / _normalize_output_path_part(task_name)
+            task_dir = _resolve_task_output_dir(
+                output_dir=output_dir,
+                task_name=task_name,
+                num_tasks=len(tasks),
+            )
             task_dataset_root = _resolve_task_dataset_root(
                 task_name=task_name,
                 args=args,
@@ -938,7 +1237,7 @@ def evaluate_policy(
             )
             task_max_steps, task_max_steps_info = _resolve_task_max_steps(
                 requested_max_steps=(
-                    None if args.max_steps is None else int(args.max_steps)
+                    None if eval_max_steps is None else int(eval_max_steps)
                 ),
                 task_name=task_name,
                 task_dataset_root=task_dataset_root,
@@ -948,13 +1247,14 @@ def evaluate_policy(
                 dataset_roots_by_task[str(task_name)] = str(task_dataset_root)
 
             task_index_resolver = _TaskIndexResolver(task_dataset_root)
-            policy_adapter = RoboCasaACTPolicyAdapter(
+            policy_adapter = RoboCasaPolicyAdapter(
                 policy=policy,
                 cfg=cfg,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 policy_dir=policy_dir,
                 task_index_resolver=task_index_resolver,
+                signature_backend=signature_backend,
             )
             _progress_write(
                 overall_progress,
@@ -982,11 +1282,11 @@ def evaluate_policy(
                 task_total_reward = 0.0
                 task_total_steps = 0
 
-                for rollout_index in range(int(args.num_rollouts)):
+                for rollout_index in range(eval_num_rollouts):
                     rollout_seed = (
                         None
-                        if getattr(args, "seed", None) is None
-                        else int(args.seed) + rollout_index
+                        if eval_seed is None
+                        else int(eval_seed) + rollout_index
                     )
                     save_video = bool(video_image_keys or video_image_key) and rollout_index < max_videos_per_task
                     video_path = (
@@ -1003,7 +1303,7 @@ def evaluate_policy(
                         total=int(task_max_steps),
                         desc=(
                             f"{task_name} "
-                            f"[{rollout_index + 1}/{int(args.num_rollouts)}]"
+                            f"[{rollout_index + 1}/{eval_num_rollouts}]"
                         ),
                         unit="step",
                         leave=False,
@@ -1018,7 +1318,7 @@ def evaluate_policy(
                             seed=rollout_seed,
                             video_path=video_path,
                             details_path=details_path,
-                            fps=int(args.fps),
+                            fps=eval_fps,
                             video_image_key=video_image_key,
                             video_image_keys=video_image_keys,
                             step_progress=step_progress,
@@ -1038,6 +1338,13 @@ def evaluate_policy(
                     task_success_count += int(result.success)
                     task_total_reward += float(result.total_reward)
                     task_total_steps += int(result.num_steps)
+                    memory_debug_stats = (
+                        get_visual_memory_debug_stats(policy)
+                        if use_visual_prefix_memory
+                        else None
+                    )
+                    if memory_debug_stats is not None:
+                        result.final_info["visual_memory_debug"] = memory_debug_stats
                     if result.video_path is not None:
                         overall_video_paths.append(result.video_path)
                     overall_rollouts += 1
@@ -1051,7 +1358,7 @@ def evaluate_policy(
                     _progress_write(
                         overall_progress,
                         "[eval][robocasa] "
-                        f"task={task_name} rollout={rollout_index + 1}/{int(args.num_rollouts)} "
+                        f"task={task_name} rollout={rollout_index + 1}/{eval_num_rollouts} "
                         f"steps={result.num_steps} reward={result.total_reward:.2f} "
                         f"success={int(result.success)} elapsed="
                         f"{_format_elapsed_s(time.perf_counter() - rollout_start_s)}",
@@ -1059,15 +1366,17 @@ def evaluate_policy(
 
                 task_eval = RoboCasaEvaluationResult(
                     task=str(task_name),
-                    num_rollouts=int(args.num_rollouts),
+                    num_rollouts=eval_num_rollouts,
                     max_steps=int(task_max_steps),
                     success_count=int(task_success_count),
-                    success_rate=float(task_success_count / max(1, int(args.num_rollouts))),
-                    average_reward=float(task_total_reward / max(1, int(args.num_rollouts))),
-                    average_steps=float(task_total_steps / max(1, int(args.num_rollouts))),
+                    success_rate=float(task_success_count / max(1, eval_num_rollouts)),
+                    average_reward=float(task_total_reward / max(1, eval_num_rollouts)),
+                    average_steps=float(task_total_steps / max(1, eval_num_rollouts)),
                     rollout_results=rollout_results,
                     output_dir=str(task_dir),
-                    summary_path=str(task_dir / "summary.json"),
+                    summary_path=str(output_dir / "summary.json")
+                    if single_task_eval
+                    else str(task_dir / "summary.json"),
                 )
                 task_summary = task_eval.to_summary_dict()
                 task_summary.update(
@@ -1083,7 +1392,8 @@ def evaluate_policy(
                         ],
                     }
                 )
-                write_summary(task_dir, task_summary)
+                if not single_task_eval:
+                    write_summary(task_dir, task_summary)
 
                 overall_success_count += int(task_success_count)
                 overall_reward += float(task_total_reward)
@@ -1133,15 +1443,15 @@ def evaluate_policy(
         "policy_type": policy_type,
         "policy_dir": str(policy_dir),
         "env": ENV_NAME,
-        "task_spec": str(args.task),
+        "task_spec": None if getattr(args, "eval_task_spec", None) is None else str(args.eval_task_spec),
         "tasks": tasks,
         "num_tasks": int(len(tasks)),
-        "rollouts_per_task": int(args.num_rollouts),
+        "rollouts_per_task": eval_num_rollouts,
         "total_rollouts": int(overall_rollouts),
-        "max_steps": None if args.max_steps is None else int(args.max_steps),
+        "max_steps": None if eval_max_steps is None else int(eval_max_steps),
         "resolved_max_steps_by_task": resolved_max_steps_by_task,
-        "seed": None if getattr(args, "seed", None) is None else int(args.seed),
-        "fps": int(args.fps),
+        "seed": None if eval_seed is None else int(eval_seed),
+        "fps": eval_fps,
         "robocasa_conda_env": conda_env,
         "robocasa_split": robocasa_split,
         "camera_names": camera_names,

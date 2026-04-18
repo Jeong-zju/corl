@@ -19,8 +19,12 @@ from eval_helpers import (  # noqa: E402
 
 class OnlineSignatureRuntime:
     def __init__(self, policy_config: PolicyConfig) -> None:
-        self._use_path = bool(policy_config.use_path_signature)
-        self._use_delta = bool(policy_config.use_delta_signature)
+        self._use_path = bool(
+            policy_config.type == "streaming_act" and policy_config.use_path_signature
+        )
+        self._use_delta = bool(
+            policy_config.type == "streaming_act" and policy_config.use_delta_signature
+        )
         self._signature_depth = int(policy_config.signature_depth)
         self._signature_dim = policy_config.signature_dim
         self._history: deque[np.ndarray] = deque()

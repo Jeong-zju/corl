@@ -2,10 +2,20 @@ train:
   dataset_root: "data/zeno-ai/rrt_connect_h_v30"
   dataset_repo_id: "zeno-ai/rrt_connect_h_v30"
   output_root: "outputs/train/h_shape/diffusion"
+  resume: false
   job_name: "diffusion"
   wandb_project: "h_shape"
   wandb_mode: "online"
   device: "cuda"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 10000
   batch_size: 32
   num_workers: 4
@@ -17,7 +27,6 @@ train:
   horizon: 8
   n_action_steps: 1
   drop_n_last_frames: 6
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

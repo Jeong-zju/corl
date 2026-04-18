@@ -6,10 +6,9 @@ from typing import Any
 import yaml
 
 
-DEFAULTS_ROOT = Path(__file__).resolve().parents[1] / "bash" / "defaults"
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MAIN_ROOT = REPO_ROOT / "main"
-DATA_ROOT = MAIN_ROOT / "data"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULTS_ROOT = PROJECT_ROOT / "bash" / "defaults"
+DATA_ROOT = PROJECT_ROOT / "data"
 
 
 def defaults_file_path(env_name: str, policy_name: str) -> Path:
@@ -52,18 +51,13 @@ def _normalize_dataset_selector_candidates(dataset_selector: str) -> list[str]:
     if len(raw_path.parts) >= 2:
         add("_".join(raw_path.parts[-2:]))
 
-    if raw.startswith("main/data/"):
-        stripped = raw[len("main/data/") :]
-        add(stripped)
-        add(stripped.replace("/", "_"))
-        add(Path(stripped).name)
     if raw.startswith("data/"):
         stripped = raw[len("data/") :]
         add(stripped)
         add(stripped.replace("/", "_"))
         add(Path(stripped).name)
 
-    for root in (DATA_ROOT, MAIN_ROOT, REPO_ROOT):
+    for root in (DATA_ROOT, PROJECT_ROOT):
         try:
             relative = raw_path.resolve(strict=False).relative_to(root.resolve())
         except Exception:
@@ -77,21 +71,69 @@ def _normalize_dataset_selector_candidates(dataset_selector: str) -> list[str]:
     return candidates
 
 
+def _normalize_defaults_match_text(value: str | Path | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return ""
+    if text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.rstrip("/")
+
+
+def _defaults_match_specificity(value: str | Path | None) -> tuple[int, int]:
+    normalized = _normalize_defaults_match_text(value)
+    if not normalized:
+        return (0, 0)
+    parts = [
+        part
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    return (len(parts), len(normalized))
+
+
+def _score_defaults_candidate_match(
+    selector_candidate: str,
+    yaml_candidate: str,
+) -> tuple[int, int, int] | None:
+    normalized_selector = _normalize_defaults_match_text(selector_candidate)
+    normalized_yaml = _normalize_defaults_match_text(yaml_candidate)
+    if not normalized_selector or not normalized_yaml:
+        return None
+
+    yaml_depth, yaml_length = _defaults_match_specificity(normalized_yaml)
+    if normalized_selector == normalized_yaml:
+        return (3, yaml_depth, yaml_length)
+    if "/" in normalized_yaml and normalized_selector.startswith(f"{normalized_yaml}/"):
+        return (2, yaml_depth, yaml_length)
+    return None
+
+
 def resolve_dataset_defaults_path(
     dataset_selector: str,
     policy_name: str,
 ) -> Path | None:
     selector_candidates = _normalize_dataset_selector_candidates(dataset_selector)
 
+    direct_matches: list[tuple[tuple[int, int], Path]] = []
     for candidate in selector_candidates:
         direct = DEFAULTS_ROOT / candidate / f"{policy_name}.yaml"
         if direct.exists():
-            return direct
+            direct_matches.append((_defaults_match_specificity(candidate), direct))
+
+    if direct_matches:
+        return max(direct_matches, key=lambda item: item[0])[1]
 
     selector_candidate_set = set(selector_candidates)
     if not selector_candidate_set:
         return None
 
+    best_match_path: Path | None = None
+    best_match_score: tuple[int, int, int] | None = None
     for yaml_path in sorted(DEFAULTS_ROOT.rglob(f"{policy_name}.yaml")):
         try:
             data = _load_yaml_mapping(yaml_path)
@@ -113,23 +155,24 @@ def resolve_dataset_defaults_path(
                 _normalize_dataset_selector_candidates(str(dataset_repo_id))
             )
 
-        yaml_candidate_set = set(yaml_candidates)
-        if selector_candidate_set.intersection(yaml_candidate_set):
-            return yaml_path
-
+        yaml_match_score: tuple[int, int, int] | None = None
         for selector_candidate in selector_candidate_set:
-            normalized_selector = str(selector_candidate).strip().replace("\\", "/")
-            if not normalized_selector:
-                continue
-            for yaml_candidate in yaml_candidate_set:
-                normalized_yaml_candidate = (
-                    str(yaml_candidate).strip().replace("\\", "/").rstrip("/")
+            for yaml_candidate in set(yaml_candidates):
+                score = _score_defaults_candidate_match(
+                    selector_candidate=selector_candidate,
+                    yaml_candidate=yaml_candidate,
                 )
-                if not normalized_yaml_candidate or "/" not in normalized_yaml_candidate:
+                if score is None:
                     continue
-                if normalized_selector.startswith(f"{normalized_yaml_candidate}/"):
-                    return yaml_path
-    return None
+                if yaml_match_score is None or score > yaml_match_score:
+                    yaml_match_score = score
+
+        if yaml_match_score is None:
+            continue
+        if best_match_score is None or yaml_match_score > best_match_score:
+            best_match_score = yaml_match_score
+            best_match_path = yaml_path
+    return best_match_path
 
 
 def load_policy_mode_defaults_for_dataset(

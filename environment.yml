@@ -8,16 +8,16 @@
 # - monitor web UI
 #
 # Notes:
-# - Create the environment from the repo root with:
-#   `conda env create -f main/environment.yml`
+# - Create the environment from the current directory with:
+#   `conda env create -f environment.yml`
 # - Install local `signatory` afterwards, once the environment is active:
-#   `bash main/install_signatory.sh`
+#   `bash install_signatory.sh`
 # - The ROS1 adapter still requires a sourced system ROS1 installation.
 #   `rospy`, `sensor_msgs`, `nav_msgs`, `trajectory_msgs`, and
 #   `geometry_msgs` are not reliably provided by Conda, so they are not
 #   declared here.
 # - If you do not use `signature_backend=signatory` or
-#   `video_backend=torchcodec`, you can skip `main/install_signatory.sh`
+#   `video_backend=torchcodec`, you can skip `install_signatory.sh`
 #   and/or remove `torchcodec` to simplify installation.
 # - `signatory` is intentionally kept out of the bulk `pip:` section so
 #   `--no-build-isolation` only applies to that package.

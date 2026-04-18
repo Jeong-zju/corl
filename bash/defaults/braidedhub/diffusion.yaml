@@ -2,10 +2,20 @@ train:
   dataset_root: "data/zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   dataset_repo_id: "zeno-ai/braidedhub_fourstart_implicit_cue_v30"
   output_root: "outputs/train/braidedhub/diffusion"
+  resume: false
   job_name: "diffusion"
   wandb_project: "braidedhub"
   wandb_mode: "online"
   device: "cuda"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 50000
   batch_size: 32
   num_workers: 4
@@ -17,8 +27,6 @@ train:
   horizon: 56
   n_action_steps: 50
   drop_n_last_frames: 5
-  use_first_frame_anchor: false
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10

@@ -9,20 +9,26 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import warnings
 
 from dataset_utils import (
+    DATASET_SPLIT_FILENAME,
     DEFAULT_LOCAL_DATA_ROOT,
+    DatasetSplitSpec,
     build_dataset_split,
     ensure_lerobot_dataset_v30_compat,
     infer_dataset_repo_id,
+    is_supported_lerobot_dataset_root,
+    load_dataset_split,
     resolve_dataset_root,
     save_dataset_split,
     validate_dataset_root,
 )
+from policy_capabilities import policy_supports_signature_features
 from policy_defaults import load_policy_mode_defaults_for_dataset
 
 warnings.filterwarnings(
@@ -31,10 +37,29 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 RAW_IMAGE_ARRAY_STORAGE_ENCODING = "raw_uint8_array"
 RAW_IMAGE_ARRAY_STORAGE_DTYPE = "uint8"
 SIGNATURE_CACHE_LAYOUT_VERSION = 1
+PATH_SIGNATURE_FEATURE_KEY = "observation.path_signature"
+DELTA_SIGNATURE_FEATURE_KEY = "observation.delta_signature"
+PREFIX_PATH_SIGNATURE_FEATURE_KEY = "observation.prefix_path_signature"
+PREFIX_DELTA_SIGNATURE_FEATURE_KEY = "observation.prefix_delta_signature"
+CHECKPOINTS_DIRNAME = "checkpoints"
+LAST_CHECKPOINT_LINK_NAME = "last"
+PRETRAINED_MODEL_DIRNAME = "pretrained_model"
+TRAIN_CONFIG_FILENAME = "train_config.json"
+TRAINING_STATE_DIRNAME = "training_state"
+TRAINING_STEP_FILENAME = "training_step.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeRunState:
+    run_dir: Path
+    checkpoint_dir: Path
+    pretrained_model_dir: Path
+    train_config_path: Path
+    split_path: Path | None
 
 
 def _sanitize_signature_cache_path_part(value: str) -> str:
@@ -55,6 +80,193 @@ def resolve_signature_cache_dir(
         else Path(cache_root).resolve()
     )
     return root / f"signature_cache_v{SIGNATURE_CACHE_LAYOUT_VERSION}"
+
+
+def _normalize_dataset_repo_id_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().replace("\\", "/").strip("/")
+
+
+def resolve_effective_dataset_repo_id(
+    *,
+    requested_repo_id: str | None,
+    default_repo_id: str | None,
+    dataset_root: Path,
+    local_data_root: Path,
+) -> str:
+    inferred_repo_id = infer_dataset_repo_id(
+        dataset_root,
+        local_data_root=local_data_root.resolve(),
+    )
+    requested = _normalize_dataset_repo_id_text(requested_repo_id)
+    if not requested:
+        return inferred_repo_id
+
+    defaulted = _normalize_dataset_repo_id_text(default_repo_id)
+    inferred = _normalize_dataset_repo_id_text(inferred_repo_id)
+    if (
+        defaulted
+        and requested == defaulted
+        and inferred
+        and inferred != requested
+        and inferred.startswith(f"{requested}/")
+    ):
+        print(
+            "[INFO] dataset_repo_id: overriding broad defaults value "
+            f"`{requested}` with inferred dataset id `{inferred_repo_id}`"
+        )
+        return inferred_repo_id
+    return requested_repo_id if requested_repo_id is not None else inferred_repo_id
+
+
+def _normalize_dataset_task_names(
+    value: list[str] | tuple[str, ...] | set[str] | str | None,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    raw_items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    task_names: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        task_name = str(raw_item).strip()
+        if not task_name or task_name in seen:
+            continue
+        seen.add(task_name)
+        task_names.append(task_name)
+    return tuple(task_names)
+
+
+def _iter_exact_dataset_root_candidates(
+    selector: str | Path | None,
+    *,
+    local_data_root: Path,
+) -> list[Path]:
+    if selector is None:
+        return []
+
+    dataset_text = str(selector).strip()
+    if not dataset_text:
+        return []
+
+    normalized_dataset_text = dataset_text.replace("\\", "/")
+    raw_path = Path(dataset_text).expanduser()
+    candidates: list[Path] = []
+
+    if raw_path.is_absolute() or raw_path.exists() or dataset_text.startswith("."):
+        candidates.append(raw_path)
+
+    if not raw_path.is_absolute():
+        if normalized_dataset_text.startswith("data/"):
+            candidates.append(
+                local_data_root / normalized_dataset_text[len("data/") :]
+            )
+        else:
+            candidates.append(local_data_root / dataset_text)
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(candidate)
+    return ordered
+
+
+def _resolve_dataset_root_from_exact_task_names(
+    selector: str | Path | None,
+    *,
+    local_data_root: Path,
+    exact_task_names: tuple[str, ...],
+) -> Path | None:
+    if not exact_task_names:
+        return None
+
+    for base_candidate in _iter_exact_dataset_root_candidates(
+        selector,
+        local_data_root=local_data_root,
+    ):
+        if is_supported_lerobot_dataset_root(base_candidate):
+            if len(exact_task_names) == 1 and base_candidate.name == exact_task_names[0]:
+                return base_candidate.resolve()
+            continue
+
+        matched_roots: list[Path] = []
+        for task_name in exact_task_names:
+            task_candidate = base_candidate / task_name
+            if not (
+                is_supported_lerobot_dataset_root(task_candidate)
+                and task_candidate.name == task_name
+            ):
+                matched_roots = []
+                break
+            matched_roots.append(task_candidate.resolve())
+
+        if not matched_roots:
+            continue
+        if len(matched_roots) == 1:
+            return matched_roots[0]
+
+        raise NotImplementedError(
+            "The selected defaults declare multiple exact dataset task names under "
+            f"{base_candidate}, but train_policy currently expects a single local "
+            "dataset root. "
+            f"dataset_tasks={list(exact_task_names)}. "
+            "Create a merged dataset root first or use a task-specific defaults file."
+        )
+
+    return None
+
+
+def resolve_training_dataset_root(
+    *,
+    dataset: str | Path | None,
+    defaults_dataset_root: str | Path | None,
+    local_data_root: Path,
+    exact_task_names: list[str] | tuple[str, ...] | set[str] | str | None = None,
+) -> Path:
+    resolved_local_data_root = local_data_root.resolve()
+    normalized_task_names = _normalize_dataset_task_names(exact_task_names)
+    last_error: FileNotFoundError | None = None
+
+    if dataset is not None:
+        matched_root = _resolve_dataset_root_from_exact_task_names(
+            dataset,
+            local_data_root=resolved_local_data_root,
+            exact_task_names=normalized_task_names,
+        )
+        if matched_root is not None:
+            return matched_root
+        try:
+            return resolve_dataset_root(
+                dataset,
+                local_data_root=resolved_local_data_root,
+            )
+        except FileNotFoundError as exc:
+            last_error = exc
+
+    if defaults_dataset_root is not None:
+        matched_root = _resolve_dataset_root_from_exact_task_names(
+            defaults_dataset_root,
+            local_data_root=resolved_local_data_root,
+            exact_task_names=normalized_task_names,
+        )
+        if matched_root is not None:
+            return matched_root
+        try:
+            return resolve_dataset_root(
+                defaults_dataset_root,
+                local_data_root=resolved_local_data_root,
+            )
+        except FileNotFoundError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError("No dataset selector or defaults dataset_root was provided.")
 
 
 def load_signature_cache_metadata(
@@ -111,6 +323,26 @@ def _identity_signature_stats(feature_dim: int) -> dict[str, list[float] | list[
     }
 
 
+def resolve_pre_normalized_signature_observation_keys(
+    *,
+    feature_keys: tuple[str, ...],
+    reader_pre_normalized: bool,
+    use_prefix_sequence_training: bool,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+) -> tuple[str, ...]:
+    if not reader_pre_normalized:
+        return ()
+
+    resolved_keys = list(str(key) for key in feature_keys)
+    if use_prefix_sequence_training:
+        if use_path_signature and PATH_SIGNATURE_FEATURE_KEY in resolved_keys:
+            resolved_keys.append(PREFIX_PATH_SIGNATURE_FEATURE_KEY)
+        if use_delta_signature and DELTA_SIGNATURE_FEATURE_KEY in resolved_keys:
+            resolved_keys.append(PREFIX_DELTA_SIGNATURE_FEATURE_KEY)
+    return tuple(dict.fromkeys(resolved_keys))
+
+
 def augment_dataset_metadata_with_signature_cache(
     *,
     info: dict,
@@ -134,13 +366,59 @@ def augment_dataset_metadata_with_signature_cache(
     return info, stats
 
 
-def ensure_streaming_act_importable(repo_root: Path) -> None:
-    streaming_act_src = repo_root / "main/policy/lerobot_policy_streaming_act/src"
+def get_signature_cache_only_feature_keys(info: dict | None) -> set[str]:
+    """Return feature keys whose payload lives in `.signature_cache`, not parquet.
+
+    Older datasets record `storage=signature_cache` only in top-level metadata
+    like `info["path_signature"]`, while newer metadata may also attach storage
+    directly on the feature spec. We support both layouts here.
+    """
+    if not isinstance(info, dict):
+        return set()
+
+    keys: set[str] = set()
+    features = info.get("features", {})
+    if isinstance(features, dict):
+        for key, feature_spec in features.items():
+            if (
+                isinstance(feature_spec, dict)
+                and str(feature_spec.get("storage", "")).lower() == "signature_cache"
+            ):
+                keys.add(str(key))
+
+    for metadata_key in ("path_signature", "delta_signature"):
+        metadata = info.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        if str(metadata.get("storage", "")).lower() != "signature_cache":
+            continue
+        feature_key = metadata.get("key")
+        if feature_key:
+            keys.add(str(feature_key))
+
+    return keys
+
+
+def ensure_streaming_act_importable(project_root: Path) -> None:
+    streaming_act_src = (
+        project_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    )
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
         )
     sys.path.insert(0, str(streaming_act_src))
+
+
+def ensure_prism_diffusion_importable(project_root: Path) -> None:
+    prism_diffusion_src = (
+        project_root / "policy" / "lerobot_policy_prism_diffusion" / "src"
+    )
+    if not prism_diffusion_src.exists():
+        raise FileNotFoundError(
+            f"PRISM Diffusion package source not found: {prism_diffusion_src}"
+        )
+    sys.path.insert(0, str(prism_diffusion_src))
 
 
 def teardown_wandb_safely(exit_code: int) -> None:
@@ -153,6 +431,27 @@ def teardown_wandb_safely(exit_code: int) -> None:
         wandb.teardown(exit_code=exit_code)
     except BaseException as exc:
         print(f"[WARN] wandb teardown failed during shutdown: {exc}")
+
+
+def ensure_writable_hf_cache_env(project_root: Path) -> None:
+    cache_root = (project_root / ".cache" / "huggingface").resolve()
+    hf_home = cache_root / "home"
+    hf_datasets_cache = cache_root / "datasets"
+    xdg_cache_home = cache_root / "xdg"
+    torch_home = cache_root / "torch"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    hf_datasets_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache_home.mkdir(parents=True, exist_ok=True)
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(hf_datasets_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache_home))
+    if "TORCH_HOME" not in os.environ:
+        cached_torch_home = Path.home() / ".cache" / "torch"
+        if (cached_torch_home / "hub" / "checkpoints").exists():
+            os.environ["TORCH_HOME"] = str(cached_torch_home)
+        else:
+            os.environ["TORCH_HOME"] = str(torch_home)
 
 
 def configure_torch_sharing_strategy(strategy: str | None) -> str | None:
@@ -238,6 +537,50 @@ def resolve_accelerator_mixed_precision(
         f"[WARN] AMP is not configured for device={device_type!r}. Falling back to fp32."
     )
     return "no"
+
+
+def _read_distributed_env_int(
+    *env_names: str,
+    default: int,
+) -> int:
+    for env_name in env_names:
+        raw_value = os.environ.get(env_name)
+        if raw_value is None or not str(raw_value).strip():
+            continue
+        try:
+            return int(raw_value)
+        except ValueError:
+            print(
+                f"[WARN] Ignoring invalid distributed env var {env_name}={raw_value!r}."
+            )
+    return int(default)
+
+
+def resolve_distributed_world_size_from_env() -> int:
+    return max(1, _read_distributed_env_int("WORLD_SIZE", default=1))
+
+
+def resolve_distributed_process_index_from_env() -> int:
+    return max(
+        0,
+        _read_distributed_env_int(
+            "RANK",
+            "ACCELERATE_PROCESS_INDEX",
+            default=0,
+        ),
+    )
+
+
+def is_distributed_main_process_from_env() -> bool:
+    return resolve_distributed_process_index_from_env() == 0
+
+
+def resolve_train_run_stamp(now: dt.datetime | None = None) -> str:
+    shared_run_stamp = os.environ.get("CORL_TRAIN_RUN_STAMP")
+    if shared_run_stamp:
+        return str(shared_run_stamp)
+    moment = dt.datetime.now() if now is None else now
+    return moment.strftime("%Y%m%d_%H%M%S")
 
 
 def install_torch_dataloader_patch(
@@ -743,16 +1086,29 @@ def install_lerobot_dataset_load_patch() -> None:
 
     def load_hf_dataset_with_timing(self):
         load_start_s = time.perf_counter()
-        cached_feature_keys = set(signature_cache_feature_keys_for_dataset(self.root))
+        runtime_cached_feature_keys = set(
+            signature_cache_feature_keys_for_dataset(self.root)
+        )
+        metadata_cached_feature_keys = get_signature_cache_only_feature_keys(
+            getattr(self.meta, "info", None)
+        )
+        cached_feature_keys = (
+            runtime_cached_feature_keys | metadata_cached_feature_keys
+        )
         load_feature_specs = {
             key: feature_spec
             for key, feature_spec in self.features.items()
             if key not in cached_feature_keys
         }
-        if cached_feature_keys:
+        if metadata_cached_feature_keys:
+            print(
+                "[INFO] dataset.load_hf_dataset: excluding signature-cache-only "
+                f"features from parquet load: {sorted(metadata_cached_feature_keys)}"
+            )
+        if runtime_cached_feature_keys:
             print(
                 "[INFO] signature_cache: excluding cached parquet columns from HF load: "
-                f"{sorted(cached_feature_keys)}"
+                f"{sorted(runtime_cached_feature_keys)}"
             )
         hf_transform = build_hf_transform_to_torch(load_feature_specs)
         parquet_paths = sorted((self.root / "data").glob("*/*.parquet"))
@@ -932,34 +1288,7 @@ def install_lerobot_dataset_load_patch() -> None:
     )
     LeRobotDataset._query_videos = query_videos_with_timestamp_layout_detection
     LeRobotDataset._query_hf_dataset = query_hf_dataset_with_compact_relative_index
-    LeRobotDataset._custom_dataset_load_patch_installed = True
-
-
-def resolve_use_imagenet_stats(
-    dataset_root: Path,
-    use_imagenet_stats: bool,
-) -> bool:
-    if not use_imagenet_stats:
-        return False
-
-    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
-    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
-
-    camera_keys = [
-        key
-        for key, spec in info.get("features", {}).items()
-        if isinstance(spec, dict) and spec.get("dtype") in ("image", "video")
-    ]
-    missing_camera_stats = [key for key in camera_keys if key not in stats]
-    if missing_camera_stats:
-        print(
-            "[WARN] meta/stats.json is missing camera stats keys required by "
-            "LeRobot's ImageNet-stats override:\n"
-            + "\n".join(f"  - {key}" for key in missing_camera_stats)
-            + "\n[WARN] Auto-switching to --disable-imagenet-stats behavior."
-        )
-        return False
-    return True
+    LeRobotDataset._custom_dataset_load_patch_installed = True # pyright: ignore[reportAttributeAccessIssue]
 
 
 def summarize_visual_storage_modes(dataset_root: Path) -> dict[str, int]:
@@ -1057,33 +1386,6 @@ def resolve_history_length(dataset_root: Path, history_length: int) -> int:
     )
 
 
-def validate_first_frame_anchor_dataset(
-    dataset_root: Path, use_first_frame_anchor: bool
-) -> None:
-    if not use_first_frame_anchor:
-        return
-
-    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
-    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
-    anchor_spec = info.get("features", {}).get(FIRST_FRAME_ANCHOR_KEY)
-    if anchor_spec is None:
-        raise KeyError(
-            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' not found in {dataset_root / 'meta/info.json'}. "
-            "Regenerate the dataset with "
-            "`main/scripts/collect_imitation_dataset.py --env braidedhub --enable-first-frame-anchor`."
-        )
-    if anchor_spec.get("dtype") not in {"image", "video"}:
-        raise ValueError(
-            f"Dataset feature '{FIRST_FRAME_ANCHOR_KEY}' must be stored as image/video, "
-            f"got dtype={anchor_spec.get('dtype')!r}."
-        )
-    if FIRST_FRAME_ANCHOR_KEY not in stats:
-        raise KeyError(
-            f"Dataset stats for '{FIRST_FRAME_ANCHOR_KEY}' are missing from {dataset_root / 'meta/stats.json'}. "
-            "Regenerate the dataset so the anchor feature participates in normalization."
-        )
-
-
 def validate_delta_signature_dataset(
     dataset_root: Path,
     *,
@@ -1127,6 +1429,265 @@ def validate_delta_signature_dataset(
         )
 
 
+def validate_prefix_sequence_support(
+    *,
+    policy_name: str,
+    use_prefix_sequence_training: bool,
+    context: str,
+) -> None:
+    if not use_prefix_sequence_training:
+        return
+    if policy_name not in {"streaming_act", "prism_diffusion"}:
+        raise NotImplementedError(
+            "Prefix-sequence training is currently implemented only for "
+            "`streaming_act` and `prism_diffusion`. "
+            f"Got policy={policy_name!r} during {context}."
+        )
+
+
+def validate_prefix_sequence_dataset(
+    dataset_root: Path,
+    *,
+    dataset_repo_id: str,
+    signature_cache_root: Path | None,
+    use_prefix_sequence_training: bool,
+    use_imagenet_stats: bool,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+) -> None:
+    if not use_prefix_sequence_training:
+        return
+
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    stats = json.loads((dataset_root / "meta/stats.json").read_text(encoding="utf-8"))
+    cache_metadata = load_signature_cache_metadata(
+        dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        cache_root=signature_cache_root,
+    )
+    info, stats = augment_dataset_metadata_with_signature_cache(
+        info=info,
+        stats=stats,
+        cache_metadata=cache_metadata,
+        feature_keys=tuple(
+            key
+            for key, enabled in (
+                ("observation.path_signature", bool(use_path_signature)),
+                ("observation.delta_signature", bool(use_delta_signature)),
+            )
+            if enabled
+        ),
+    )
+    features = info.get("features", {})
+
+    state_spec = features.get("observation.state")
+    if state_spec is None:
+        raise KeyError(
+            "Prefix-sequence mode requires dataset feature `observation.state`."
+        )
+
+    camera_keys = [
+        key
+        for key, spec in features.items()
+        if isinstance(spec, dict)
+        and spec.get("dtype") in {"image", "video"}
+        and key != "observation.anchor_image"
+        and not str(key).startswith("observation.prefix_images.")
+    ]
+    if not camera_keys:
+        raise KeyError(
+            "Prefix-sequence mode requires at least one regular observation image feature."
+        )
+    missing_camera_stats = [key for key in camera_keys if key not in stats]
+    if missing_camera_stats:
+        if use_imagenet_stats:
+            raise KeyError(
+                "Prefix-sequence mode could not apply ImageNet camera stats because "
+                f"meta/stats.json is missing {missing_camera_stats}."
+            )
+        print(
+            "[WARN] Prefix-sequence mode found observation cameras without stats in "
+            f"{dataset_root / 'meta/stats.json'}:\n"
+            + "\n".join(f"  - {key}" for key in missing_camera_stats)
+            + "\n[WARN] Current and prefix image features will use identity "
+            "normalization for those keys."
+        )
+
+    if "observation.state" not in stats:
+        raise KeyError(
+            "Prefix-sequence mode requires `observation.state` stats in meta/stats.json."
+        )
+
+    if use_path_signature:
+        sig_key = "observation.path_signature"
+        if sig_key not in features:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset feature `{sig_key}`. "
+                "Regenerate the dataset with path-signature export enabled."
+            )
+        if sig_key not in stats:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset stats for `{sig_key}`."
+            )
+    if use_delta_signature:
+        delta_sig_key = "observation.delta_signature"
+        if delta_sig_key not in features:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset feature `{delta_sig_key}` "
+                "when delta signatures are enabled."
+            )
+        if delta_sig_key not in stats:
+            raise KeyError(
+                f"Prefix-sequence mode requires dataset stats for `{delta_sig_key}`."
+            )
+
+
+def validate_visual_prefix_memory_support(
+    *,
+    use_visual_prefix_memory: bool,
+    use_prefix_sequence_training: bool,
+) -> None:
+    if not use_visual_prefix_memory:
+        return
+    if not use_prefix_sequence_training:
+        raise ValueError(
+            "`--enable-visual-prefix-memory` requires "
+            "`--enable-prefix-sequence-training`."
+        )
+
+
+def build_policy_feature_overrides(
+    dataset_root: Path,
+    *,
+    dataset_repo_id: str,
+    signature_cache_root: Path | None,
+    use_prefix_sequence_training: bool,
+    prefix_train_max_steps: int,
+    use_path_signature: bool,
+    use_delta_signature: bool,
+):
+    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
+    cache_metadata = load_signature_cache_metadata(
+        dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        cache_root=signature_cache_root,
+    )
+    info, _stats = augment_dataset_metadata_with_signature_cache(
+        info=info,
+        stats={},
+        cache_metadata=cache_metadata,
+        feature_keys=tuple(
+            key
+            for key, enabled in (
+                ("observation.path_signature", bool(use_path_signature)),
+                ("observation.delta_signature", bool(use_delta_signature)),
+            )
+            if enabled
+        ),
+    )
+
+    from lerobot.configs.types import FeatureType
+    from lerobot.datasets.utils import dataset_to_policy_features
+    from lerobot_policy_streaming_act.prefix_sequence import (
+        build_prefix_sequence_input_features,
+    )
+
+    dataset_features = dataset_to_policy_features(info.get("features", {}))
+    output_features = {
+        key: feature
+        for key, feature in dataset_features.items()
+        if feature.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: feature
+        for key, feature in dataset_features.items()
+        if key not in output_features
+    }
+    if use_prefix_sequence_training:
+        input_features = build_prefix_sequence_input_features(
+            base_input_features=input_features,
+            prefix_train_max_steps=prefix_train_max_steps,
+            use_path_signature=use_path_signature,
+            use_delta_signature=use_delta_signature,
+        )
+    return input_features, output_features
+
+
+def install_prefix_sequence_dataset_patch() -> None:
+    import lerobot.datasets.factory as dataset_factory
+    import lerobot.scripts.lerobot_train as lerobot_train_module
+
+    try:
+        from lerobot_policy_streaming_act.prefix_image_cache import (
+            get_prefix_image_cache_reader_for_dataset,
+        )
+    except ModuleNotFoundError:
+
+        def get_prefix_image_cache_reader_for_dataset(_dataset_root: Path):
+            return None
+
+    if getattr(lerobot_train_module, "_prefix_sequence_patch_installed", False):
+        return
+
+    original_make_dataset = dataset_factory.make_dataset
+
+    def make_dataset_with_prefix(cfg):
+        dataset_load_start_s = time.perf_counter()
+        print(
+            "[INFO] Building local dataset view. Large parquet/video datasets "
+            "can take several minutes before training starts."
+        )
+        dataset = original_make_dataset(cfg)
+        dataset_load_elapsed_s = time.perf_counter() - dataset_load_start_s
+        print(
+            "[INFO] Dataset ready in "
+            f"{dataset_load_elapsed_s:.1f}s "
+            f"({dataset.num_episodes} episodes, {dataset.num_frames} frames)."
+        )
+        policy_cfg = cfg.policy
+        if not bool(getattr(policy_cfg, "use_prefix_sequence_training", False)):
+            return dataset
+        policy_name = getattr(policy_cfg, "type", None)
+        if policy_name == "streaming_act":
+            from lerobot_policy_streaming_act.prefix_sequence import (
+                PrefixSequenceDataset,
+            )
+
+            wrapper_cls = PrefixSequenceDataset
+        elif policy_name == "prism_diffusion":
+            from lerobot_policy_prism_diffusion.prefix_dataset import (
+                PrismDiffusionPrefixDataset,
+            )
+
+            wrapper_cls = PrismDiffusionPrefixDataset
+        else:
+            return dataset
+        if isinstance(dataset, wrapper_cls):
+            return dataset
+        prefix_image_cache_reader = get_prefix_image_cache_reader_for_dataset(
+            Path(dataset.root)
+        )
+        if prefix_image_cache_reader is not None:
+            print(
+                "[INFO] prefix_image_cache: attached "
+                f"(keys={list(prefix_image_cache_reader.camera_keys)}, "
+                f"mode={prefix_image_cache_reader.mode})"
+            )
+        return wrapper_cls(
+            dataset,
+            prefix_train_max_steps=int(policy_cfg.prefix_train_max_steps),
+            prefix_frame_stride=int(policy_cfg.prefix_frame_stride),
+            prefix_pad_value=float(policy_cfg.prefix_pad_value),
+            use_path_signature=bool(getattr(policy_cfg, "use_path_signature", False)),
+            use_delta_signature=bool(getattr(policy_cfg, "use_delta_signature", False)),
+            prefix_image_cache_reader=prefix_image_cache_reader,
+        )
+
+    dataset_factory.make_dataset = make_dataset_with_prefix
+    lerobot_train_module.make_dataset = make_dataset_with_prefix
+    lerobot_train_module._prefix_sequence_patch_installed = True
+
+
 def parquet_has_columns(dataset_root: Path, required_keys: list[str]) -> bool:
     if not required_keys:
         return True
@@ -1147,14 +1708,7 @@ def parquet_has_columns(dataset_root: Path, required_keys: list[str]) -> bool:
 
 
 def default_train_output_root(policy_name: str) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return (
-        repo_root
-        / "main"
-        / "outputs"
-        / "train"
-        / default_policy_series_name(policy_name)
-    )
+    return PROJECT_ROOT / "outputs" / "train" / default_policy_series_name(policy_name)
 
 
 def default_policy_series_name(policy_name: str) -> str:
@@ -1176,13 +1730,10 @@ def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
         return None
     if raw.startswith("./"):
         raw = raw[2:]
-    for prefix in ("main/data/", "data/"):
+    for prefix in ("data/",):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/main/data/"
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
 
     parts = [
         normalize_output_path_part(part)
@@ -1199,12 +1750,154 @@ def resolve_default_train_output_root(
     policy_name: str,
     dataset_selector: str | None,
 ) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    base = repo_root / "main" / "outputs" / "train"
+    base = PROJECT_ROOT / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
     return default_train_output_root(policy_name)
+
+
+def _resolve_train_output_root_candidates(raw: Path) -> list[Path]:
+    candidates: list[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend([Path.cwd() / raw, PROJECT_ROOT / raw])
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        ordered.append(resolved)
+    return ordered
+
+
+def iter_training_run_dirs(train_output_root: Path) -> list[Path]:
+    run_dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    for resolved_root in _resolve_train_output_root_candidates(
+        train_output_root.expanduser()
+    ):
+        if not resolved_root.is_dir():
+            continue
+        candidates = [
+            path
+            for path in resolved_root.iterdir()
+            if path.is_dir()
+        ]
+        candidates.sort(
+            key=lambda path: (path.stat().st_mtime, path.name),
+            reverse=True,
+        )
+        for candidate in candidates:
+            resolved = candidate.resolve(strict=False)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            run_dirs.append(resolved)
+
+    return run_dirs
+
+
+def iter_resume_checkpoint_dirs(run_dir: Path) -> list[Path]:
+    checkpoints_dir = run_dir / CHECKPOINTS_DIRNAME
+    if not checkpoints_dir.is_dir():
+        return []
+
+    candidates: list[Path] = []
+    last_dir = checkpoints_dir / LAST_CHECKPOINT_LINK_NAME
+    if last_dir.is_dir():
+        candidates.append(last_dir.resolve(strict=False))
+
+    numbered_dirs = [
+        path
+        for path in checkpoints_dir.iterdir()
+        if path.is_dir() and path.name != LAST_CHECKPOINT_LINK_NAME
+    ]
+    numbered_dirs.sort(
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    candidates.extend(path.resolve(strict=False) for path in numbered_dirs)
+
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def is_resumable_checkpoint_dir(checkpoint_dir: Path) -> bool:
+    pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIRNAME
+    training_state_dir = checkpoint_dir / TRAINING_STATE_DIRNAME
+    return (
+        pretrained_model_dir.is_dir()
+        and (pretrained_model_dir / TRAIN_CONFIG_FILENAME).is_file()
+        and training_state_dir.is_dir()
+        and (training_state_dir / TRAINING_STEP_FILENAME).is_file()
+    )
+
+
+def resolve_resume_run_state(train_output_root: Path) -> ResumeRunState:
+    run_dirs = iter_training_run_dirs(train_output_root)
+    if not run_dirs:
+        raise FileNotFoundError(
+            "Resume requested, but no prior training runs were found under "
+            f"{train_output_root}."
+        )
+
+    for run_dir in run_dirs:
+        for checkpoint_dir in iter_resume_checkpoint_dirs(run_dir):
+            if not is_resumable_checkpoint_dir(checkpoint_dir):
+                continue
+            pretrained_model_dir = checkpoint_dir / PRETRAINED_MODEL_DIRNAME
+            split_path = run_dir / DATASET_SPLIT_FILENAME
+            return ResumeRunState(
+                run_dir=run_dir,
+                checkpoint_dir=checkpoint_dir,
+                pretrained_model_dir=pretrained_model_dir,
+                train_config_path=pretrained_model_dir / TRAIN_CONFIG_FILENAME,
+                split_path=split_path if split_path.is_file() else None,
+            )
+
+    raise FileNotFoundError(
+        "Resume requested, but no resumable checkpoint was found under "
+        f"{train_output_root}."
+    )
+
+
+def load_resume_dataset_split(
+    *,
+    resume_run_state: ResumeRunState,
+    source_dataset_root: Path,
+    dataset_repo_id: str,
+) -> DatasetSplitSpec | None:
+    if resume_run_state.split_path is None:
+        return None
+
+    split_spec = load_dataset_split(resume_run_state.split_path)
+    saved_dataset_root = Path(split_spec.dataset_root).expanduser().resolve()
+    expected_dataset_root = source_dataset_root.resolve()
+
+    if saved_dataset_root != expected_dataset_root:
+        raise ValueError(
+            "The latest resumable run was created from a different dataset root. "
+            f"saved={saved_dataset_root}, expected={expected_dataset_root}."
+        )
+    if str(split_spec.dataset_repo_id) != str(dataset_repo_id):
+        raise ValueError(
+            "The latest resumable run was created from a different dataset_repo_id. "
+            f"saved={split_spec.dataset_repo_id!r}, expected={dataset_repo_id!r}."
+        )
+    return split_spec
 
 
 def default_wandb_project_name(
@@ -1274,7 +1967,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -1288,13 +1981,13 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train LeRobot ACT, Diffusion, or Streaming ACT on a local "
-            "LeRobot dataset."
+            "Train LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "on a local LeRobot dataset."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -1303,11 +1996,11 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         required=True,
         default=known_args.dataset,
         help=(
-            "Dataset ID or path under main/data. This value is also used to resolve "
+            "Dataset ID or path under data. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
             "Examples: zeno-ai/day3_5_Exp1_processed, "
             "robocasa/composite/ArrangeBreadBasket, "
-            "./main/data/zeno-ai/day3_5_Exp1."
+            "./data/zeno-ai/day3_5_Exp1."
         ),
     )
     parser.add_argument(
@@ -1346,7 +2039,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "--test-ratio",
         type=float,
         default=defaults.get("test_ratio", 0.2),
-        help="Held-out test-set ratio computed over episodes.",
+        help=(
+            "Held-out test-set ratio computed over episodes. "
+            "Use 0 to place every episode in the training split."
+        ),
     )
     parser.add_argument(
         "--split-seed",
@@ -1380,6 +2076,23 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         ),
         help="Root folder for training outputs.",
     )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help=(
+            "Resume from the newest resumable checkpoint under --output-root. "
+            "The latest run directory is reused instead of creating a new timestamped run."
+        ),
+    )
+    resume_group.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Disable resume and start a fresh run.",
+    )
+    parser.set_defaults(resume=bool(defaults.get("resume", False)))
     parser.add_argument(
         "--job-name",
         type=str,
@@ -1501,7 +2214,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning."
         ),
     )
-    if known_args.policy == "diffusion":
+    if known_args.policy in {"diffusion", "prism_diffusion"}:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
@@ -1537,40 +2250,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("chunk_size", 5),
             help="ACT-style action chunk size.",
         )
-    anchor_group = parser.add_mutually_exclusive_group()
-    anchor_group.add_argument(
-        "--enable-first-frame-anchor",
-        dest="use_first_frame_anchor",
-        action="store_true",
-        help="Enable an episode-constant first-frame anchor token from observation.anchor_image.",
-    )
-    anchor_group.add_argument(
-        "--disable-first-frame-anchor",
-        dest="use_first_frame_anchor",
-        action="store_false",
-        help="Disable the first-frame anchor token input.",
-    )
-    parser.set_defaults(
-        use_first_frame_anchor=defaults.get("use_first_frame_anchor", False),
-    )
-
-    imagenet_group = parser.add_mutually_exclusive_group()
-    imagenet_group.add_argument(
-        "--enable-imagenet-stats",
-        dest="use_imagenet_stats",
-        action="store_true",
-        help="Replace visual dataset stats with ImageNet stats when available.",
-    )
-    imagenet_group.add_argument(
-        "--disable-imagenet-stats",
-        dest="use_imagenet_stats",
-        action="store_false",
-        help="Use dataset-provided visual stats instead of ImageNet stats.",
-    )
-    parser.set_defaults(
-        use_imagenet_stats=defaults.get("use_imagenet_stats", True),
-    )
-
     parser.add_argument(
         "--wandb-project",
         type=str,
@@ -1684,6 +2363,224 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         parser.set_defaults(
             use_delta_signature=defaults.get("use_delta_signature", False),
         )
+        prefix_group = parser.add_mutually_exclusive_group()
+        prefix_group.add_argument(
+            "--enable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_true",
+            help=(
+                "Enable prefix-sequence training inputs derived from the full episode "
+                "prefix up to the current step."
+            ),
+        )
+        prefix_group.add_argument(
+            "--disable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_false",
+            help="Disable prefix-sequence training inputs.",
+        )
+        parser.set_defaults(
+            use_prefix_sequence_training=defaults.get("use_prefix_sequence_training", False),
+        )
+        parser.add_argument(
+            "--prefix-train-max-steps",
+            type=int,
+            default=defaults.get("prefix_train_max_steps", 32),
+            help=(
+                "Maximum number of prefix elements kept per training sample. "
+                "Prefix tensors are right padded to this length."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-frame-stride",
+            type=int,
+            default=defaults.get("prefix_frame_stride", 1),
+            help=(
+                "Stride used when subsampling the episode prefix. "
+                "The current step is always kept as the last valid element."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-pad-value",
+            type=float,
+            default=defaults.get("prefix_pad_value", 0.0),
+            help="Padding value used for prefix state/signature tensors.",
+        )
+        visual_prefix_memory_group = parser.add_mutually_exclusive_group()
+        visual_prefix_memory_group.add_argument(
+            "--enable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_true",
+            help=(
+                "Enable fixed-budget historical memory tokens built from prefix "
+                "images and prefix states."
+            ),
+        )
+        visual_prefix_memory_group.add_argument(
+            "--disable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_false",
+            help="Disable the visual prefix memory token.",
+        )
+        parser.set_defaults(
+            use_visual_prefix_memory=defaults.get("use_visual_prefix_memory", False),
+        )
+        parser.add_argument(
+            "--num-memory-slots",
+            type=int,
+            default=defaults.get("num_memory_slots", 1),
+            help=(
+                "Number of legacy GRU-style visual prefix memory slots. "
+                "Ignored when --enable-signature-indexed-slot-memory is used."
+            ),
+        )
+        signature_indexed_slot_memory_group = parser.add_mutually_exclusive_group()
+        signature_indexed_slot_memory_group.add_argument(
+            "--enable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_true",
+            help=(
+                "Replace the legacy GRU-style visual prefix memory updater with "
+                "a Signature-Indexed Slot Memory (SISM / PRISM core) updater."
+            ),
+        )
+        signature_indexed_slot_memory_group.add_argument(
+            "--disable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_false",
+            help="Disable the SISM updater and use the legacy GRU-style updater instead.",
+        )
+        parser.set_defaults(
+            use_signature_indexed_slot_memory=defaults.get(
+                "use_signature_indexed_slot_memory", False
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-num-slots",
+            type=int,
+            default=defaults.get("slot_memory_num_slots", 4),
+            help=(
+                "Number of SISM slots when --enable-signature-indexed-slot-memory "
+                "is active."
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-routing-hidden-dim",
+            type=int,
+            default=defaults.get("slot_memory_routing_hidden_dim", 512),
+            help="Hidden dimension used by the SISM routing network.",
+        )
+        slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
+        slot_memory_delta_routing_group.add_argument(
+            "--enable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_true",
+            help="Include delta signatures in the explicit SISM routing signal.",
+        )
+        slot_memory_delta_routing_group.add_argument(
+            "--disable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_false",
+            help="Route SISM slots using path signatures only.",
+        )
+        parser.set_defaults(
+            slot_memory_use_delta_routing=defaults.get(
+                "slot_memory_use_delta_routing", False
+            ),
+        )
+        slot_memory_softmax_group = parser.add_mutually_exclusive_group()
+        slot_memory_softmax_group.add_argument(
+            "--enable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_true",
+            help="Use softmax routing weights across SISM slots.",
+        )
+        slot_memory_softmax_group.add_argument(
+            "--disable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_false",
+            help="Use independent sigmoid routing strengths for SISM slots.",
+        )
+        parser.set_defaults(
+            slot_memory_use_softmax_routing=defaults.get(
+                "slot_memory_use_softmax_routing", True
+            ),
+        )
+        slot_memory_readout_group = parser.add_mutually_exclusive_group()
+        slot_memory_readout_group.add_argument(
+            "--enable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_true",
+            help=(
+                "Use an attention readout over SISM slots to produce the pooled "
+                "memory context for encoder FiLM."
+            ),
+        )
+        slot_memory_readout_group.add_argument(
+            "--disable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_false",
+            help="Use mean pooling over SISM slots for encoder FiLM context.",
+        )
+        parser.set_defaults(
+            slot_memory_use_readout_pooling=defaults.get(
+                "slot_memory_use_readout_pooling", True
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-balance-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_balance_loss_coef", 0.0),
+            help="Optional routing-balance loss coefficient for SISM.",
+        )
+        parser.add_argument(
+            "--slot-memory-consistency-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_consistency_loss_coef", 0.0),
+            help="Optional readout/write consistency loss coefficient for SISM.",
+        )
+        signature_conditioned_memory_group = parser.add_mutually_exclusive_group()
+        signature_conditioned_memory_group.add_argument(
+            "--enable-signature-conditioned-visual-prefix-memory",
+            dest="use_signature_conditioned_visual_prefix_memory",
+            action="store_true",
+            help=(
+                "Condition visual prefix memory updates on path signatures and, "
+                "when enabled, delta signatures."
+            ),
+        )
+        signature_conditioned_memory_group.add_argument(
+            "--disable-signature-conditioned-visual-prefix-memory",
+            dest="use_signature_conditioned_visual_prefix_memory",
+            action="store_false",
+            help="Disable signature-conditioned visual prefix memory updates.",
+        )
+        parser.set_defaults(
+            use_signature_conditioned_visual_prefix_memory=defaults.get(
+                "use_signature_conditioned_visual_prefix_memory", False
+            ),
+        )
+        memory_conditioned_encoder_film_group = parser.add_mutually_exclusive_group()
+        memory_conditioned_encoder_film_group.add_argument(
+            "--enable-memory-conditioned-encoder-film",
+            dest="use_memory_conditioned_encoder_film",
+            action="store_true",
+            help=(
+                "FiLM-modulate the current-step encoder tokens using the pooled "
+                "visual prefix memory context."
+            ),
+        )
+        memory_conditioned_encoder_film_group.add_argument(
+            "--disable-memory-conditioned-encoder-film",
+            dest="use_memory_conditioned_encoder_film",
+            action="store_false",
+            help="Disable memory-conditioned encoder FiLM.",
+        )
+        parser.set_defaults(
+            use_memory_conditioned_encoder_film=defaults.get(
+                "use_memory_conditioned_encoder_film", False
+            ),
+        )
         parser.add_argument(
             "--signature-cache-mode",
             choices=["off", "memmap", "ram"],
@@ -1718,9 +2615,356 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "folder under the dataset root."
             ),
         )
+        parser.add_argument(
+            "--prefix-image-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("prefix_image_cache_mode", "off"),
+            help=(
+                "Optional raw prefix-image cache. `memmap` reads contiguous cached "
+                "frames from disk, `ram` preloads that cache once, and `off` falls "
+                "back to the dataset video decode path."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-image-cache-dtype",
+            choices=["uint8", "float16", "float32"],
+            default=defaults.get("prefix_image_cache_dtype", "uint8"),
+            help=(
+                "Storage dtype used by the optional raw prefix-image cache. "
+                "`uint8` minimizes disk and RAM footprint."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-prefix-image-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_prefix_image_cache", False)),
+            help="Force a prefix-image cache rebuild before training starts.",
+        )
+        parser.add_argument(
+            "--prefix-image-cache-root",
+            type=Path,
+            default=defaults.get("prefix_image_cache_root"),
+            help=(
+                "Optional prefix-image cache directory override. Defaults to a "
+                "hidden cache folder under the dataset root."
+            ),
+        )
+    elif known_args.policy == "prism_diffusion":
+        path_signature_group = parser.add_mutually_exclusive_group()
+        path_signature_group.add_argument(
+            "--enable-path-signature",
+            dest="use_path_signature",
+            action="store_true",
+            help=(
+                "Record path-signature conditioning in the PRISM Diffusion "
+                "checkpoint config."
+            ),
+        )
+        path_signature_group.add_argument(
+            "--disable-path-signature",
+            dest="use_path_signature",
+            action="store_false",
+            help="Disable path-signature conditioning in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_path_signature=defaults.get("use_path_signature", False),
+        )
+        parser.add_argument(
+            "--history-length",
+            type=int,
+            default=defaults.get("history_length", 0),
+            help=(
+                "History window size recorded in PrismDiffusionConfig. "
+                "Set 0 to defer inference to the local policy package."
+            ),
+        )
+        parser.add_argument(
+            "--signature-dim",
+            type=int,
+            default=defaults.get("signature_dim", 0),
+            help=(
+                "Serialized signature feature dim for PRISM Diffusion. "
+                "Set 0 to defer inference to the local policy package."
+            ),
+        )
+        parser.add_argument(
+            "--signature-depth",
+            type=int,
+            default=defaults.get("signature_depth", 3),
+            help="Serialized signature truncation depth for PRISM Diffusion.",
+        )
+        parser.add_argument(
+            "--signature-hidden-dim",
+            type=int,
+            default=defaults.get("signature_hidden_dim", 512),
+            help="Serialized signature projection hidden dim for PRISM Diffusion.",
+        )
+        parser.add_argument(
+            "--signature-dropout",
+            type=float,
+            default=defaults.get("signature_dropout", 0.1),
+            help="Serialized signature projection dropout for PRISM Diffusion.",
+        )
+        delta_signature_group = parser.add_mutually_exclusive_group()
+        delta_signature_group.add_argument(
+            "--enable-delta-signature",
+            dest="use_delta_signature",
+            action="store_true",
+            help="Record delta-signature conditioning in PrismDiffusionConfig.",
+        )
+        delta_signature_group.add_argument(
+            "--disable-delta-signature",
+            dest="use_delta_signature",
+            action="store_false",
+            help="Disable delta-signature conditioning in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_delta_signature=defaults.get("use_delta_signature", False),
+        )
+        prefix_group = parser.add_mutually_exclusive_group()
+        prefix_group.add_argument(
+            "--enable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_true",
+            help="Record prefix-sequence training support in PrismDiffusionConfig.",
+        )
+        prefix_group.add_argument(
+            "--disable-prefix-sequence-training",
+            dest="use_prefix_sequence_training",
+            action="store_false",
+            help="Disable prefix-sequence training fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_prefix_sequence_training=defaults.get(
+                "use_prefix_sequence_training", False
+            ),
+        )
+        parser.add_argument(
+            "--prefix-train-max-steps",
+            type=int,
+            default=defaults.get("prefix_train_max_steps", 32),
+            help="Serialized prefix length budget for PRISM Diffusion configs.",
+        )
+        parser.add_argument(
+            "--prefix-frame-stride",
+            type=int,
+            default=defaults.get("prefix_frame_stride", 1),
+            help="Serialized prefix subsampling stride for PRISM Diffusion configs.",
+        )
+        parser.add_argument(
+            "--prefix-pad-value",
+            type=float,
+            default=defaults.get("prefix_pad_value", 0.0),
+            help="Serialized prefix padding value for PRISM Diffusion configs.",
+        )
+        parser.add_argument(
+            "--signature-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("signature_cache_mode", "off"),
+            help=(
+                "Fast path for path/delta signature loading in PRISM Diffusion. "
+                "`memmap` reads from a disk-backed contiguous cache, `ram` preloads "
+                "that cache once into shared memory, and `off` falls back to parquet "
+                "columns."
+            ),
+        )
+        parser.add_argument(
+            "--signature-cache-dtype",
+            choices=["float16", "float32"],
+            default=defaults.get("signature_cache_dtype", "float16"),
+            help=(
+                "Storage dtype used by the PRISM Diffusion signature cache. The "
+                "cache preserves runtime normalization semantics."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-signature-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_signature_cache", False)),
+            help="Force a signature cache rebuild before PRISM Diffusion training starts.",
+        )
+        parser.add_argument(
+            "--signature-cache-root",
+            type=Path,
+            default=defaults.get("signature_cache_root"),
+            help=(
+                "Optional signature cache directory override. Defaults to a hidden "
+                "cache folder under the dataset root."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-image-cache-mode",
+            choices=["off", "memmap", "ram"],
+            default=defaults.get("prefix_image_cache_mode", "off"),
+            help=(
+                "Optional raw prefix-image cache for PRISM Diffusion. `memmap` "
+                "reads contiguous cached frames from disk, `ram` preloads that "
+                "cache once, and `off` falls back to the dataset image/video path."
+            ),
+        )
+        parser.add_argument(
+            "--prefix-image-cache-dtype",
+            choices=["uint8", "float16", "float32"],
+            default=defaults.get("prefix_image_cache_dtype", "uint8"),
+            help=(
+                "Storage dtype used by the optional PRISM Diffusion prefix-image "
+                "cache. `uint8` minimizes disk and RAM footprint."
+            ),
+        )
+        parser.add_argument(
+            "--refresh-prefix-image-cache",
+            action="store_true",
+            default=bool(defaults.get("refresh_prefix_image_cache", False)),
+            help="Force a prefix-image cache rebuild before PRISM Diffusion training starts.",
+        )
+        parser.add_argument(
+            "--prefix-image-cache-root",
+            type=Path,
+            default=defaults.get("prefix_image_cache_root"),
+            help=(
+                "Optional prefix-image cache directory override. Defaults to a "
+                "hidden cache folder under the dataset root."
+            ),
+        )
+        visual_prefix_memory_group = parser.add_mutually_exclusive_group()
+        visual_prefix_memory_group.add_argument(
+            "--enable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_true",
+            help="Record visual prefix memory support in PrismDiffusionConfig.",
+        )
+        visual_prefix_memory_group.add_argument(
+            "--disable-visual-prefix-memory",
+            dest="use_visual_prefix_memory",
+            action="store_false",
+            help="Disable visual prefix memory fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_visual_prefix_memory=defaults.get("use_visual_prefix_memory", False),
+        )
+        signature_indexed_slot_memory_group = parser.add_mutually_exclusive_group()
+        signature_indexed_slot_memory_group.add_argument(
+            "--enable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_true",
+            help="Record Signature-Indexed Slot Memory support in PrismDiffusionConfig.",
+        )
+        signature_indexed_slot_memory_group.add_argument(
+            "--disable-signature-indexed-slot-memory",
+            dest="use_signature_indexed_slot_memory",
+            action="store_false",
+            help="Disable Signature-Indexed Slot Memory fields in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            use_signature_indexed_slot_memory=defaults.get(
+                "use_signature_indexed_slot_memory", False
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-num-slots",
+            type=int,
+            default=defaults.get("slot_memory_num_slots", 4),
+            help="Serialized number of PRISM slot-memory slots.",
+        )
+        parser.add_argument(
+            "--slot-memory-routing-hidden-dim",
+            type=int,
+            default=defaults.get("slot_memory_routing_hidden_dim", 512),
+            help="Serialized PRISM slot-routing hidden dim.",
+        )
+        slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
+        slot_memory_delta_routing_group.add_argument(
+            "--enable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_true",
+            help="Record delta-signature slot routing in PrismDiffusionConfig.",
+        )
+        slot_memory_delta_routing_group.add_argument(
+            "--disable-slot-memory-delta-routing",
+            dest="slot_memory_use_delta_routing",
+            action="store_false",
+            help="Disable delta-signature slot routing in PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_delta_routing=defaults.get(
+                "slot_memory_use_delta_routing", False
+            ),
+        )
+        slot_memory_softmax_group = parser.add_mutually_exclusive_group()
+        slot_memory_softmax_group.add_argument(
+            "--enable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_true",
+            help="Use softmax slot routing in serialized PRISM Diffusion configs.",
+        )
+        slot_memory_softmax_group.add_argument(
+            "--disable-slot-memory-softmax-routing",
+            dest="slot_memory_use_softmax_routing",
+            action="store_false",
+            help="Use sigmoid slot routing in serialized PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_softmax_routing=defaults.get(
+                "slot_memory_use_softmax_routing", True
+            ),
+        )
+        slot_memory_readout_group = parser.add_mutually_exclusive_group()
+        slot_memory_readout_group.add_argument(
+            "--enable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_true",
+            help="Use readout pooling in serialized PRISM Diffusion configs.",
+        )
+        slot_memory_readout_group.add_argument(
+            "--disable-slot-memory-readout-pooling",
+            dest="slot_memory_use_readout_pooling",
+            action="store_false",
+            help="Disable readout pooling in serialized PRISM Diffusion configs.",
+        )
+        parser.set_defaults(
+            slot_memory_use_readout_pooling=defaults.get(
+                "slot_memory_use_readout_pooling", True
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-balance-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_balance_loss_coef", 0.0),
+            help="Serialized PRISM slot-memory balance loss coefficient.",
+        )
+        parser.add_argument(
+            "--slot-memory-consistency-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_consistency_loss_coef", 0.0),
+            help="Serialized PRISM slot-memory consistency loss coefficient.",
+        )
+        parser.add_argument(
+            "--prism-adapter-hidden-dim",
+            type=int,
+            default=defaults.get("prism_adapter_hidden_dim", 512),
+            help="Serialized hidden dim for the PRISM adapter MLP.",
+        )
+        prism_adapter_zero_init_group = parser.add_mutually_exclusive_group()
+        prism_adapter_zero_init_group.add_argument(
+            "--enable-prism-adapter-zero-init",
+            dest="prism_adapter_zero_init",
+            action="store_true",
+            help="Zero-initialize the serialized PRISM adapter parameters.",
+        )
+        prism_adapter_zero_init_group.add_argument(
+            "--disable-prism-adapter-zero-init",
+            dest="prism_adapter_zero_init",
+            action="store_false",
+            help="Disable zero-init for serialized PRISM adapter parameters.",
+        )
+        parser.set_defaults(
+            prism_adapter_zero_init=defaults.get("prism_adapter_zero_init", True),
+        )
     parser.set_defaults(
         _policy_defaults_path=(None if defaults_path is None else str(defaults_path)),
         _policy_defaults_dataset_root=defaults.get("dataset_root"),
+        _policy_defaults_dataset_repo_id=defaults.get("dataset_repo_id"),
+        _policy_defaults_dataset_tasks=defaults.get("dataset_tasks"),
     )
     return parser
 
@@ -1736,15 +2980,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.signature_cache_root, Path
     ):
         args.signature_cache_root = Path(args.signature_cache_root)
+    if getattr(args, "prefix_image_cache_root", None) is not None and not isinstance(
+        args.prefix_image_cache_root, Path
+    ):
+        args.prefix_image_cache_root = Path(args.prefix_image_cache_root)
     return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    repo_root = Path(__file__).resolve().parents[2]
+    ensure_writable_hf_cache_env(PROJECT_ROOT)
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
+        ensure_streaming_act_importable(PROJECT_ROOT)
+    elif args.policy == "prism_diffusion":
+        ensure_prism_diffusion_importable(PROJECT_ROOT)
+        ensure_streaming_act_importable(PROJECT_ROOT)
 
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
@@ -1761,25 +3012,17 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
-    try:
-        source_dataset_root = resolve_dataset_root(
-            args.dataset,
-            local_data_root=args.local_data_root.resolve(),
-        )
-    except FileNotFoundError:
-        if not defaults_dataset_root:
-            raise
-        source_dataset_root = resolve_dataset_root(
-            defaults_dataset_root,
-            local_data_root=args.local_data_root.resolve(),
-        )
-    dataset_repo_id = (
-        str(args.dataset_repo_id)
-        if args.dataset_repo_id
-        else infer_dataset_repo_id(
-            source_dataset_root,
-            local_data_root=args.local_data_root.resolve(),
-        )
+    source_dataset_root = resolve_training_dataset_root(
+        dataset=args.dataset,
+        defaults_dataset_root=defaults_dataset_root,
+        local_data_root=args.local_data_root.resolve(),
+        exact_task_names=getattr(args, "_policy_defaults_dataset_tasks", None),
+    )
+    dataset_repo_id = resolve_effective_dataset_repo_id(
+        requested_repo_id=args.dataset_repo_id,
+        default_repo_id=getattr(args, "_policy_defaults_dataset_repo_id", None),
+        dataset_root=source_dataset_root,
+        local_data_root=args.local_data_root.resolve(),
     )
     dataset_root = ensure_lerobot_dataset_v30_compat(
         source_dataset_root,
@@ -1787,33 +3030,44 @@ def main(argv: list[str] | None = None) -> None:
         local_data_root=args.local_data_root.resolve(),
     )
     validate_dataset_root(dataset_root)
-    split_spec = build_dataset_split(
-        dataset_arg=args.dataset,
-        dataset_root=source_dataset_root,
-        dataset_repo_id=dataset_repo_id,
-        test_ratio=float(args.test_ratio),
-        split_seed=int(args.split_seed),
-        split_shuffle=bool(args.split_shuffle),
+    resume_run_state = (
+        resolve_resume_run_state(args.output_root) if bool(args.resume) else None
     )
-    use_first_frame_anchor = bool(args.use_first_frame_anchor)
-    validate_first_frame_anchor_dataset(
-        dataset_root=dataset_root,
-        use_first_frame_anchor=use_first_frame_anchor,
-    )
-    if args.policy != "streaming_act" and use_first_frame_anchor:
-        raise NotImplementedError(
-            "`--enable-first-frame-anchor` is only supported by the local "
-            "`streaming_act` implementation. Other current policies, including "
-            "`act` and `diffusion`, should be run without it."
+    split_spec = (
+        load_resume_dataset_split(
+            resume_run_state=resume_run_state,
+            source_dataset_root=source_dataset_root,
+            dataset_repo_id=dataset_repo_id,
         )
-    use_imagenet_stats = resolve_use_imagenet_stats(
-        dataset_root=dataset_root,
-        use_imagenet_stats=args.use_imagenet_stats,
+        if resume_run_state is not None
+        else None
     )
+    if split_spec is None:
+        split_spec = build_dataset_split(
+            dataset_arg=args.dataset,
+            dataset_root=source_dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            test_ratio=float(args.test_ratio),
+            split_seed=int(args.split_seed),
+            split_shuffle=bool(args.split_shuffle),
+        )
     visual_storage_modes = summarize_visual_storage_modes(dataset_root)
 
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+    PrismDiffusionConfig = None
+    if policy_supports_signature_features(args.policy):
+        from lerobot_policy_streaming_act.prefix_image_cache import (
+            PrefixImageCacheRuntimeConfig,
+            configure_prefix_image_cache_runtime,
+            prepare_prefix_image_cache_runtime,
+        )
+        from lerobot_policy_streaming_act.signature_cache import (
+            SignatureCacheRuntimeConfig,
+            configure_signature_cache_runtime,
+            prepare_signature_cache_runtime,
+        )
 
     if args.policy == "streaming_act":
         from lerobot_policy_streaming_act.configuration_streaming_act import (
@@ -1821,12 +3075,13 @@ def main(argv: list[str] | None = None) -> None:
             PATH_SIGNATURE_KEY,
             StreamingACTConfig,
         )
-        from lerobot_policy_streaming_act.signature_cache import (
-            SignatureCacheRuntimeConfig,
-            configure_signature_cache_runtime,
-            prepare_signature_cache_runtime,
+    elif args.policy == "prism_diffusion":
+        from lerobot_policy_prism_diffusion.configuration_diffusion import (
+            PrismDiffusionConfig,
         )
     else:
+        configure_prefix_image_cache_runtime = None
+        prepare_prefix_image_cache_runtime = None
         configure_signature_cache_runtime = None
         prepare_signature_cache_runtime = None
     install_torch_dataloader_patch(
@@ -1836,9 +3091,21 @@ def main(argv: list[str] | None = None) -> None:
     install_lerobot_dataset_load_patch()
     install_episode_aware_sampler_patch()
 
+    prism_use_path_signature = False
+    prism_use_delta_signature = False
+    prism_use_prefix_sequence_training = False
+    prism_use_visual_prefix_memory = False
+    prism_history_length = 0
+    prism_signature_dim = 0
+    prism_required_signature_parquet_keys: list[str] = []
+    required_signature_parquet_keys: list[str] = []
+
     if args.policy == "streaming_act":
         use_path_signature = args.use_path_signature
         use_delta_signature = bool(args.use_delta_signature)
+        use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
+        use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
+        use_imagenet_stats = False
         required_signature_parquet_keys = [
             key
             for key, enabled in (
@@ -1847,6 +3114,11 @@ def main(argv: list[str] | None = None) -> None:
             )
             if enabled
         ]
+        validate_prefix_sequence_support(
+            policy_name=args.policy,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            context="training",
+        )
         resolved_history_length = resolve_history_length(
             dataset_root=dataset_root,
             history_length=args.history_length,
@@ -1864,6 +3136,19 @@ def main(argv: list[str] | None = None) -> None:
             signature_cache_root=args.signature_cache_root,
             use_delta_signature=use_delta_signature,
         )
+        validate_prefix_sequence_dataset(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            use_imagenet_stats=use_imagenet_stats,
+            use_path_signature=use_path_signature,
+            use_delta_signature=use_delta_signature,
+        )
+        validate_visual_prefix_memory_support(
+            use_visual_prefix_memory=use_visual_prefix_memory,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+        )
         if (
             required_signature_parquet_keys
             and str(args.signature_cache_mode) == "off"
@@ -1874,14 +3159,93 @@ def main(argv: list[str] | None = None) -> None:
                 "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
                 "so the training loader materializes signatures from the dataset cache."
             )
-    else:
+    elif args.policy == "prism_diffusion":
         use_path_signature = False
         use_delta_signature = False
+        use_prefix_sequence_training = False
+        use_visual_prefix_memory = False
         resolved_history_length = 0
         signature_dim = 0
 
+        prism_use_path_signature = bool(args.use_path_signature)
+        prism_use_delta_signature = bool(args.use_delta_signature)
+        prism_use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
+        prism_use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
+        prism_required_signature_parquet_keys = [
+            key
+            for key, enabled in (
+                ("observation.path_signature", bool(prism_use_path_signature)),
+                ("observation.delta_signature", bool(prism_use_delta_signature)),
+            )
+            if enabled
+        ]
+        validate_prefix_sequence_support(
+            policy_name=args.policy,
+            use_prefix_sequence_training=prism_use_prefix_sequence_training,
+            context="training",
+        )
+        prism_history_length = (
+            resolve_history_length(
+                dataset_root=dataset_root,
+                history_length=args.history_length,
+            )
+            if prism_use_path_signature
+            else int(args.history_length)
+        )
+        prism_signature_dim = resolve_signature_dim(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_path_signature=prism_use_path_signature,
+            signature_dim=args.signature_dim,
+        )
+        validate_delta_signature_dataset(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_delta_signature=prism_use_delta_signature,
+        )
+        validate_prefix_sequence_dataset(
+            dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_prefix_sequence_training=prism_use_prefix_sequence_training,
+            use_imagenet_stats=False,
+            use_path_signature=prism_use_path_signature,
+            use_delta_signature=prism_use_delta_signature,
+        )
+        if (
+            prism_required_signature_parquet_keys
+            and str(args.signature_cache_mode) == "off"
+            and not parquet_has_columns(dataset_root, prism_required_signature_parquet_keys)
+        ):
+            raise ValueError(
+                "This dataset does not store the requested signature features as parquet columns. "
+                "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
+                "so the training loader materializes signatures from the dataset cache."
+            )
+    else:
+        use_path_signature = False
+        use_delta_signature = False
+        use_prefix_sequence_training = False
+        use_visual_prefix_memory = False
+        resolved_history_length = 0
+        signature_dim = 0
+
+    active_use_prefix_sequence_training = bool(
+        use_prefix_sequence_training
+        if args.policy == "streaming_act"
+        else prism_use_prefix_sequence_training
+    )
+    active_use_path_signature = bool(
+        use_path_signature if args.policy == "streaming_act" else prism_use_path_signature
+    )
+    active_use_delta_signature = bool(
+        use_delta_signature if args.policy == "streaming_act" else prism_use_delta_signature
+    )
+
     resolved_diffusion_drop_n_last_frames = None
-    if args.policy == "diffusion":
+    if args.policy in {"diffusion", "prism_diffusion"}:
         resolved_diffusion_drop_n_last_frames = resolve_diffusion_drop_n_last_frames(
             n_obs_steps=int(args.n_obs_steps),
             horizon=int(args.horizon),
@@ -1891,43 +3255,23 @@ def main(argv: list[str] | None = None) -> None:
 
     input_features_override = None
     output_features_override = None
-
-    run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = (args.output_root / run_stamp).resolve()
-    split_path = output_dir / "dataset_split.json"
-
-    wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
-    resolved_wandb_project = (
-        str(args.wandb_project)
-        if args.wandb_project
-        else default_wandb_project_name(
-            dataset_repo_id=dataset_repo_id,
+    if active_use_prefix_sequence_training:
+        install_prefix_sequence_dataset_patch()
+        input_features_override, output_features_override = build_policy_feature_overrides(
             dataset_root=dataset_root,
-        )
-    )
-    resolved_job_name = args.job_name
-    if wandb_enable:
-        resolved_job_name = (
-            args.wandb_run_name
-            if args.wandb_run_name
-            else f"{args.job_name}-s{args.seed}-{run_stamp}"
-        )
-
-    if (
-        wandb_enable
-        and args.wandb_mode == "online"
-        and "WANDB_API_KEY" not in os.environ
-    ):
-        print(
-            "[WARN] WANDB_API_KEY not found in environment. "
-            "If you are not already logged in, run `wandb login` first."
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_prefix_sequence_training=active_use_prefix_sequence_training,
+            prefix_train_max_steps=int(args.prefix_train_max_steps),
+            use_path_signature=active_use_path_signature,
+            use_delta_signature=active_use_delta_signature,
         )
 
     dataset_cfg = DatasetConfig(
         repo_id=dataset_repo_id,
         root=str(dataset_root),
         episodes=split_spec.train_episode_indices,
-        use_imagenet_stats=use_imagenet_stats,
+        use_imagenet_stats=False,
         video_backend=args.video_backend,
     )
 
@@ -1946,6 +3290,38 @@ def main(argv: list[str] | None = None) -> None:
             signature_depth=int(args.signature_depth),
             signature_hidden_dim=int(args.signature_hidden_dim),
             signature_dropout=float(args.signature_dropout),
+            use_prefix_sequence_training=bool(use_prefix_sequence_training),
+            prefix_train_max_steps=(
+                int(args.prefix_train_max_steps) if use_prefix_sequence_training else 32
+            ),
+            prefix_frame_stride=(
+                int(args.prefix_frame_stride) if use_prefix_sequence_training else 1
+            ),
+            prefix_pad_value=(
+                float(args.prefix_pad_value) if use_prefix_sequence_training else 0.0
+            ),
+            use_visual_prefix_memory=bool(use_visual_prefix_memory),
+            use_signature_conditioned_visual_prefix_memory=bool(
+                args.use_signature_conditioned_visual_prefix_memory
+            ),
+            use_signature_indexed_slot_memory=bool(
+                args.use_signature_indexed_slot_memory
+            ),
+            use_memory_conditioned_encoder_film=bool(
+                args.use_memory_conditioned_encoder_film
+            ),
+            num_memory_slots=int(args.num_memory_slots),
+            slot_memory_num_slots=int(args.slot_memory_num_slots),
+            slot_memory_routing_hidden_dim=int(args.slot_memory_routing_hidden_dim),
+            slot_memory_use_delta_routing=bool(args.slot_memory_use_delta_routing),
+            slot_memory_use_softmax_routing=bool(args.slot_memory_use_softmax_routing),
+            slot_memory_use_readout_pooling=bool(args.slot_memory_use_readout_pooling),
+            slot_memory_balance_loss_coef=float(args.slot_memory_balance_loss_coef),
+            slot_memory_consistency_loss_coef=float(
+                args.slot_memory_consistency_loss_coef
+            ),
+            input_features=input_features_override,
+            output_features=output_features_override,
         )
         active_signature_keys = tuple(
             key
@@ -1970,6 +3346,20 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         signature_cache_reader = prepare_signature_cache_runtime()
+        if use_prefix_sequence_training:
+            configure_prefix_image_cache_runtime(
+                PrefixImageCacheRuntimeConfig(
+                    dataset_root=dataset_root,
+                    dataset_repo_id=dataset_repo_id,
+                    mode=str(args.prefix_image_cache_mode),
+                    cache_dtype=str(args.prefix_image_cache_dtype),
+                    refresh=bool(args.refresh_prefix_image_cache),
+                    cache_root=args.prefix_image_cache_root,
+                )
+            )
+            prepare_prefix_image_cache_runtime()
+        elif configure_prefix_image_cache_runtime is not None:
+            configure_prefix_image_cache_runtime(None)
         if signature_cache_reader is None and required_signature_parquet_keys and not parquet_has_columns(
             dataset_root,
             required_signature_parquet_keys,
@@ -1978,14 +3368,65 @@ def main(argv: list[str] | None = None) -> None:
                 "Signature cache is required for this dataset because the parquet files "
                 "do not contain the requested signature columns, but the cache could not be prepared."
             )
-        if signature_cache_reader is not None and signature_cache_reader.pre_normalized:
-            policy_cfg.pre_normalized_observation_keys = tuple(
-                signature_cache_reader.feature_keys
+        policy_cfg.pre_normalized_observation_keys = (
+            resolve_pre_normalized_signature_observation_keys(
+                feature_keys=tuple(signature_cache_reader.feature_keys)
+                if signature_cache_reader is not None
+                else (),
+                reader_pre_normalized=bool(
+                    signature_cache_reader is not None
+                    and signature_cache_reader.pre_normalized
+                ),
+                use_prefix_sequence_training=bool(use_prefix_sequence_training),
+                use_path_signature=bool(use_path_signature),
+                use_delta_signature=bool(use_delta_signature),
             )
-        else:
-            policy_cfg.pre_normalized_observation_keys = ()
-    elif args.policy == "diffusion":
-        policy_cfg = DiffusionConfig(
+        )
+    elif args.policy in {"diffusion", "prism_diffusion"}:
+        diffusion_config_cls = (
+            PrismDiffusionConfig if args.policy == "prism_diffusion" else DiffusionConfig
+        )
+        prism_config_kwargs = {}
+        if args.policy == "prism_diffusion":
+            prism_config_kwargs = {
+                "use_path_signature": prism_use_path_signature,
+                "use_delta_signature": prism_use_delta_signature,
+                "history_length": prism_history_length,
+                "signature_dim": prism_signature_dim,
+                "signature_depth": int(args.signature_depth),
+                "signature_hidden_dim": int(args.signature_hidden_dim),
+                "signature_dropout": float(args.signature_dropout),
+                "use_prefix_sequence_training": prism_use_prefix_sequence_training,
+                "prefix_train_max_steps": int(args.prefix_train_max_steps),
+                "prefix_frame_stride": int(args.prefix_frame_stride),
+                "prefix_pad_value": float(args.prefix_pad_value),
+                "use_visual_prefix_memory": prism_use_visual_prefix_memory,
+                "use_signature_indexed_slot_memory": bool(
+                    args.use_signature_indexed_slot_memory
+                ),
+                "slot_memory_num_slots": int(args.slot_memory_num_slots),
+                "slot_memory_routing_hidden_dim": int(
+                    args.slot_memory_routing_hidden_dim
+                ),
+                "slot_memory_use_delta_routing": bool(
+                    args.slot_memory_use_delta_routing
+                ),
+                "slot_memory_use_softmax_routing": bool(
+                    args.slot_memory_use_softmax_routing
+                ),
+                "slot_memory_use_readout_pooling": bool(
+                    args.slot_memory_use_readout_pooling
+                ),
+                "slot_memory_balance_loss_coef": float(
+                    args.slot_memory_balance_loss_coef
+                ),
+                "slot_memory_consistency_loss_coef": float(
+                    args.slot_memory_consistency_loss_coef
+                ),
+                "prism_adapter_hidden_dim": int(args.prism_adapter_hidden_dim),
+                "prism_adapter_zero_init": bool(args.prism_adapter_zero_init),
+            }
+        policy_cfg = diffusion_config_cls(
             device=args.device,
             use_amp=bool(args.use_amp),
             push_to_hub=False,
@@ -1993,10 +3434,82 @@ def main(argv: list[str] | None = None) -> None:
             horizon=int(args.horizon),
             n_action_steps=int(args.n_action_steps),
             drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
+            input_features=input_features_override,
+            output_features=output_features_override,
+            **prism_config_kwargs,
         )
+        if args.policy == "prism_diffusion":
+            active_signature_keys = tuple(
+                key
+                for key, enabled in (
+                    ("observation.path_signature", bool(prism_use_path_signature)),
+                    ("observation.delta_signature", bool(prism_use_delta_signature)),
+                )
+                if enabled
+            )
+            configure_signature_cache_runtime(
+                SignatureCacheRuntimeConfig(
+                    dataset_root=dataset_root,
+                    dataset_repo_id=dataset_repo_id,
+                    mode=str(args.signature_cache_mode),
+                    cache_dtype=str(args.signature_cache_dtype),
+                    feature_keys=active_signature_keys,
+                    normalization_mode=policy_cfg.normalization_mapping.get(
+                        "STATE", "mean_std"
+                    ),
+                    refresh=bool(args.refresh_signature_cache),
+                    cache_root=args.signature_cache_root,
+                )
+            )
+            signature_cache_reader = prepare_signature_cache_runtime()
+            if prism_use_prefix_sequence_training:
+                configure_prefix_image_cache_runtime(
+                    PrefixImageCacheRuntimeConfig(
+                        dataset_root=dataset_root,
+                        dataset_repo_id=dataset_repo_id,
+                        mode=str(args.prefix_image_cache_mode),
+                        cache_dtype=str(args.prefix_image_cache_dtype),
+                        refresh=bool(args.refresh_prefix_image_cache),
+                        cache_root=args.prefix_image_cache_root,
+                    )
+                )
+                prepare_prefix_image_cache_runtime()
+            elif configure_prefix_image_cache_runtime is not None:
+                configure_prefix_image_cache_runtime(None)
+            if (
+                signature_cache_reader is None
+                and prism_required_signature_parquet_keys
+                and not parquet_has_columns(
+                    dataset_root,
+                    prism_required_signature_parquet_keys,
+                )
+            ):
+                raise RuntimeError(
+                    "Signature cache is required for this dataset because the parquet "
+                    "files do not contain the requested signature columns, but the "
+                    "cache could not be prepared."
+                )
+            policy_cfg.pre_normalized_observation_keys = (
+                resolve_pre_normalized_signature_observation_keys(
+                    feature_keys=tuple(signature_cache_reader.feature_keys)
+                    if signature_cache_reader is not None
+                    else (),
+                    reader_pre_normalized=bool(
+                        signature_cache_reader is not None
+                        and signature_cache_reader.pre_normalized
+                    ),
+                    use_prefix_sequence_training=bool(
+                        prism_use_prefix_sequence_training
+                    ),
+                    use_path_signature=bool(prism_use_path_signature),
+                    use_delta_signature=bool(prism_use_delta_signature),
+                )
+            )
     else:
         if configure_signature_cache_runtime is not None:
             configure_signature_cache_runtime(None)
+        if configure_prefix_image_cache_runtime is not None:
+            configure_prefix_image_cache_runtime(None)
         policy_cfg = ACTConfig(
             device=args.device,
             use_amp=bool(args.use_amp),
@@ -2004,6 +3517,85 @@ def main(argv: list[str] | None = None) -> None:
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
             chunk_size=args.chunk_size,
             n_action_steps=args.n_action_steps,
+        )
+
+    resume_saved_train_cfg = None
+    resume_optimizer_cfg = None
+    resume_scheduler_cfg = None
+    if resume_run_state is not None:
+        policy_cfg.pretrained_path = resume_run_state.pretrained_model_dir
+        try:
+            resume_saved_train_cfg = TrainPipelineConfig.from_pretrained(
+                resume_run_state.train_config_path,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            print(
+                "[WARN] Failed to load saved train config from "
+                f"{resume_run_state.train_config_path}: {exc}"
+            )
+        else:
+            saved_policy_type = getattr(resume_saved_train_cfg.policy, "type", None)
+            if saved_policy_type and str(saved_policy_type) != str(args.policy):
+                raise ValueError(
+                    "The latest resumable checkpoint was created with a different "
+                    f"policy type: saved={saved_policy_type!r}, requested={args.policy!r}."
+                )
+            resume_optimizer_cfg = resume_saved_train_cfg.optimizer
+            resume_scheduler_cfg = resume_saved_train_cfg.scheduler
+
+        if resume_optimizer_cfg is None:
+            resume_optimizer_cfg = policy_cfg.get_optimizer_preset()
+        if resume_scheduler_cfg is None:
+            resume_scheduler_cfg = policy_cfg.get_scheduler_preset()
+
+    distributed_world_size = resolve_distributed_world_size_from_env()
+    run_stamp = resolve_train_run_stamp()
+    output_dir = (
+        resume_run_state.run_dir.resolve()
+        if resume_run_state is not None
+        else (args.output_root / run_stamp).resolve()
+    )
+    split_path = output_dir / DATASET_SPLIT_FILENAME
+
+    wandb_enable = args.enable_wandb and (args.wandb_mode != "disabled")
+    resolved_wandb_project = (
+        str(args.wandb_project)
+        if args.wandb_project
+        else default_wandb_project_name(
+            dataset_repo_id=dataset_repo_id,
+            dataset_root=dataset_root,
+        )
+    )
+    resolved_job_name = (
+        str(resume_saved_train_cfg.job_name)
+        if (
+            resume_saved_train_cfg is not None
+            and resume_saved_train_cfg.job_name is not None
+        )
+        else str(args.job_name)
+    )
+    if wandb_enable:
+        if args.wandb_run_name:
+            resolved_job_name = str(args.wandb_run_name)
+        elif resume_run_state is None:
+            resolved_job_name = f"{args.job_name}-s{args.seed}-{run_stamp}"
+        elif (
+            resume_saved_train_cfg is not None
+            and resume_saved_train_cfg.job_name is not None
+        ):
+            resolved_job_name = str(resume_saved_train_cfg.job_name)
+        else:
+            resolved_job_name = output_dir.name
+
+    if (
+        wandb_enable
+        and args.wandb_mode == "online"
+        and "WANDB_API_KEY" not in os.environ
+    ):
+        print(
+            "[WARN] WANDB_API_KEY not found in environment. "
+            "If you are not already logged in, run `wandb login` first."
         )
 
     env_cfg = None
@@ -2028,7 +3620,7 @@ def main(argv: list[str] | None = None) -> None:
     if int(args.eval_freq) > 0:
         print(
             "[WARN] `--eval-freq` is ignored in dataset-only mode because no simulator "
-            "environment is configured. Use `main/scripts/eval_policy.py` on the saved "
+            "environment is configured. Use `scripts/eval_policy.py` on the saved "
             "held-out test split instead."
         )
 
@@ -2038,6 +3630,7 @@ def main(argv: list[str] | None = None) -> None:
         policy=policy_cfg,
         output_dir=output_dir,
         job_name=resolved_job_name,
+        resume=bool(resume_run_state is not None),
         seed=args.seed,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
@@ -2045,6 +3638,8 @@ def main(argv: list[str] | None = None) -> None:
         eval_freq=effective_eval_freq,
         log_freq=args.log_freq,
         save_freq=args.save_freq,
+        optimizer=resume_optimizer_cfg,
+        scheduler=resume_scheduler_cfg,
         wandb=wandb_cfg,
     )
 
@@ -2059,8 +3654,22 @@ def main(argv: list[str] | None = None) -> None:
         print(f"- dataset_root_source: {source_dataset_root}")
         print(f"- dataset_root_runtime: {dataset_root}")
     print(f"- dataset_repo_id: {dataset_repo_id}")
+    normalized_dataset_tasks = _normalize_dataset_task_names(
+        getattr(args, "_policy_defaults_dataset_tasks", None)
+    )
+    if normalized_dataset_tasks:
+        print(f"- dataset_tasks: {list(normalized_dataset_tasks)}")
     if args.task:
         print(f"- task: {args.task}")
+    print(f"- resume: {bool(resume_run_state is not None)}")
+    if resume_run_state is not None:
+        print(f"- resume_run_dir: {resume_run_state.run_dir}")
+        print(f"- resume_checkpoint_dir: {resume_run_state.checkpoint_dir}")
+        print(f"- resume_train_config_path: {resume_run_state.train_config_path}")
+        print(
+            "- train_split_source: "
+            f"{resume_run_state.split_path or 'recomputed from current dataset/split args'}"
+        )
     print(
         f"- train_test_split: train={split_spec.train_count}, "
         f"test={split_spec.test_count}, "
@@ -2096,7 +3705,7 @@ def main(argv: list[str] | None = None) -> None:
             "- video_backend: ignored "
             "(dataset stores visual observations directly in parquet image columns)"
         )
-    if args.policy == "diffusion":
+    if args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- action_execution: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -2110,8 +3719,6 @@ def main(argv: list[str] | None = None) -> None:
             f"- action_execution: chunk_size={args.chunk_size}, "
             f"n_action_steps={args.n_action_steps}"
         )
-    print(f"- use_imagenet_stats: {use_imagenet_stats}")
-    print(f"- use_first_frame_anchor: {use_first_frame_anchor}")
     if args.policy == "streaming_act":
         print(f"- use_path_signature: {use_path_signature}")
         if use_path_signature:
@@ -2121,6 +3728,40 @@ def main(argv: list[str] | None = None) -> None:
                 f"dropout={args.signature_dropout}"
             )
         print(f"- use_delta_signature: {use_delta_signature}")
+        print(f"- use_prefix_sequence_training: {use_prefix_sequence_training}")
+        if use_prefix_sequence_training:
+            print(
+                f"- prefix_sequence: max_steps={args.prefix_train_max_steps}, "
+                f"stride={args.prefix_frame_stride}, pad_value={args.prefix_pad_value}"
+            )
+        print(f"- use_visual_prefix_memory: {use_visual_prefix_memory}")
+        if use_visual_prefix_memory:
+            print(
+                "- visual_prefix_memory: "
+                f"num_memory_slots={int(args.num_memory_slots)}, "
+                "signature_indexed_slot_memory="
+                f"{bool(args.use_signature_indexed_slot_memory)}, "
+                "signature_conditioned="
+                f"{bool(args.use_signature_conditioned_visual_prefix_memory)}, "
+                "encoder_film="
+                f"{bool(args.use_memory_conditioned_encoder_film)}"
+            )
+            if bool(args.use_signature_indexed_slot_memory):
+                print(
+                    "- slot_memory: "
+                    f"num_slots={int(args.slot_memory_num_slots)}, "
+                    f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                    "delta_routing="
+                    f"{bool(args.slot_memory_use_delta_routing)}, "
+                    "softmax_routing="
+                    f"{bool(args.slot_memory_use_softmax_routing)}, "
+                    "readout_pooling="
+                    f"{bool(args.slot_memory_use_readout_pooling)}, "
+                    "balance_loss_coef="
+                    f"{float(args.slot_memory_balance_loss_coef)}, "
+                    "consistency_loss_coef="
+                    f"{float(args.slot_memory_consistency_loss_coef)}"
+                )
         print(
             "- signature_cache: "
             f"mode={args.signature_cache_mode}, dtype={args.signature_cache_dtype}, "
@@ -2128,10 +3769,16 @@ def main(argv: list[str] | None = None) -> None:
             f"refresh={bool(args.refresh_signature_cache)}"
         )
         print(
+            "- prefix_image_cache: "
+            f"mode={args.prefix_image_cache_mode}, dtype={args.prefix_image_cache_dtype}, "
+            f"root={args.prefix_image_cache_root or (dataset_root / '.prefix_image_cache')}, "
+            f"refresh={bool(args.refresh_prefix_image_cache)}"
+        )
+        print(
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
         )
-    elif args.policy == "diffusion":
+    elif args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- diffusion: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -2139,6 +3786,47 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
+        if args.policy == "prism_diffusion":
+            print(f"- use_path_signature: {prism_use_path_signature}")
+            if prism_use_path_signature:
+                print(
+                    f"- signature: dim={prism_signature_dim}, "
+                    f"depth={int(args.signature_depth)}, "
+                    f"history={prism_history_length}, "
+                    f"hidden={int(args.signature_hidden_dim)}, "
+                    f"dropout={float(args.signature_dropout)}"
+                )
+            print(f"- use_delta_signature: {prism_use_delta_signature}")
+            print(
+                "- prefix_sequence: "
+                f"enabled={prism_use_prefix_sequence_training}, "
+                f"max_steps={int(args.prefix_train_max_steps)}, "
+                f"stride={int(args.prefix_frame_stride)}, "
+                f"pad_value={float(args.prefix_pad_value)}"
+            )
+            print(f"- use_visual_prefix_memory: {prism_use_visual_prefix_memory}")
+            print(
+                "- slot_memory: "
+                "enabled="
+                f"{bool(args.use_signature_indexed_slot_memory)}, "
+                f"num_slots={int(args.slot_memory_num_slots)}, "
+                f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                "delta_routing="
+                f"{bool(args.slot_memory_use_delta_routing)}, "
+                "softmax_routing="
+                f"{bool(args.slot_memory_use_softmax_routing)}, "
+                "readout_pooling="
+                f"{bool(args.slot_memory_use_readout_pooling)}, "
+                "balance_loss_coef="
+                f"{float(args.slot_memory_balance_loss_coef)}, "
+                "consistency_loss_coef="
+                f"{float(args.slot_memory_consistency_loss_coef)}"
+            )
+            print(
+                "- prism_adapter: "
+                f"hidden_dim={int(args.prism_adapter_hidden_dim)}, "
+                f"zero_init={bool(args.prism_adapter_zero_init)}"
+            )
     print(
         f"- wandb: enable={wandb_enable}, project={resolved_wandb_project}, mode={args.wandb_mode}"
     )
@@ -2161,15 +3849,39 @@ def main(argv: list[str] | None = None) -> None:
         cpu=force_cpu,
         mixed_precision=resolved_mixed_precision,
     )
+    accelerator_world_size = max(
+        int(getattr(accelerator, "num_processes", distributed_world_size)),
+        1,
+    )
+    if accelerator.is_main_process:
+        print(
+            "- distributed: "
+            f"world_size={accelerator_world_size}, "
+            f"per_device_batch_size={int(args.batch_size)}, "
+            f"global_batch_size={int(args.batch_size) * accelerator_world_size}"
+        )
+
+    resume_config_arg = None
+    if resume_run_state is not None and not any(
+        str(arg).startswith("--config_path=") for arg in sys.argv[1:]
+    ):
+        resume_config_arg = f"--config_path={resume_run_state.train_config_path}"
+        sys.argv.append(resume_config_arg)
 
     try:
         train(cfg, accelerator=accelerator)
-        saved_split_path = save_dataset_split(output_dir, split_spec)
-        print(f"Saved dataset split: {saved_split_path}")
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            saved_split_path = save_dataset_split(output_dir, split_spec)
+            print(f"Saved dataset split: {saved_split_path}")
+        accelerator.wait_for_everyone()
     except KeyboardInterrupt:
         print("\n[WARN] Training interrupted by user. Cleaning up wandb before exit.")
         teardown_wandb_safely(exit_code=130)
         raise SystemExit(130)
+    finally:
+        if resume_config_arg is not None and sys.argv[-1] == resume_config_arg:
+            sys.argv.pop()
 
 
 if __name__ == "__main__":

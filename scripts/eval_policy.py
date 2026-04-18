@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,10 +31,14 @@ from eval_helpers import (
     ensure_prefix_sequence_batch_dims,
     import_local_streaming_act_policy_class,
     load_streaming_act_config_from_pretrained_dir,
-    resolve_code_root,
     resolve_eval_policy_path,
     resolve_signature_backend,
     write_summary,
+)
+from policy_capabilities import (
+    get_visual_memory_debug_stats,
+    policy_supports_signature_features,
+    resolve_policy_capability_flags,
 )
 from policy_defaults import (
     load_policy_mode_defaults,
@@ -41,9 +46,17 @@ from policy_defaults import (
 )
 
 
-FIRST_FRAME_ANCHOR_KEY = "observation.anchor_image"
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
+ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedTaskSelector:
+    raw: str | None
+    items: tuple[str, ...]
+    canonical: str | None
 
 
 def maybe_create_tqdm(*, total: int, desc: str, unit: str):
@@ -65,9 +78,10 @@ def format_elapsed_s(elapsed_s: float) -> str:
     return f"{elapsed_s:.1f}s"
 
 
-def ensure_streaming_act_importable(repo_root: Path) -> None:
-    code_root = resolve_code_root(repo_root)
-    streaming_act_src = code_root / "policy" / "lerobot_policy_streaming_act" / "src"
+def ensure_streaming_act_importable(project_root: Path) -> None:
+    streaming_act_src = (
+        project_root / "policy" / "lerobot_policy_streaming_act" / "src"
+    )
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
@@ -75,59 +89,50 @@ def ensure_streaming_act_importable(repo_root: Path) -> None:
     sys.path.insert(0, str(streaming_act_src))
 
 
-def validate_first_frame_anchor_support(
-    *,
-    env_name: str,
-    use_first_frame_anchor: bool,
-) -> None:
-    if not use_first_frame_anchor:
-        return
-    if env_name != "braidedhub":
-        raise NotImplementedError(
-            "First-frame anchor evaluation is currently implemented only for `braidedhub`. "
-            f"Got env={env_name!r}."
+def ensure_prism_diffusion_importable(project_root: Path) -> None:
+    prism_diffusion_src = (
+        project_root / "policy" / "lerobot_policy_prism_diffusion" / "src"
+    )
+    if not prism_diffusion_src.exists():
+        raise FileNotFoundError(
+            f"PRISM Diffusion package source not found: {prism_diffusion_src}"
         )
+    sys.path.insert(0, str(prism_diffusion_src))
 
 
 def validate_prefix_sequence_support(
     *,
-    policy_name: str,
     use_prefix_sequence_training: bool,
 ) -> None:
     if not use_prefix_sequence_training:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Prefix-sequence evaluation is currently implemented only for `streaming_act`. "
-            f"Got policy={policy_name!r}."
-        )
 
 
 def validate_visual_prefix_memory_support(
     *,
-    policy_name: str,
     use_visual_prefix_memory: bool,
+    use_prefix_sequence_training: bool,
 ) -> None:
     if not use_visual_prefix_memory:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Visual prefix memory evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
+    if not use_prefix_sequence_training:
+        raise ValueError(
+            "Visual prefix memory evaluation requires "
+            "`use_prefix_sequence_training=True` in the loaded policy config."
         )
 
 
 def validate_delta_signature_support(
     *,
-    policy_name: str,
+    use_path_signature: bool,
     use_delta_signature: bool,
 ) -> None:
     if not use_delta_signature:
         return
-    if policy_name != "streaming_act":
-        raise NotImplementedError(
-            "Delta-signature evaluation is currently implemented only for "
-            f"`streaming_act`. Got policy={policy_name!r}."
+    if not use_path_signature:
+        raise ValueError(
+            "Delta-signature evaluation requires `use_path_signature=True` in the "
+            "loaded policy config."
         )
 
 
@@ -141,9 +146,154 @@ def normalize_output_path_part(value: str) -> str:
     return normalized or "item"
 
 
-def ensure_writable_hf_cache_env(repo_root: Path) -> None:
-    code_root = resolve_code_root(repo_root)
-    cache_root = (code_root / ".cache" / "huggingface").resolve()
+def normalize_cli_text(value: str | os.PathLike[str] | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return None
+    if text.startswith("./"):
+        text = text[2:]
+    while "//" in text:
+        text = text.replace("//", "/")
+    return text.rstrip("/")
+
+
+def normalize_csv_items(value: str | list[str] | tuple[str, ...] | set[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    raw_items = (
+        value
+        if isinstance(value, (list, tuple, set))
+        else str(value).split(",")
+    )
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        items.append(item)
+    return tuple(items)
+
+
+def cli_option_was_provided(
+    argv: list[str] | tuple[str, ...] | None,
+    *flags: str,
+) -> bool:
+    if argv is None:
+        return False
+    normalized_flags = tuple(str(flag) for flag in flags)
+    for token in argv:
+        token_s = str(token)
+        if token_s in normalized_flags:
+            return True
+        if any(token_s.startswith(f"{flag}=") for flag in normalized_flags):
+            return True
+    return False
+
+
+def build_normalized_task_selector(
+    value: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> NormalizedTaskSelector:
+    items = normalize_csv_items(value)
+    canonical = ",".join(items) if items else None
+    return NormalizedTaskSelector(
+        raw=None if value is None else str(value),
+        items=items,
+        canonical=canonical,
+    )
+
+
+def infer_robocasa_task_from_selector(
+    selector: str | os.PathLike[str] | None,
+) -> str | None:
+    normalized = normalize_cli_text(selector)
+    if normalized is None:
+        return None
+
+    parts = [
+        part
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if parts[:2] == ["main", "data"]:
+        parts = parts[2:]
+    elif parts[:1] == ["data"]:
+        parts = parts[1:]
+    if len(parts) < 3 or parts[0] != "robocasa":
+        return None
+    if parts[1] not in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    task_name = str(parts[2]).strip()
+    if not task_name or task_name in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    return task_name
+
+
+def resolve_robocasa_task_selector(args: argparse.Namespace) -> NormalizedTaskSelector:
+    explicit = build_normalized_task_selector(getattr(args, "task", None))
+    if explicit.items:
+        return explicit
+
+    defaults_tasks = build_normalized_task_selector(
+        getattr(args, "_policy_defaults_dataset_tasks", None)
+    )
+    if defaults_tasks.items:
+        return defaults_tasks
+
+    for selector in (
+        getattr(args, "dataset", None),
+        getattr(args, "dataset_repo_id", None),
+        getattr(args, "_policy_defaults_dataset_root", None),
+    ):
+        task_name = infer_robocasa_task_from_selector(selector)
+        if task_name is not None:
+            return build_normalized_task_selector(task_name)
+
+    return explicit
+
+
+def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.dataset = normalize_cli_text(getattr(args, "dataset", None))
+    args.dataset_repo_id = normalize_cli_text(getattr(args, "dataset_repo_id", None))
+
+    if args.env == "robocasa":
+        task_selector = resolve_robocasa_task_selector(args)
+    else:
+        task_selector = build_normalized_task_selector(getattr(args, "task", None))
+
+    args.eval_task_names = task_selector.items
+    args.eval_task_spec = task_selector.canonical
+    args.task = task_selector.canonical
+
+    args.eval_mode = "env" if args.env is not None else "dataset"
+    args.eval_num_rollouts = int(args.num_rollouts)
+    args.eval_max_steps = None if args.max_steps is None else int(args.max_steps)
+    args.eval_fps = int(args.fps)
+    args.eval_max_episodes_rendered = (
+        None
+        if args.max_episodes_rendered is None
+        else int(args.max_episodes_rendered)
+    )
+    args.eval_seed = None if getattr(args, "seed", None) is None else int(args.seed)
+    args.eval_split_name = str(args.eval_split)
+    args.eval_max_episodes = args.max_episodes
+    args.eval_max_steps_per_episode = args.max_steps_per_episode
+    args.eval_dataset_selector = args.dataset
+    args.eval_robocasa_conda_env = normalize_cli_text(
+        getattr(args, "robocasa_conda_env", None)
+    )
+    args.robocasa_conda_env = args.eval_robocasa_conda_env
+    args.eval_robocasa_split = str(getattr(args, "robocasa_split", "target"))
+    args.robocasa_split = args.eval_robocasa_split
+    return args
+
+
+def ensure_writable_hf_cache_env(project_root: Path) -> None:
+    cache_root = (project_root / ".cache" / "huggingface").resolve()
     hf_home = cache_root / "home"
     hf_datasets_cache = cache_root / "datasets"
     xdg_cache_home = cache_root / "xdg"
@@ -176,9 +326,6 @@ def default_dataset_output_subdir(dataset_selector: str | None) -> Path | None:
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
             break
-    marker = "/data/"
-    if marker in raw:
-        raw = raw.split(marker, 1)[1]
 
     parts = [
         normalize_output_path_part(part)
@@ -194,8 +341,7 @@ def default_train_output_root(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> Path:
-    code_root = resolve_code_root()
-    base = code_root / "outputs" / "train"
+    base = PROJECT_ROOT / "outputs" / "train"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return base / dataset_subdir / default_policy_series_name(policy_name)
@@ -206,8 +352,7 @@ def default_eval_output_dir(
     policy_name: str,
     dataset_selector: str | None = None,
 ) -> str:
-    code_root = resolve_code_root()
-    base = code_root / "outputs" / "eval"
+    base = PROJECT_ROOT / "outputs" / "eval"
     dataset_subdir = default_dataset_output_subdir(dataset_selector)
     if dataset_subdir is not None:
         return str(
@@ -226,7 +371,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
     known_args, _ = bootstrap.parse_known_args(argv)
@@ -257,14 +402,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a LeRobot ACT, Diffusion, or Streaming ACT checkpoint "
-            "either with env rollouts (`--env`) or on a held-out dataset split "
-            "(`--dataset`)."
+            "Evaluate a LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "checkpoint either with env rollouts (`--env`) or on a held-out "
+            "dataset split (`--dataset`)."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "streaming_act"],
+        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default=known_args.policy,
     )
     parser.add_argument(
@@ -480,6 +625,16 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--robocasa-split",
+        type=str,
+        default=defaults.get("robocasa_split", "target"),
+        choices=["target", "pretrain", "all"],
+        help=(
+            "RoboCasa task split used by online env eval. "
+            "`target` is the default benchmark split."
+        ),
+    )
+    parser.add_argument(
         "--success-threshold",
         type=float,
         default=defaults.get("success_threshold", 0.0),
@@ -516,7 +671,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     parser.set_defaults(enable_randomize=bool(defaults.get("enable_randomize", False)))
 
-    if known_args.policy == "streaming_act":
+    if policy_supports_signature_features(known_args.policy):
         parser.add_argument(
             "--signature-backend",
             type=str,
@@ -532,13 +687,31 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             None if defaults_path is None else str(defaults_path)
         ),
         _policy_defaults_dataset_root=dataset_train_defaults.get("dataset_root"),
+        _policy_defaults_dataset_tasks=dataset_train_defaults.get("dataset_tasks"),
+        _max_steps_default_source=(
+            "defaults" if "max_steps" in defaults else "builtin"
+        ),
     )
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = build_parser(argv)
-    args = parser.parse_args(argv)
+    normalized_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser(normalized_argv)
+    args = parser.parse_args(normalized_argv)
+    args._cli_provided_max_steps = cli_option_was_provided(
+        normalized_argv,
+        "--max-steps",
+    )
+
+    if (
+        args.env == "robocasa"
+        and not bool(getattr(args, "_cli_provided_max_steps", False))
+        and getattr(args, "_max_steps_default_source", "builtin") == "builtin"
+    ):
+        # RoboCasa prefers conservative horizon inference from the selected dataset
+        # whenever the user did not explicitly override rollout length.
+        args.max_steps = None
 
     output_dir_s = str(args.output_dir)
     if "{run_tag}" in output_dir_s:
@@ -550,7 +723,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, attr)
         if value is not None and not isinstance(value, Path):
             setattr(args, attr, Path(value))
-    return args
+    return normalize_eval_args(args)
 
 
 def select_visual_observation_keys(cfg) -> list[str]:
@@ -740,24 +913,21 @@ def run_env_evaluation(
     postprocessor,
     policy_dir: Path,
 ) -> None:
-    validate_first_frame_anchor_support(
-        env_name=args.env,
-        use_first_frame_anchor=bool(getattr(cfg, "use_first_frame_anchor", False)),
-    )
     validate_prefix_sequence_support(
-        policy_name=args.policy,
         use_prefix_sequence_training=bool(
             getattr(cfg, "use_prefix_sequence_training", False)
         ),
     )
     validate_visual_prefix_memory_support(
-        policy_name=args.policy,
         use_visual_prefix_memory=bool(
             getattr(cfg, "use_visual_prefix_memory", False)
         ),
+        use_prefix_sequence_training=bool(
+            getattr(cfg, "use_prefix_sequence_training", False)
+        ),
     )
     validate_delta_signature_support(
-        policy_name=args.policy,
+        use_path_signature=bool(getattr(cfg, "use_path_signature", False)),
         use_delta_signature=bool(getattr(cfg, "use_delta_signature", False)),
     )
 
@@ -835,27 +1005,16 @@ def run_dataset_evaluation(
     env_state_key = resolve_env_state_key(cfg)
     action_key = resolve_action_key(cfg)
 
-    use_path_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_path_signature", False)
+    capability_flags = resolve_policy_capability_flags(cfg)
+    use_path_signature = capability_flags.use_path_signature
+    use_prefix_sequence_training = capability_flags.use_prefix_sequence_training
+    use_visual_prefix_memory = capability_flags.use_visual_prefix_memory
+    use_signature_indexed_slot_memory = (
+        capability_flags.use_signature_indexed_slot_memory
     )
-    use_prefix_sequence_training = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_prefix_sequence_training", False)
-    )
-    use_visual_prefix_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_visual_prefix_memory", False)
-    )
-    use_signature_indexed_slot_memory = bool(
-        args.policy == "streaming_act"
-        and getattr(cfg, "use_signature_indexed_slot_memory", False)
-    )
-    use_delta_signature = bool(
-        args.policy == "streaming_act" and getattr(cfg, "use_delta_signature", False)
-    )
-    use_first_frame_anchor = bool(getattr(cfg, "use_first_frame_anchor", False))
+    use_delta_signature = capability_flags.use_delta_signature
     build_explicit_prefix_eval_inputs = (
-        use_prefix_sequence_training and not use_visual_prefix_memory
+        capability_flags.build_explicit_prefix_eval_inputs
     )
     signature_backend = None
     if use_path_signature:
@@ -878,6 +1037,7 @@ def run_dataset_evaluation(
             f"cameras={visual_keys}"
         )
     elif use_visual_prefix_memory:
+        initial_memory_debug = get_visual_memory_debug_stats(policy)
         print(
             "[info] visual prefix memory eval enabled: "
             + (
@@ -886,11 +1046,14 @@ def run_dataset_evaluation(
                 else "the policy updates recurrent memory from the true current observation at each step"
             )
         )
-    if use_first_frame_anchor:
-        print(
-            "[info] first-frame anchor eval enabled: "
-            f"key={FIRST_FRAME_ANCHOR_KEY}, fallback_camera={visual_keys[0]}"
-        )
+        if initial_memory_debug is not None:
+            print(
+                "[info] visual prefix memory debug: "
+                f"enabled={bool(initial_memory_debug.get('enabled', False))}, "
+                f"num_slots={int(initial_memory_debug.get('num_slots', 0))}, "
+                "signature_indexed_slot_memory="
+                f"{bool(initial_memory_debug.get('signature_indexed_slot_memory', False))}"
+            )
 
     action_dim: int | None = None
     total_abs_error: np.ndarray | None = None
@@ -900,7 +1063,6 @@ def run_dataset_evaluation(
     total_cosine_count = 0
     total_steps = 0
     results: list[dict[str, object]] = []
-    warned_anchor_fallback = False
     planned_steps_per_episode: list[int] = []
     for _, rel_indices in episode_groups:
         planned_steps = len(rel_indices)
@@ -944,7 +1106,6 @@ def run_dataset_evaluation(
             else None
         )
         previous_signature_vec: np.ndarray | None = None
-        first_frame_anchor = None
         episode_abs_error: np.ndarray | None = None
         episode_sq_error: np.ndarray | None = None
         episode_l2_error = 0.0
@@ -980,23 +1141,6 @@ def run_dataset_evaluation(
                 obs[env_state_key] = as_tensor_copy(item[env_state_key])
             for visual_key in visual_keys:
                 obs[visual_key] = as_tensor_copy(item[visual_key])
-
-            if use_first_frame_anchor:
-                if FIRST_FRAME_ANCHOR_KEY in item:
-                    anchor_tensor = as_tensor_copy(item[FIRST_FRAME_ANCHOR_KEY])
-                    if first_frame_anchor is None:
-                        first_frame_anchor = anchor_tensor.detach().clone()
-                else:
-                    if not warned_anchor_fallback:
-                        print(
-                            "[WARN] Dataset does not contain `observation.anchor_image`; "
-                            f"falling back to the first frame from `{visual_keys[0]}`."
-                        )
-                        warned_anchor_fallback = True
-                    if first_frame_anchor is None:
-                        first_frame_anchor = as_tensor_copy(item[visual_keys[0]])
-                    anchor_tensor = first_frame_anchor.detach().clone()
-                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_tensor
 
             signature_vec: np.ndarray | None = None
             if use_path_signature:
@@ -1100,23 +1244,6 @@ def run_dataset_evaluation(
                     use_path_signature=use_path_signature,
                     use_delta_signature=use_delta_signature,
                 )
-            if use_first_frame_anchor:
-                if FIRST_FRAME_ANCHOR_KEY not in obs:
-                    raise KeyError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` missing after preprocessor."
-                    )
-                anchor_image = obs[FIRST_FRAME_ANCHOR_KEY]
-                if anchor_image.ndim == 3:
-                    anchor_image = anchor_image.unsqueeze(0)
-                elif anchor_image.ndim != 4:
-                    raise RuntimeError(
-                        f"`{FIRST_FRAME_ANCHOR_KEY}` must be 3D/4D after preprocessing, "
-                        f"got shape={tuple(anchor_image.shape)}"
-                    )
-                obs[FIRST_FRAME_ANCHOR_KEY] = anchor_image.to(
-                    device=obs[state_key].device,
-                    dtype=obs[state_key].dtype,
-                )
 
             with torch.no_grad():
                 predicted_action = policy.select_action(obs)
@@ -1200,18 +1327,31 @@ def run_dataset_evaluation(
             "per_dim_mae": (episode_abs_error / evaluated_steps).tolist(),
             "per_dim_rmse": np.sqrt(episode_sq_error / evaluated_steps).tolist(),
         }
+        memory_debug_stats = (
+            get_visual_memory_debug_stats(policy) if use_visual_prefix_memory else None
+        )
+        if memory_debug_stats is not None:
+            result["visual_memory_debug"] = memory_debug_stats
         results.append(result)
         cosine_text = (
             "n/a"
             if result["cosine_similarity"] is None
             else f"{result['cosine_similarity']:.4f}"
         )
+        memory_debug_text = ""
+        if memory_debug_stats is not None:
+            memory_debug_text = (
+                " "
+                f"memory_updates={int(memory_debug_stats.get('update_count', 0))} "
+                f"memory_norm={float(memory_debug_stats.get('state_norm', 0.0)):.4f}"
+            )
         progress_write(
             step_progress,
             f"[{episode_pos:03d}/{len(episode_groups):03d}] "
             f"episode={episode_index} steps={evaluated_steps} "
             f"mae={result['mae']:.6f} rmse={result['rmse']:.6f} "
             f"l2={result['mean_l2_error']:.6f} cosine={cosine_text}"
+            f"{memory_debug_text}"
         )
 
     if step_progress is not None:
@@ -1247,6 +1387,10 @@ def run_dataset_evaluation(
         },
         "results": results,
     }
+    if use_visual_prefix_memory:
+        memory_debug_stats = get_visual_memory_debug_stats(policy)
+        if memory_debug_stats is not None:
+            summary["visual_memory_debug"] = memory_debug_stats
     summary_path = write_summary(output_dir, summary)
 
     print(f"\nSummary: {summary_path}")
@@ -1262,10 +1406,12 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
-    repo_root = resolve_code_root()
-    ensure_writable_hf_cache_env(repo_root)
+    ensure_writable_hf_cache_env(PROJECT_ROOT)
     if args.policy == "streaming_act":
-        ensure_streaming_act_importable(repo_root)
+        ensure_streaming_act_importable(PROJECT_ROOT)
+    elif args.policy == "prism_diffusion":
+        ensure_prism_diffusion_importable(PROJECT_ROOT)
+        ensure_streaming_act_importable(PROJECT_ROOT)
 
     try:
         from lerobot.configs.policies import PreTrainedConfig
@@ -1278,7 +1424,7 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
 
     if args.policy == "streaming_act":
-        policy_cls = import_local_streaming_act_policy_class(repo_root=repo_root)
+        policy_cls = import_local_streaming_act_policy_class(repo_root=PROJECT_ROOT)
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
             PrismDiffusionConfig,
@@ -1314,7 +1460,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.policy == "streaming_act":
         cfg = load_streaming_act_config_from_pretrained_dir(
             policy_dir,
-            repo_root=repo_root,
+            repo_root=PROJECT_ROOT,
         )
     else:
         cfg = PreTrainedConfig.from_pretrained(
@@ -1367,7 +1513,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
                 )
     if (
-        args.policy == "streaming_act"
+        hasattr(policy, "get_visual_prefix_memory_debug_stats")
         and getattr(cfg, "use_visual_prefix_memory", False)
         and cfg.n_action_steps > 1
     ):

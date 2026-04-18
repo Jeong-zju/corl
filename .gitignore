@@ -3,6 +3,7 @@ data/*
 !data/*.py
 !data/README.md
 !data/hfd.sh
+!data/configs
 **/__pycache__/
 *.npz
 .cache
@@ -10,3 +11,6 @@ data/*
 **/*.egg-info/
 depends/signatory/build/
 *.so
+discussions/
+plot/
+*bak*

@@ -1,0 +1,129 @@
+dataset:
+  data_root: data/zeno-ai/mem-1
+  output_dir: data/zeno-ai
+  output_name: CleanTableTopDelayedToolChoice
+  task_label: pick
+  robot_type: zeno
+  bag_glob: "*.bag"
+  overwrite_output: true
+
+processing:
+  fps: 30
+  n_workers: 2
+
+image:
+  width: 224
+  height: 224
+  color_order: rgb
+  use_videos: true
+  vcodec: h264_nvenc
+  image_writer_threads: 8
+  image_writer_processes: 4
+
+topics:
+  images:
+    - name: top
+      topic: /realsense_top/color/image_raw/compressed
+      key: observation.images.realsense_top
+    - name: left
+      topic: /realsense_left/color/image_raw/compressed
+      key: observation.images.realsense_left
+    - name: right
+      topic: /realsense_right/color/image_raw/compressed
+      key: observation.images.realsense_right
+
+  vectors:
+    base_vel:
+      topic: /ranger_base_node/odom
+      required: false
+      sync: false
+      extractor:
+        type: fields
+        fields:
+          - twist.twist.linear.x
+          - twist.twist.linear.y
+          - twist.twist.angular.z
+        default: [0.0, 0.0, 0.0]
+        names:
+          - base_vx
+          - base_vy
+          - base_omega
+
+    left_state:
+      topic: /robot/arm_left/joint_states_single
+      extractor:
+        type: sequence_field
+        field: position
+        length: 7
+        pad_value: 0.0
+        names:
+          - left_joint_0
+          - left_joint_1
+          - left_joint_2
+          - left_joint_3
+          - left_joint_4
+          - left_joint_5
+          - left_joint_6
+
+    right_state:
+      topic: /robot/arm_right/joint_states_single
+      extractor:
+        type: sequence_field
+        field: position
+        length: 7
+        pad_value: 0.0
+        names:
+          - right_joint_0
+          - right_joint_1
+          - right_joint_2
+          - right_joint_3
+          - right_joint_4
+          - right_joint_5
+          - right_joint_6
+
+    left_action:
+      topic: /teleop/arm_left/joint_states_single
+      extractor:
+        type: sequence_field
+        field: position
+        length: 7
+        pad_value: 0.0
+        names:
+          - left_joint_0
+          - left_joint_1
+          - left_joint_2
+          - left_joint_3
+          - left_joint_4
+          - left_joint_5
+          - left_joint_6
+
+    right_action:
+      topic: /teleop/arm_right/joint_states_single
+      extractor:
+        type: sequence_field
+        field: position
+        length: 7
+        pad_value: 0.0
+        names:
+          - right_joint_0
+          - right_joint_1
+          - right_joint_2
+          - right_joint_3
+          - right_joint_4
+          - right_joint_5
+          - right_joint_6
+
+features:
+  vectors:
+    - key: observation.state
+      dtype: float32
+      sources:
+        - base_vel
+        - left_state
+        - right_state
+    - key: action
+      dtype: float32
+      sources:
+        - base_vel
+        - left_action
+        - right_action

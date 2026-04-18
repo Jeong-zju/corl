@@ -2,10 +2,20 @@ train:
   dataset_root: "data/zeno-ai/rrt_connect_h_v30"
   dataset_repo_id: "zeno-ai/rrt_connect_h_v30"
   output_root: "outputs/train/h_shape/streaming-act"
+  resume: false
   job_name: "streaming-act"
   wandb_project: "h_shape"
   wandb_mode: "online"
   device: "cuda"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
   steps: 10000
   batch_size: 32
   num_workers: 4
@@ -15,7 +25,6 @@ train:
   eval_freq: -1
   chunk_size: 5
   n_action_steps: 1
-  use_imagenet_stats: false
   enable_wandb: true
   wandb_console: "off"
   wandb_service_wait: 10
