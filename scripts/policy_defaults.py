@@ -113,6 +113,21 @@ def _score_defaults_candidate_match(
     return None
 
 
+def _iter_defaults_yaml_match_candidates(
+    value: str | Path | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    if value is None:
+        return []
+
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    candidates: list[str] = []
+    for raw_value in raw_values:
+        candidates.extend(
+            _normalize_dataset_selector_candidates(str(raw_value))
+        )
+    return candidates
+
+
 def resolve_dataset_defaults_path(
     dataset_selector: str,
     policy_name: str,
@@ -133,7 +148,7 @@ def resolve_dataset_defaults_path(
         return None
 
     best_match_path: Path | None = None
-    best_match_score: tuple[int, int, int] | None = None
+    best_match_score: tuple[int, int, int, int] | None = None
     for yaml_path in sorted(DEFAULTS_ROOT.rglob(f"{policy_name}.yaml")):
         try:
             data = _load_yaml_mapping(yaml_path)
@@ -143,27 +158,50 @@ def resolve_dataset_defaults_path(
         if not isinstance(train_cfg, dict):
             continue
 
-        yaml_candidates: list[str] = []
+        eval_cfg = data.get("eval", {})
+        if not isinstance(eval_cfg, dict):
+            eval_cfg = {}
+
+        yaml_candidates: list[tuple[str, int]] = []
         dataset_root = train_cfg.get("dataset_root")
         dataset_repo_id = train_cfg.get("dataset_repo_id")
         if dataset_root:
             yaml_candidates.extend(
-                _normalize_dataset_selector_candidates(str(dataset_root))
+                (candidate, 2)
+                for candidate in _iter_defaults_yaml_match_candidates(dataset_root)
             )
         if dataset_repo_id:
             yaml_candidates.extend(
-                _normalize_dataset_selector_candidates(str(dataset_repo_id))
+                (candidate, 2)
+                for candidate in _iter_defaults_yaml_match_candidates(dataset_repo_id)
+            )
+        for task_value in (
+            train_cfg.get("dataset_tasks"),
+            train_cfg.get("task"),
+            train_cfg.get("cil"),
+            eval_cfg.get("task"),
+            eval_cfg.get("cil"),
+        ):
+            yaml_candidates.extend(
+                (candidate, 1)
+                for candidate in _iter_defaults_yaml_match_candidates(task_value)
             )
 
-        yaml_match_score: tuple[int, int, int] | None = None
+        yaml_match_score: tuple[int, int, int, int] | None = None
         for selector_candidate in selector_candidate_set:
-            for yaml_candidate in set(yaml_candidates):
-                score = _score_defaults_candidate_match(
+            for yaml_candidate, source_priority in set(yaml_candidates):
+                base_score = _score_defaults_candidate_match(
                     selector_candidate=selector_candidate,
                     yaml_candidate=yaml_candidate,
                 )
-                if score is None:
+                if base_score is None:
                     continue
+                score = (
+                    base_score[0],
+                    source_priority,
+                    base_score[1],
+                    base_score[2],
+                )
                 if yaml_match_score is None or score > yaml_match_score:
                     yaml_match_score = score
 

@@ -17,6 +17,7 @@ from dataset_utils import (
     build_dataset_split,
     find_dataset_split_file,
     infer_dataset_repo_id,
+    is_supported_lerobot_dataset_root,
     load_dataset_split,
     resolve_dataset_root,
     resolve_episode_indices_from_dataset_info,
@@ -361,6 +362,64 @@ def default_eval_output_dir(
     return str(base / default_policy_series_name(policy_name) / "{run_tag}")
 
 
+def infer_eval_defaults_dataset_selector(
+    *,
+    env_name: str | None,
+    dataset_selector: str | None,
+    task_selector: str | None,
+) -> str | None:
+    normalized_dataset = normalize_cli_text(dataset_selector)
+    task_items = normalize_csv_items(task_selector)
+    single_task = task_items[0] if len(task_items) == 1 else None
+
+    if normalized_dataset is not None:
+        if (
+            single_task is not None
+            and (
+                env_name == "robocasa"
+                or normalized_dataset == "robocasa"
+                or normalized_dataset.startswith("robocasa/")
+            )
+            and infer_robocasa_task_from_selector(normalized_dataset) is None
+        ):
+            return single_task
+        return normalized_dataset
+
+    if env_name == "robocasa" and single_task is not None:
+        return single_task
+    return None
+
+
+def resolve_direct_dataset_root(
+    dataset: str | Path,
+    *,
+    local_data_root: Path,
+) -> Path | None:
+    dataset_text = str(dataset).strip()
+    normalized_dataset_text = dataset_text.replace("\\", "/")
+    raw_path = Path(dataset_text).expanduser()
+    candidates: list[Path] = []
+
+    if raw_path.is_absolute() or raw_path.exists() or dataset_text.startswith("."):
+        candidates.append(raw_path)
+
+    if not raw_path.is_absolute():
+        if normalized_dataset_text.startswith("data/"):
+            candidates.append(local_data_root / normalized_dataset_text[len("data/") :])
+        candidates.append(local_data_root / dataset_text)
+        candidates.append(local_data_root / dataset_text.replace("/", "_"))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if is_supported_lerobot_dataset_root(candidate):
+            return candidate.resolve()
+    return None
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--dataset", type=str, default=None)
@@ -374,19 +433,27 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
+    bootstrap.add_argument("--task", type=str, default=None)
+    bootstrap.add_argument("--tasks", dest="task", type=str)
+    bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults = {}
     dataset_train_defaults = {}
     defaults_path = None
-    if known_args.dataset:
+    defaults_dataset_selector = infer_eval_defaults_dataset_selector(
+        env_name=known_args.env,
+        dataset_selector=known_args.dataset,
+        task_selector=getattr(known_args, "task", None),
+    )
+    if defaults_dataset_selector:
         defaults, defaults_path = load_policy_mode_defaults_for_dataset(
             mode="eval",
-            dataset_selector=known_args.dataset,
+            dataset_selector=defaults_dataset_selector,
             policy_name=known_args.policy,
         )
         dataset_train_defaults, _ = load_policy_mode_defaults_for_dataset(
             mode="train",
-            dataset_selector=known_args.dataset,
+            dataset_selector=defaults_dataset_selector,
             policy_name=known_args.policy,
         )
     if known_args.env:
@@ -824,24 +891,27 @@ def resolve_dataset_selection(
 
     if args.dataset is not None:
         defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
-        try:
-            dataset_root = resolve_dataset_root(
-                args.dataset,
-                local_data_root=args.local_data_root.resolve(),
-            )
-        except FileNotFoundError:
-            if not defaults_dataset_root:
-                raise
+        resolved_local_data_root = args.local_data_root.resolve()
+        dataset_root = resolve_direct_dataset_root(
+            args.dataset,
+            local_data_root=resolved_local_data_root,
+        )
+        if dataset_root is None and defaults_dataset_root:
             dataset_root = resolve_dataset_root(
                 defaults_dataset_root,
-                local_data_root=args.local_data_root.resolve(),
+                local_data_root=resolved_local_data_root,
+            )
+        if dataset_root is None:
+            dataset_root = resolve_dataset_root(
+                args.dataset,
+                local_data_root=resolved_local_data_root,
             )
         dataset_repo_id = (
             str(args.dataset_repo_id)
             if args.dataset_repo_id
             else infer_dataset_repo_id(
                 dataset_root,
-                local_data_root=args.local_data_root.resolve(),
+                local_data_root=resolved_local_data_root,
             )
         )
     elif saved_split is not None:

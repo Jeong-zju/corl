@@ -27,6 +27,40 @@ def test_parse_args_accepts_robocasa_split() -> None:
     assert args.eval_robocasa_split == "all"
 
 
+def test_parse_args_uses_task_specific_robocasa_defaults_without_dataset() -> None:
+    args = parse_args(
+        [
+            "--env",
+            "robocasa",
+            "--policy",
+            "act",
+            "--task",
+            "CloseFridge",
+        ]
+    )
+
+    assert args.task == "CloseFridge"
+    assert args.train_output_root.as_posix() == "outputs/train/robocasa/atomic/CloseFridge/act"
+    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
+
+
+def test_parse_args_uses_task_specific_robocasa_defaults_with_broad_dataset() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "robocasa",
+            "--policy",
+            "act",
+            "--task",
+            "CloseFridge",
+        ]
+    )
+
+    assert args.task == "CloseFridge"
+    assert args.train_output_root.as_posix() == "outputs/train/robocasa/atomic/CloseFridge/act"
+    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
+
+
 def test_parse_args_infers_robocasa_task_from_leaf_dataset() -> None:
     args = parse_args(
         [
