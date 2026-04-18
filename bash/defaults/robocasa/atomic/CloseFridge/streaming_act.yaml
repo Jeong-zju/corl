@@ -21,7 +21,7 @@ train:
     main_process_port: null
   steps: 200000
   batch_size: 16
-  num_workers: 16
+  num_workers: 8
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   video_backend: "torchcodec"
