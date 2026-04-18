@@ -25,55 +25,8 @@ PATH_SIGNATURE_KEY = "observation.path_signature"
 DELTA_SIGNATURE_KEY = "observation.delta_signature"
 
 
-def _normalize_mode_name(mode: Any) -> str:
-    value = getattr(mode, "value", mode)
-    return str(value).upper()
-
-
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _load_numpy_stats(stats: dict[str, Any]) -> dict[str, np.ndarray]:
-    return {
-        key: np.asarray(value, dtype=np.float32)
-        for key, value in stats.items()
-        if key in {"mean", "std", "min", "max", "q01", "q99", "q10", "q90"}
-    }
-
-
-def _normalize_values(
-    values: np.ndarray,
-    *,
-    stats: dict[str, np.ndarray],
-    mode_name: str,
-    eps: float,
-) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32)
-    if mode_name == "IDENTITY":
-        return array
-    if mode_name == "MEAN_STD":
-        return (array - stats["mean"]) / (stats["std"] + float(eps))
-    if mode_name == "MIN_MAX":
-        return ((array - stats["min"]) / (stats["max"] - stats["min"] + float(eps))) * 2.0 - 1.0
-    if mode_name == "QUANTILES":
-        return ((array - stats["q01"]) / (stats["q99"] - stats["q01"] + float(eps))) * 2.0 - 1.0
-    if mode_name == "QUANTILE10":
-        return ((array - stats["q10"]) / (stats["q90"] - stats["q10"] + float(eps))) * 2.0 - 1.0
-    raise ValueError(f"Unsupported signature normalization mode: {mode_name}.")
-
-
-def _clip_values_to_stats_support(
-    values: np.ndarray,
-    *,
-    stats: dict[str, np.ndarray],
-) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32)
-    min_value = stats.get("min")
-    max_value = stats.get("max")
-    if min_value is None or max_value is None:
-        return array
-    return np.clip(array, min_value, max_value)
 
 
 def _find_training_split_artifact(policy_dir: Path) -> Path | None:
@@ -85,51 +38,46 @@ def _find_training_split_artifact(policy_dir: Path) -> Path | None:
     return None
 
 
-@dataclass(frozen=True)
-class SignatureNormalizationState:
-    feature_stats: dict[str, dict[str, np.ndarray]]
-    mode_name: str
-    eps: float
-    dataset_root: Path
+def _resolve_dataset_root(split_payload: dict[str, Any]) -> Path | None:
+    dataset_root_raw = split_payload.get("dataset_root")
+    if not dataset_root_raw:
+        return None
 
-    def normalize(self, feature_key: str, values: np.ndarray) -> np.ndarray:
-        stats = self.feature_stats.get(feature_key)
-        if stats is None:
-            return np.asarray(values, dtype=np.float32)
-        clipped = _clip_values_to_stats_support(values, stats=stats)
-        return _normalize_values(
-            clipped,
-            stats=stats,
-            mode_name=self.mode_name,
-            eps=self.eps,
-        )
+    dataset_root = Path(dataset_root_raw).expanduser().resolve(strict=False)
+    if dataset_root.exists():
+        return dataset_root
+
+    dataset_repo_id = split_payload.get("dataset_repo_id")
+    if dataset_repo_id:
+        repo_dataset_root = resolve_code_root() / "data" / Path(str(dataset_repo_id))
+        if repo_dataset_root.exists():
+            return repo_dataset_root.resolve(strict=False)
+    return dataset_root
+
+
+@dataclass(frozen=True)
+class SignatureDatasetSpec:
+    dataset_root: Path
+    backend: str | None
+    window: str | None
 
     @property
     def summary(self) -> str:
-        enabled_keys = ",".join(sorted(self.feature_stats))
         return (
-            f"enabled(keys={enabled_keys}, mode={self.mode_name}, clip=minmax, "
-            f"dataset_root={self.dataset_root})"
+            f"dataset_backend={self.backend or 'unknown'}, "
+            f"dataset_window={self.window or 'unknown'}, "
+            f"dataset_root={self.dataset_root}"
         )
 
 
-def _maybe_load_signature_normalization_state(
+def _maybe_load_signature_dataset_spec(
     *,
     loaded_policy_cfg: Any | None,
     policy_dir: Path | None,
-) -> SignatureNormalizationState | None:
+) -> SignatureDatasetSpec | None:
     if loaded_policy_cfg is None or policy_dir is None:
         return None
-
-    pre_normalized_keys = {
-        str(key) for key in getattr(loaded_policy_cfg, "pre_normalized_observation_keys", ())
-    }
-    target_keys = {
-        key
-        for key in (PATH_SIGNATURE_KEY, DELTA_SIGNATURE_KEY)
-        if key in pre_normalized_keys
-    }
-    if not target_keys:
+    if not bool(getattr(loaded_policy_cfg, "use_path_signature", False)):
         return None
 
     split_artifact = _find_training_split_artifact(policy_dir)
@@ -137,37 +85,31 @@ def _maybe_load_signature_normalization_state(
         return None
 
     split_payload = _load_json(split_artifact)
-    dataset_root_raw = split_payload.get("dataset_root")
-    if not dataset_root_raw:
+    dataset_root = _resolve_dataset_root(split_payload)
+    if dataset_root is None:
         return None
 
-    dataset_root = Path(dataset_root_raw).expanduser().resolve(strict=False)
-    if not dataset_root.exists():
-        dataset_repo_id = split_payload.get("dataset_repo_id")
-        if dataset_repo_id:
-            repo_dataset_root = resolve_code_root() / "data" / Path(str(dataset_repo_id))
-            if repo_dataset_root.exists():
-                dataset_root = repo_dataset_root.resolve(strict=False)
-    stats_path = dataset_root / "meta" / "stats.json"
-    if not stats_path.is_file():
+    info_path = dataset_root / "meta" / "info.json"
+    if not info_path.is_file():
         return None
 
-    stats_payload = _load_json(stats_path)
-    feature_stats = {
-        key: _load_numpy_stats(stats_payload[key])
-        for key in target_keys
-        if key in stats_payload and isinstance(stats_payload[key], dict)
-    }
-    if not feature_stats:
+    info_payload = _load_json(info_path)
+    path_signature_info = info_payload.get("path_signature")
+    if not isinstance(path_signature_info, dict):
         return None
 
-    normalization_mapping = getattr(loaded_policy_cfg, "normalization_mapping", {}) or {}
-    mode_name = _normalize_mode_name(normalization_mapping.get("STATE", "MEAN_STD"))
-    return SignatureNormalizationState(
-        feature_stats=feature_stats,
-        mode_name=mode_name,
-        eps=1e-8,
+    return SignatureDatasetSpec(
         dataset_root=dataset_root,
+        backend=(
+            None
+            if path_signature_info.get("backend") in {None, "", "null"}
+            else str(path_signature_info.get("backend"))
+        ),
+        window=(
+            None
+            if path_signature_info.get("window") in {None, "", "null"}
+            else str(path_signature_info.get("window"))
+        ),
     )
 
 
@@ -208,18 +150,32 @@ class OnlineSignatureRuntime:
             None if raw_signature_dim in {None, 0} else int(raw_signature_dim)
         )
 
-        maxlen = self._history_length if self._history_length and self._history_length > 0 else None
-        self._history: deque[np.ndarray] = deque(maxlen=maxlen)
         self._previous_signature_raw: np.ndarray | None = None
         self._backend = (
             resolve_signature_backend(policy_config.signature_backend)
             if self.enabled
             else "disabled"
         )
-        self._normalization_state = _maybe_load_signature_normalization_state(
+        self._dataset_spec = _maybe_load_signature_dataset_spec(
             loaded_policy_cfg=loaded_policy_cfg,
             policy_dir=policy_dir,
         )
+        if self._dataset_spec is not None:
+            dataset_window = (self._dataset_spec.window or "").strip().lower()
+            if dataset_window == "full_prefix":
+                self._history_length = None
+
+            dataset_backend = (self._dataset_spec.backend or "").strip().lower()
+            if dataset_backend in {"simple", "signatory"} and dataset_backend != self._backend:
+                raise RuntimeError(
+                    "Online signature backend mismatch: "
+                    f"deploy resolved backend={self._backend}, "
+                    f"but dataset metadata requires backend={dataset_backend}. "
+                    "Use the same signature backend as dataset generation."
+                )
+
+        maxlen = self._history_length if self._history_length and self._history_length > 0 else None
+        self._history = deque(maxlen=maxlen)
 
     @property
     def enabled(self) -> bool:
@@ -235,9 +191,13 @@ class OnlineSignatureRuntime:
 
     @property
     def normalization_summary(self) -> str:
-        if self._normalization_state is None:
-            return "disabled"
-        return self._normalization_state.summary
+        return "disabled"
+
+    @property
+    def dataset_summary(self) -> str:
+        if self._dataset_spec is None:
+            return "unknown"
+        return self._dataset_spec.summary
 
     def reset(self) -> None:
         self._history.clear()
@@ -283,17 +243,6 @@ class OnlineSignatureRuntime:
 
         signature = raw_signature
         delta = raw_delta
-        if self._normalization_state is not None:
-            if self._use_path:
-                signature = self._normalization_state.normalize(
-                    PATH_SIGNATURE_KEY,
-                    raw_signature,
-                )
-            if self._use_delta and raw_delta is not None:
-                delta = self._normalization_state.normalize(
-                    DELTA_SIGNATURE_KEY,
-                    raw_delta,
-                )
         if not self._use_path:
             signature = None
         return signature, delta

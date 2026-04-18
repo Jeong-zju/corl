@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main"))
@@ -96,52 +97,23 @@ def test_online_signature_runtime_uses_loaded_checkpoint_signature_settings() ->
     assert np.allclose(delta_t1, expected_t1 - expected_t0)
 
 
-def test_online_signature_runtime_normalizes_pre_normalized_signature_features(
+def test_online_signature_runtime_uses_dataset_full_prefix_window_when_available(
     tmp_path: Path,
 ) -> None:
     dataset_root = tmp_path / "data" / "zeno-ai" / "CleanTableTopDelayedToolChoice"
     stats_dir = dataset_root / "meta"
     stats_dir.mkdir(parents=True)
-
-    state_t0 = np.asarray([1.0, 2.0], dtype=np.float32)
-    state_t1 = np.asarray([3.0, 5.0], dtype=np.float32)
-    raw_signature_t0 = compute_simple_signature_np(
-        np.repeat(state_t0[None, :], 3, axis=0),
-        2,
-    )
-    raw_signature_t1 = compute_simple_signature_np(
-        np.asarray(
-            [
-                state_t0,
-                state_t0,
-                state_t1,
-            ],
-            dtype=np.float32,
+    (stats_dir / "info.json").write_text(
+        json.dumps(
+            {
+                "path_signature": {
+                    "backend": "simple",
+                    "window": "full_prefix",
+                }
+            }
         ),
-        2,
+        encoding="utf-8",
     )
-    raw_delta_t0 = np.zeros_like(raw_signature_t0)
-    raw_delta_t1 = raw_signature_t1 - raw_signature_t0
-
-    path_mean = np.full_like(raw_signature_t0, 1.5, dtype=np.float32)
-    path_std = np.full_like(raw_signature_t0, 0.5, dtype=np.float32)
-    delta_mean = np.full_like(raw_signature_t0, -0.25, dtype=np.float32)
-    delta_std = np.full_like(raw_signature_t0, 2.0, dtype=np.float32)
-    stats_payload = {
-        "observation.path_signature": {
-            "min": np.minimum(raw_signature_t0, raw_signature_t1).tolist(),
-            "max": np.maximum(raw_signature_t0, raw_signature_t1).tolist(),
-            "mean": path_mean.tolist(),
-            "std": path_std.tolist(),
-        },
-        "observation.delta_signature": {
-            "min": np.minimum(raw_delta_t0, raw_delta_t1).tolist(),
-            "max": np.maximum(raw_delta_t0, raw_delta_t1).tolist(),
-            "mean": delta_mean.tolist(),
-            "std": delta_std.tolist(),
-        },
-    }
-    (stats_dir / "stats.json").write_text(json.dumps(stats_payload), encoding="utf-8")
 
     run_root = tmp_path / "outputs" / "train" / "streaming-act-prism" / "20260418_010000"
     policy_dir = run_root / "checkpoints" / "last" / "pretrained_model"
@@ -173,44 +145,28 @@ def test_online_signature_runtime_normalizes_pre_normalized_signature_features(
         policy_dir=policy_dir,
     )
 
-    signature_t0, delta_t0 = runtime.update(state_t0)
-    signature_t1, delta_t1 = runtime.update(state_t1)
-
-    expected_signature_t0 = (raw_signature_t0 - path_mean) / path_std
-    expected_signature_t1 = (raw_signature_t1 - path_mean) / path_std
-    expected_delta_t0 = (raw_delta_t0 - delta_mean) / delta_std
-    expected_delta_t1 = (raw_delta_t1 - delta_mean) / delta_std
-
-    assert runtime.normalization_summary.startswith("enabled(")
-    assert np.allclose(signature_t0, expected_signature_t0)
-    assert np.allclose(signature_t1, expected_signature_t1)
-    assert np.allclose(delta_t0, expected_delta_t0)
-    assert np.allclose(delta_t1, expected_delta_t1)
+    assert runtime.history_length is None
+    assert "dataset_window=full_prefix" in runtime.dataset_summary
+    assert runtime.normalization_summary == "disabled"
 
 
-def test_online_signature_runtime_clips_signature_values_to_training_support(
+def test_online_signature_runtime_rejects_dataset_backend_mismatch(
     tmp_path: Path,
 ) -> None:
     dataset_root = tmp_path / "data" / "zeno-ai" / "CleanTableTopDelayedToolChoice"
     stats_dir = dataset_root / "meta"
     stats_dir.mkdir(parents=True)
-
-    # The second coordinate is intentionally constant in training support.
-    stats_payload = {
-        "observation.path_signature": {
-            "min": [0.0, 0.0],
-            "max": [10.0, 0.0],
-            "mean": [5.0, 0.0],
-            "std": [2.0, 1e-8],
-        },
-        "observation.delta_signature": {
-            "min": [-1.0, 0.0],
-            "max": [1.0, 0.0],
-            "mean": [0.0, 0.0],
-            "std": [0.5, 1e-8],
-        },
-    }
-    (stats_dir / "stats.json").write_text(json.dumps(stats_payload), encoding="utf-8")
+    (stats_dir / "info.json").write_text(
+        json.dumps(
+            {
+                "path_signature": {
+                    "backend": "signatory",
+                    "window": "full_prefix",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     run_root = tmp_path / "outputs" / "train" / "streaming-act-prism" / "20260418_010000"
     policy_dir = run_root / "checkpoints" / "last" / "pretrained_model"
@@ -225,36 +181,18 @@ def test_online_signature_runtime_clips_signature_values_to_training_support(
         encoding="utf-8",
     )
 
-    runtime = OnlineSignatureRuntime(
-        _make_policy_config(signature_backend="simple"),
-        loaded_policy_cfg=SimpleNamespace(
-            use_path_signature=True,
-            use_delta_signature=True,
-            history_length=1,
-            signature_depth=1,
-            signature_dim=2,
-            pre_normalized_observation_keys=(
-                "observation.path_signature",
-                "observation.delta_signature",
+    with pytest.raises(RuntimeError, match="backend mismatch"):
+        OnlineSignatureRuntime(
+            _make_policy_config(signature_backend="simple"),
+            loaded_policy_cfg=SimpleNamespace(
+                use_path_signature=True,
+                use_delta_signature=True,
+                history_length=1,
+                signature_depth=1,
+                signature_dim=2,
             ),
-            normalization_mapping={"STATE": "MEAN_STD"},
-        ),
-        policy_dir=policy_dir,
-    )
-
-    # Isolate the support-clipping behavior by normalizing synthetic online values.
-    normalized_signature = runtime._normalization_state.normalize(
-        "observation.path_signature",
-        np.asarray([100.0, 0.2], dtype=np.float32),
-    )
-    normalized_delta = runtime._normalization_state.normalize(
-        "observation.delta_signature",
-        np.asarray([3.0, -0.4], dtype=np.float32),
-    )
-
-    # Both coordinates are clipped into training support before normalization.
-    assert np.allclose(normalized_signature, np.asarray([2.5, 0.0], dtype=np.float32))
-    assert np.allclose(normalized_delta, np.asarray([2.0, 0.0], dtype=np.float32))
+            policy_dir=policy_dir,
+        )
 
 
 def test_resolve_policy_dir_accepts_train_output_root_and_finds_latest_run(

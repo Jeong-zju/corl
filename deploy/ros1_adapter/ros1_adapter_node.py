@@ -24,6 +24,7 @@ from bridge.sync import (
     SOURCE_ODOM,
     SensorCache,
     TimedSample,
+    reorder_joint_positions,
 )
 from config import DeployConfig, load_deploy_config
 from policy_runtime.loader import PolicyRuntime
@@ -172,14 +173,13 @@ class DeployRosNode:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return np.ascontiguousarray(frame)
 
-    def _extract_joint_positions(self, msg) -> np.ndarray:
-        positions = list(msg.position)
-        dof = self.config.policy.arm_dof
-        if len(positions) >= dof:
-            positions = positions[:dof]
-        else:
-            positions = positions + [0.0] * (dof - len(positions))
-        return np.asarray(positions, dtype=np.float32)
+    def _extract_joint_positions(self, msg, expected_names: list[str]) -> np.ndarray:
+        return reorder_joint_positions(
+            positions=list(msg.position),
+            names=list(getattr(msg, "name", []) or []),
+            expected_names=expected_names,
+            dof=self.config.policy.arm_dof,
+        )
 
     def _extract_base_velocity(self, msg) -> np.ndarray:
         twist = msg.twist.twist
@@ -207,14 +207,14 @@ class DeployRosNode:
         self._store_sample(
             SOURCE_JOINT_LEFT,
             ros_stamp_to_ns(msg.header.stamp),
-            self._extract_joint_positions(msg),
+            self._extract_joint_positions(msg, self.config.ros.joint_names_left.name),
         )
 
     def _on_joint_right(self, msg) -> None:
         self._store_sample(
             SOURCE_JOINT_RIGHT,
             ros_stamp_to_ns(msg.header.stamp),
-            self._extract_joint_positions(msg),
+            self._extract_joint_positions(msg, self.config.ros.joint_names_right.name),
         )
 
     def _on_odom(self, msg) -> None:
@@ -237,6 +237,13 @@ class DeployRosNode:
         state = self.cache.latest_state_vector(arm_dof=self.config.policy.arm_dof)
         if state is None:
             return None, "Missing low-dimensional state for inference."
+
+        stamp_span_ms = self.cache.stamp_span_ms(list(ALL_REQUIRED_SOURCES))
+        if stamp_span_ms > 80.0:
+            self.rospy.logwarn_throttle(
+                2.0,
+                f"ROS inputs are temporally misaligned: stamp_span_ms={stamp_span_ms:.1f}",
+            )
 
         images = {
             self.config.policy.image_keys["left"]: self.cache.get(SOURCE_IMAGE_LEFT).value,
@@ -325,6 +332,7 @@ class DeployRosNode:
                     else f"history={self.signature_runtime.history_length}"
                 )
                 + f", normalization={self.signature_runtime.normalization_summary}"
+                + f", {self.signature_runtime.dataset_summary}"
             )
         )
         self.rospy.loginfo(
