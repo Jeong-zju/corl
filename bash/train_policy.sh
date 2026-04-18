@@ -21,6 +21,7 @@ cd "${REPO_ROOT}"
 policy_name="act"
 env_name=""
 dataset_name=""
+task_name=""
 defaults_path=""
 forward_args=()
 
@@ -34,22 +35,28 @@ distributed_machine_rank="0"
 distributed_main_process_ip=""
 distributed_main_process_port=""
 
-resolve_defaults_path_from_dataset() {
+resolve_defaults_path_from_dataset_and_task() {
   local dataset_selector="$1"
+  local task_selector="$2"
   python3 -c '
 from pathlib import Path
 import sys
 
 repo_root = Path(sys.argv[1]).resolve()
 dataset_selector = sys.argv[2]
-policy_name = sys.argv[3]
+task_selector = sys.argv[3]
+policy_name = sys.argv[4]
 
 sys.path.insert(0, str(repo_root / "scripts"))
-from policy_defaults import resolve_dataset_defaults_path
+from policy_defaults import resolve_cli_dataset_defaults_path
 
-path = resolve_dataset_defaults_path(dataset_selector, policy_name)
+path = resolve_cli_dataset_defaults_path(
+    dataset_selector=dataset_selector or None,
+    task_selector=task_selector or None,
+    policy_name=policy_name,
+)
 print("" if path is None else path.as_posix())
-' "${REPO_ROOT}" "${dataset_selector}" "${policy_name}"
+' "${REPO_ROOT}" "${dataset_selector}" "${task_selector}" "${policy_name}"
 }
 
 load_train_defaults() {
@@ -137,6 +144,20 @@ while [[ $# -gt 0 ]]; do
       forward_args+=("$1")
       shift
       ;;
+    --task|--tasks|--cil)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a value." >&2
+        exit 2
+      fi
+      task_name="$2"
+      forward_args+=("$1" "$2")
+      shift 2
+      ;;
+    --task=*|--tasks=*|--cil=*)
+      task_name="${1#*=}"
+      forward_args+=("$1")
+      shift
+      ;;
     *)
       forward_args+=("$1")
       shift
@@ -145,7 +166,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "${dataset_name}" ]]; then
-  defaults_path="$(resolve_defaults_path_from_dataset "${dataset_name}")"
+  defaults_path="$(resolve_defaults_path_from_dataset_and_task "${dataset_name}" "${task_name}")"
 elif [[ -n "${env_name}" ]]; then
   defaults_path="bash/defaults/${env_name}/${policy_name}.yaml"
   if [[ ! -f "${defaults_path}" ]]; then
