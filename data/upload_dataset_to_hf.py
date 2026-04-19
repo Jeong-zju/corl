@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,9 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAIN_ROOT = SCRIPT_DIR.parent
 DATA_ROOT = MAIN_ROOT / "data"
+DEFAULT_NAMESPACE_OVERRIDES: dict[str, str] = {
+    "robocasa": "zeno-ai",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,8 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Target Hugging Face dataset repo id. If omitted, the script tries to "
-            "infer it from a `data/<namespace>/<name>` path."
+            "Target Hugging Face dataset repo id. If omitted, the script derives a "
+            "legal repo id from the local path under `data/`."
+        ),
+    )
+    parser.add_argument(
+        "--repo-namespace",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face namespace / organization to use when inferring "
+            "the repo id. For example, RoboCasa datasets default to `zeno-ai`."
         ),
     )
     visibility = parser.add_mutually_exclusive_group()
@@ -288,44 +301,101 @@ def resolve_repo_visibility(*, private: bool, public: bool) -> bool | None:
     return None
 
 
-def infer_default_repo_id(
+def normalize_repo_namespace(repo_namespace: str | None) -> str | None:
+    if repo_namespace is None:
+        return None
+    normalized = repo_namespace.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        raise ValueError("`--repo-namespace` must not be empty.")
+    if "/" in normalized:
+        raise ValueError(
+            "`--repo-namespace` must be a single Hugging Face namespace without `/`."
+        )
+    return normalized
+
+
+def _relative_dataset_parts(
     local_path: Path,
     *,
     data_root: Path = DATA_ROOT,
-) -> str | None:
+) -> tuple[str, ...] | None:
     try:
         relative = local_path.resolve().relative_to(data_root.resolve())
     except ValueError:
         return None
 
-    parts = relative.parts
+    return relative.parts
+
+
+def _sanitize_repo_name(text: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip())
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    normalized = re.sub(r"\.{2,}", ".", normalized)
+    normalized = normalized.strip("-.")
+    if normalized.endswith(".git"):
+        normalized = f"{normalized[:-4]}-git".strip("-.")
+    if not normalized:
+        raise ValueError(
+            "Could not derive a valid Hugging Face repo name from the local dataset path."
+        )
+    return normalized
+
+
+def infer_default_repo_id(
+    local_path: Path,
+    *,
+    data_root: Path = DATA_ROOT,
+    repo_namespace: str | None = None,
+) -> str | None:
+    parts = _relative_dataset_parts(local_path, data_root=data_root)
+    if not parts:
+        return None
+
+    normalized_namespace = normalize_repo_namespace(repo_namespace)
+    if normalized_namespace is None and len(parts) >= 2:
+        normalized_namespace = DEFAULT_NAMESPACE_OVERRIDES.get(parts[0], parts[0])
+
+    if normalized_namespace is None:
+        return _sanitize_repo_name(parts[0])
+
     if len(parts) == 1:
-        return parts[0]
-    if len(parts) == 2:
-        return f"{parts[0]}/{parts[1]}"
-    return None
+        repo_name_parts = parts
+    elif normalized_namespace == parts[0]:
+        repo_name_parts = (parts[1],) if len(parts) == 2 else parts[1:]
+    else:
+        repo_name_parts = parts
+
+    repo_name = _sanitize_repo_name("-".join(repo_name_parts))
+    return f"{normalized_namespace}/{repo_name}"
 
 
 def resolve_repo_id(
     local_path: Path,
     *,
     repo_id: str | None,
+    repo_namespace: str | None = None,
     data_root: Path = DATA_ROOT,
 ) -> str:
     if repo_id is not None:
+        if repo_namespace is not None:
+            raise ValueError("Pass either `--repo-id` or `--repo-namespace`, not both.")
         normalized = repo_id.strip()
         if not normalized:
             raise ValueError("`--repo-id` must not be empty.")
         return normalized
 
-    inferred = infer_default_repo_id(local_path, data_root=data_root)
+    inferred = infer_default_repo_id(
+        local_path,
+        data_root=data_root,
+        repo_namespace=repo_namespace,
+    )
     if inferred is not None:
         return inferred
 
     raise ValueError(
         "Could not infer a Hugging Face repo id from the local path. "
         "Pass `--repo-id` explicitly. Automatic inference only works for paths "
-        "under `data/<name>` or `data/<namespace>/<name>`."
+        "under `data/`."
     )
 
 
@@ -485,7 +555,11 @@ def main(argv: list[str] | None = None) -> int:
         allow_patterns = normalize_patterns(args.include_patterns)
         ignore_patterns = normalize_patterns(args.exclude_patterns)
         private = resolve_repo_visibility(private=args.private, public=args.public)
-        repo_id = resolve_repo_id(local_path, repo_id=args.repo_id)
+        repo_id = resolve_repo_id(
+            local_path,
+            repo_id=args.repo_id,
+            repo_namespace=args.repo_namespace,
+        )
         validate_upload_options(
             large_folder=args.large_folder,
             path_in_repo=path_in_repo,

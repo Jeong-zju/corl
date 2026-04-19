@@ -90,20 +90,50 @@ def test_resolve_repo_id_infers_namespace_name_for_two_level_paths(tmp_path: Pat
     repo_id = MODULE.resolve_repo_id(
         dataset_root,
         repo_id=None,
+        repo_namespace=None,
         data_root=data_root,
     )
 
     assert repo_id == "zeno-ai/demo_dataset"
 
 
-def test_resolve_repo_id_requires_explicit_value_for_deeper_paths(tmp_path: Path) -> None:
+def test_resolve_repo_id_maps_robocasa_datasets_to_zeno_ai_by_default(tmp_path: Path) -> None:
     data_root = tmp_path / "main" / "data"
     dataset_root = _make_fake_dataset_root(data_root / "robocasa" / "composite" / "task_a")
 
-    with pytest.raises(ValueError, match="Could not infer a Hugging Face repo id"):
+    repo_id = MODULE.resolve_repo_id(
+        dataset_root,
+        repo_id=None,
+        repo_namespace=None,
+        data_root=data_root,
+    )
+
+    assert repo_id == "zeno-ai/robocasa-composite-task_a"
+
+
+def test_resolve_repo_id_supports_explicit_repo_namespace_for_deeper_paths(tmp_path: Path) -> None:
+    data_root = tmp_path / "main" / "data"
+    dataset_root = _make_fake_dataset_root(data_root / "robocasa" / "composite" / "task_a")
+
+    repo_id = MODULE.resolve_repo_id(
+        dataset_root,
+        repo_id=None,
+        repo_namespace="robocasa",
+        data_root=data_root,
+    )
+
+    assert repo_id == "robocasa/composite-task_a"
+
+
+def test_resolve_repo_id_rejects_repo_id_and_namespace_together(tmp_path: Path) -> None:
+    data_root = tmp_path / "main" / "data"
+    dataset_root = _make_fake_dataset_root(data_root / "robocasa" / "composite" / "task_a")
+
+    with pytest.raises(ValueError, match="either `--repo-id` or `--repo-namespace`"):
         MODULE.resolve_repo_id(
             dataset_root,
-            repo_id=None,
+            repo_id="zeno-ai/manual-repo",
+            repo_namespace="zeno-ai",
             data_root=data_root,
         )
 
