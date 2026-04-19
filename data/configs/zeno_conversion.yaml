@@ -1,5 +1,5 @@
 dataset:
-  data_root: data/zeno-ai/mem-1
+  data_root: data/zeno-ai/mem-21
   output_dir: data/zeno-ai
   output_name: CleanTableTopDelayedToolChoice
   task_label: pick
@@ -43,7 +43,7 @@ topics:
           - twist.twist.linear.x
           - twist.twist.linear.y
           - twist.twist.angular.z
-        default: [0.0, 0.0, 0.0]
+        default: [ 0.0, 0.0, 0.0 ]
         names:
           - base_vx
           - base_vy
