@@ -310,11 +310,15 @@ class DeployRosNode:
             command_packet = build_command_packet(
                 config=self.config,
                 seq=self.seq,
-                obs_seq=int(observation["seq"]),
+                obs_seq=int(result.get("obs_seq", observation["seq"])),
                 action=action,
                 status="ok",
-                message="policy_eval",
-                runtime_ms=float(result["runtime_ms"]),
+                message=str(result.get("message", "policy_eval")),
+                runtime_ms=(
+                    None
+                    if result.get("runtime_ms") is None
+                    else float(result["runtime_ms"])
+                ),
             )
             self.publishers.publish(command_packet)
             self.pending_reset = False
@@ -336,10 +340,11 @@ class DeployRosNode:
             )
         )
         self.rospy.loginfo(
-            "Deploy node started: policy=%s path=%s hz=%.2f signatures=%s",
+            "Deploy node started: policy=%s path=%s hz=%.2f execution=%s signatures=%s",
             self.config.policy.type,
             self.config.policy.path,
             self.config.runtime.control_hz,
+            self.policy_runtime.execution_summary,
             signature_status,
         )
         self.rospy.spin()

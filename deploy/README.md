@@ -18,6 +18,7 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 
 - `policy.path`：checkpoint 路径，按当前 YAML 文件的相对路径解析；也可以直接写训练输出根目录，deploy 会自动解析最新 run
 - `policy.device`：推理设备
+- `policy.temporal_ensemble_coeff`：`0` 表示按 `n_action_steps` 开环执行；非 `0` 表示每步推理一次，并按该系数做 temporal ensemble（deploy 会强制按单步执行，即 `n_action_steps=1`）
 - `ros.topics.*`：订阅/发布话题
 - `runtime.control_hz`：推理控制频率
 - `ros.joint_names_left.name` / `ros.joint_names_right.name`
@@ -32,3 +33,4 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - 如果 checkpoint 把 signature 特征标记成 `pre_normalized_observation_keys`，deploy 会自动从训练 run 关联的数据集 `meta/stats.json` 读取统计量，对在线 `path_signature` / `delta_signature` 做同样的归一化；为了抑制真实机器人噪声在零方差维度上的放大，归一化前还会先裁到训练数据的 `min/max` 支持范围内。
 - 对 `streaming_act` 的 PRISM 变体，在线部署走的是“当前帧 + 在线 visual prefix memory / slot memory 更新”路径，不需要每步重建显式 prefix sequence tensor。
 - 如果图像颜色和训练时不一致，优先改 YAML 里的 `image.color_order`。
+- `policy.temporal_ensemble_coeff=0` 时，deploy 会缓存一段 action chunk 并开环消费；`!=0` 时，每个控制周期都会重新推理，并使用 temporal ensemble 输出当前动作。

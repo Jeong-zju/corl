@@ -27,6 +27,7 @@ def _make_policy_config(**overrides) -> PolicyConfig:
         device="cpu",
         load_device=None,
         n_action_steps=None,
+        temporal_ensemble_coeff=0.0,
         state_dim=17,
         action_dim=17,
         arm_dof=7,

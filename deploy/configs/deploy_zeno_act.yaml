@@ -4,6 +4,7 @@ policy:
   device: cuda
   load_device: null
   n_action_steps: 50
+  temporal_ensemble_coeff: 0.0
   state_dim: 17
   action_dim: 17
   arm_dof: 7

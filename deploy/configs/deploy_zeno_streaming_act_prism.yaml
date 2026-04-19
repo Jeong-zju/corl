@@ -3,7 +3,8 @@ policy:
   path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism/20260419_072016/checkpoints/040000
   device: cuda
   load_device: null
-  n_action_steps: 30
+  n_action_steps: 1
+  temporal_ensemble_coeff: 0.0
   state_dim: 17
   action_dim: 17
   arm_dof: 7

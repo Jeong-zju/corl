@@ -13,6 +13,7 @@ class PolicyConfig:
     device: str
     load_device: str | None
     n_action_steps: int | None
+    temporal_ensemble_coeff: float
     state_dim: int
     action_dim: int
     arm_dof: int
@@ -136,6 +137,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
         n_action_steps=(
             None if policy_raw.get("n_action_steps") is None else int(policy_raw["n_action_steps"])
         ),
+        temporal_ensemble_coeff=float(policy_raw.get("temporal_ensemble_coeff", 0.0)),
         state_dim=int(policy_raw.get("state_dim", 17)),
         action_dim=int(policy_raw.get("action_dim", 17)),
         arm_dof=int(policy_raw.get("arm_dof", 7)),
