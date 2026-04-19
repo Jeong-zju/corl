@@ -290,7 +290,105 @@ def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
     args.robocasa_conda_env = args.eval_robocasa_conda_env
     args.eval_robocasa_split = str(getattr(args, "robocasa_split", "target"))
     args.robocasa_split = args.eval_robocasa_split
+    temporal_ensemble_coeff = getattr(args, "temporal_ensemble_coeff", None)
+    if temporal_ensemble_coeff is not None:
+        temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+        args.temporal_ensemble_coeff = temporal_ensemble_coeff
+    args.eval_temporal_ensemble_coeff = temporal_ensemble_coeff
     return args
+
+
+def validate_policy_n_action_steps(cfg) -> None:
+    n_action_steps = getattr(cfg, "n_action_steps", None)
+    if n_action_steps is None:
+        return
+
+    cfg.n_action_steps = int(n_action_steps)
+    if cfg.n_action_steps <= 0:
+        raise ValueError(
+            f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
+        )
+    if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
+        raise ValueError(
+            "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
+            f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
+        )
+    if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
+        max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
+        if cfg.n_action_steps > max_n_action_steps:
+            raise ValueError(
+                "`--n-action-steps` cannot exceed the checkpoint diffusion "
+                "execution window (`horizon - n_obs_steps + 1`). "
+                f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
+                f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
+            )
+
+
+def configure_streaming_act_eval_runtime(
+    *,
+    policy,
+    cfg,
+    requested_n_action_steps: int | None,
+    requested_temporal_ensemble_coeff: float | None,
+    temporal_ensembler_factory=None,
+) -> bool:
+    runtime_reconfigured = False
+
+    if requested_n_action_steps is not None:
+        cfg.n_action_steps = int(requested_n_action_steps)
+        runtime_reconfigured = True
+
+    if requested_temporal_ensemble_coeff is not None:
+        coeff = float(requested_temporal_ensemble_coeff)
+        if coeff < 0.0:
+            raise ValueError(
+                "`--temporal-ensemble-coeff` must be >= 0. "
+                f"Got {coeff}."
+            )
+
+        runtime_reconfigured = True
+        if coeff == 0.0:
+            if getattr(cfg, "temporal_ensemble_coeff", None) is not None:
+                print(
+                    "[eval] temporal_ensemble_coeff=0 -> disabling temporal "
+                    "ensembling and using the current rollout action queue."
+                )
+            cfg.temporal_ensemble_coeff = None
+        else:
+            if int(getattr(cfg, "n_action_steps", 1)) != 1:
+                print(
+                    "[eval] temporal ensembling enabled -> forcing "
+                    "`n_action_steps=1` for per-step replanning."
+                )
+            cfg.temporal_ensemble_coeff = coeff
+            cfg.n_action_steps = 1
+
+    effective_temporal_ensemble_coeff = getattr(cfg, "temporal_ensemble_coeff", None)
+    if effective_temporal_ensemble_coeff is not None:
+        if int(getattr(cfg, "n_action_steps", 1)) != 1:
+            print(
+                "[eval] `streaming_act` temporal ensembling requires "
+                "`n_action_steps=1`; overriding the rollout setting."
+            )
+            cfg.n_action_steps = 1
+            runtime_reconfigured = True
+
+        if temporal_ensembler_factory is None:
+            ensure_streaming_act_importable(PROJECT_ROOT)
+            from lerobot_policy_streaming_act.modeling_streaming_act import (
+                StreamingACTTemporalEnsembler,
+            )
+
+            temporal_ensembler_factory = StreamingACTTemporalEnsembler
+
+        policy.temporal_ensembler = temporal_ensembler_factory(
+            float(effective_temporal_ensemble_coeff),
+            int(cfg.chunk_size),
+        )
+        runtime_reconfigured = True
+
+    validate_policy_n_action_steps(cfg)
+    return runtime_reconfigured
 
 
 def ensure_writable_hf_cache_env(project_root: Path) -> None:
@@ -571,6 +669,18 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning. Defaults to the checkpoint config."
         ),
     )
+    if known_args.policy == "streaming_act":
+        parser.add_argument(
+            "--temporal-ensemble-coeff",
+            type=float,
+            default=defaults.get("temporal_ensemble_coeff"),
+            help=(
+                "Streaming ACT rollout override for temporal action ensembling. "
+                "Set to 0 to disable and keep the current rollout behavior. "
+                "Set to a non-zero value to enable temporal ensembling, force "
+                "`n_action_steps=1`, and execute ensembled actions."
+            ),
+        )
     parser.add_argument(
         "--device",
         type=str,
@@ -1562,26 +1672,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     cfg = policy.config
     cfg.device = args.device
-    if args.n_action_steps is not None:
-        cfg.n_action_steps = int(args.n_action_steps)
-        if cfg.n_action_steps <= 0:
-            raise ValueError(
-                f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
-            )
-        if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
-            raise ValueError(
-                "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
-                f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
-            )
-        if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
-            max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
-            if cfg.n_action_steps > max_n_action_steps:
-                raise ValueError(
-                    "`--n-action-steps` cannot exceed the checkpoint diffusion "
-                    "execution window (`horizon - n_obs_steps + 1`). "
-                    f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
-                    f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
-                )
+    runtime_reconfigured = False
+    if args.policy == "streaming_act":
+        runtime_reconfigured = configure_streaming_act_eval_runtime(
+            policy=policy,
+            cfg=cfg,
+            requested_n_action_steps=args.n_action_steps,
+            requested_temporal_ensemble_coeff=getattr(
+                args,
+                "eval_temporal_ensemble_coeff",
+                None,
+            ),
+        )
+    else:
+        if args.n_action_steps is not None:
+            cfg.n_action_steps = int(args.n_action_steps)
+            runtime_reconfigured = True
+        validate_policy_n_action_steps(cfg)
     if (
         hasattr(policy, "get_visual_prefix_memory_debug_stats")
         and getattr(cfg, "use_visual_prefix_memory", False)
@@ -1594,7 +1701,7 @@ def main(argv: list[str] | None = None) -> None:
             "For the most responsive streaming evaluation, prefer `--n-action-steps 1`."
         )
     policy.eval()
-    if args.n_action_steps is not None and hasattr(policy, "reset"):
+    if runtime_reconfigured and hasattr(policy, "reset"):
         policy.reset()
 
     preprocessor_overrides = {

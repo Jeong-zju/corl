@@ -42,15 +42,22 @@ train:
   use_path_signature: true
   use_delta_signature: true
   use_prefix_sequence_training: true
-  prefix_train_max_steps: 16
-  prefix_frame_stride: 5
+  # Scaled from the CleanTableTopDelayedToolChoice 24 x 8 visual-prefix setup:
+  # - CleanTableTopDelayedToolChoice mean episode length: ~2910 frames
+  # - CloseFridge mean episode length: ~303 frames
+  # Keep a similar recent-prefix coverage ratio, but use denser sampling for the
+  # much shorter CloseFridge episodes. This preserves the first frame anchor and
+  # roughly the last ~20 frames of visual context.
+  prefix_train_max_steps: 12
+  prefix_frame_stride: 2
   prefix_pad_value: 0.0
   use_visual_prefix_memory: true
   use_signature_conditioned_visual_prefix_memory: false
   use_signature_indexed_slot_memory: true
   use_memory_conditioned_encoder_film: true
   num_memory_slots: 1
-  slot_memory_num_slots: 4
+  # Keep the tuned 1:4 slot-to-prefix ratio from the CleanTableTop reference.
+  slot_memory_num_slots: 3
   slot_memory_routing_hidden_dim: 512
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
@@ -80,6 +87,7 @@ eval:
   seed: 42
   device: "cuda"
   n_action_steps: 100
+  temporal_ensemble_coeff: 0.005
   signature_backend: "auto"
   robocasa_conda_env: "robocasa"
   robocasa_split: "target"
