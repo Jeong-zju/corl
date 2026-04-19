@@ -1,0 +1,96 @@
+# Single-task defaults for RoboCasa composite/LoadCondimentsInFridge.
+train:
+  dataset_root: "data/robocasa/composite/LoadCondimentsInFridge"
+  dataset_repo_id: "robocasa/composite/LoadCondimentsInFridge"
+  output_root: "outputs/train/robocasa/composite/LoadCondimentsInFridge/streaming-act-prism"
+  resume: false
+  job_name: "streaming-act-prism"
+  wandb_project: "robocasa-composite-loadcondimentsinfridge"
+  wandb_mode: "online"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
+  # LoadCondimentsInFridge is shorter (~57s / ~1140 frames) but still demands
+  # memory for top-shelf occupancy and distractor relocation. Use a denser prefix
+  # than the longer tasks because local shelf state changes quickly.
+  steps: 220000
+  batch_size: 16
+  num_workers: 16
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  video_backend: "torchcodec"
+  torch_sharing_strategy: "file_system"
+  torchcodec_decoder_cache_size: 32
+  seed: 42
+  log_freq: 2000
+  save_freq: 50000
+  eval_freq: -1
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  chunk_size: 100
+  n_action_steps: 100
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+  use_path_signature: true
+  use_delta_signature: true
+  use_prefix_sequence_training: true
+  # Keep about 9.5 seconds of recent shelf interaction together with the first
+  # frame anchor. This is enough to recover cleared-space state while staying
+  # compute-light for a single-task run.
+  prefix_train_max_steps: 18
+  prefix_frame_stride: 12
+  prefix_pad_value: 0.0
+  use_visual_prefix_memory: true
+  use_signature_conditioned_visual_prefix_memory: false
+  use_signature_indexed_slot_memory: true
+  use_memory_conditioned_encoder_film: true
+  num_memory_slots: 1
+  slot_memory_num_slots: 5
+  slot_memory_routing_hidden_dim: 640
+  slot_memory_use_delta_routing: true
+  slot_memory_use_softmax_routing: true
+  slot_memory_use_readout_pooling: true
+  slot_memory_balance_loss_coef: 0.01
+  slot_memory_consistency_loss_coef: 0.005
+  history_length: 0
+  signature_dim: 0
+  signature_depth: 3
+  signature_hidden_dim: 640
+  signature_dropout: 0.05
+  signature_cache_mode: "ram"
+  signature_cache_dtype: "float16"
+  prefix_image_cache_mode: "off"
+  prefix_image_cache_dtype: "uint8"
+
+eval:
+  train_output_root: "outputs/train/robocasa/composite/LoadCondimentsInFridge/streaming-act-prism"
+  output_dir: "outputs/eval/robocasa/composite/LoadCondimentsInFridge/streaming-act-prism/{run_tag}"
+  task: "LoadCondimentsInFridge"
+  eval_split: "test"
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  max_episodes: 20
+  max_steps_per_episode: null
+  seed: 42
+  device: "cuda"
+  n_action_steps: 100
+  temporal_ensemble_coeff: 0
+  signature_backend: "auto"
+  robocasa_conda_env: "robocasa"
+  robocasa_split: "target"
+  num_rollouts: 20
+  max_steps: null
+  fps: 20
+  max_episodes_rendered: 4

@@ -184,6 +184,38 @@ def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_r
     assert args.signature_cache_mode == "ram"
 
 
+@pytest.mark.parametrize(
+    "task_name",
+    (
+        "PackFoodByTemp",
+        "StoreLeftoversByType",
+        "BeverageSorting",
+        "PackIdenticalLunches",
+        "CreateChildFriendlyFridge",
+        "LoadCondimentsInFridge",
+    ),
+)
+def test_resolve_dataset_defaults_path_supports_task_specific_composite_memory_defaults(
+    task_name: str,
+) -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="train",
+        dataset_selector=f"robocasa/composite/{task_name}",
+        policy_name="streaming_act",
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        f"main/bash/defaults/robocasa/composite/{task_name}/streaming_act.yaml"
+    )
+    assert defaults["dataset_root"] == f"data/robocasa/composite/{task_name}"
+    assert defaults["dataset_repo_id"] == f"robocasa/composite/{task_name}"
+    assert defaults["use_visual_prefix_memory"] is True
+    assert defaults["use_signature_indexed_slot_memory"] is True
+    assert defaults["use_memory_conditioned_encoder_film"] is True
+    assert defaults["signature_cache_mode"] == "ram"
+
+
 def test_resolve_training_dataset_root_uses_exact_named_child_from_dataset_tasks(
     tmp_path: Path,
 ) -> None:
