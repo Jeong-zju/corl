@@ -97,3 +97,28 @@ cd monitor
 pip install -r requirements.txt
 uvicorn app:app --reload
 ```
+
+
+# 部署指令
+
+```bash
+git clone https://github.com/Jeong-zju/corl.git
+cd corl/
+git switch develop/benchmark
+(python==3.12.13)
+pip install -r requirements.txt
+pip install -e depends/signatory --no-build-isolation
+sudo apt install aria2
+hf auth login
+wandb login
+cd data
+./hfd.sh zeno-ai/CleanTableTopDelayedToolChoice --dataset --local-dir zeno-ai/CleanTableTopDelayedToolChoice --hf_username jeong-zju --hf_token <token>
+cd ..
+python data/process_dataset.py zeno-ai/CleanTableTopDelayedToolChoice
+bash bash/train_policy.sh --dataset zeno-ai/CleanTableTopDelayedToolChoice --policy streaming_act
+vim bash/defaults/zeno-ai/CleanTableTopDelayedToolChoice/streaming_act.yaml
+
+(new terminal)
+
+python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism   --repo-id zeno-ai/CleanTableTopDelayedToolChoice-streaming-act --mode full --watch
+```
