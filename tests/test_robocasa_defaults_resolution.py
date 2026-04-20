@@ -185,8 +185,36 @@ def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_r
 
 
 @pytest.mark.parametrize(
+    ("policy_name", "expected_output_suffix"),
+    (
+        ("act", "robocasa/composite/OrganizeVegetables/act"),
+        ("diffusion", "robocasa/composite/OrganizeVegetables/diffusion"),
+        ("streaming_act", "robocasa/composite/OrganizeVegetables/streaming-act-prism"),
+    ),
+)
+def test_resolve_dataset_defaults_path_supports_organize_vegetables_policy_defaults(
+    policy_name: str,
+    expected_output_suffix: str,
+) -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="train",
+        dataset_selector="robocasa/composite/OrganizeVegetables",
+        policy_name=policy_name,
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        f"main/bash/defaults/robocasa/composite/OrganizeVegetables/{policy_name}.yaml"
+    )
+    assert defaults["dataset_root"] == "data/robocasa/composite/OrganizeVegetables"
+    assert defaults["dataset_repo_id"] == "robocasa/composite/OrganizeVegetables"
+    assert defaults["output_root"].endswith(expected_output_suffix)
+
+
+@pytest.mark.parametrize(
     "task_name",
     (
+        "OrganizeVegetables",
         "PackFoodByTemp",
         "StoreLeftoversByType",
         "BeverageSorting",
