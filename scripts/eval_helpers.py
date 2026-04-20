@@ -99,6 +99,20 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         last_nested = base / "checkpoints" / "last" / "pretrained_model"
         if (last_nested / "model.safetensors").exists():
             return last_nested
+        checkpoints_dir = base / "checkpoints"
+        if checkpoints_dir.is_dir():
+            checkpoint_pretrained_dirs = [
+                path / "pretrained_model"
+                for path in checkpoints_dir.iterdir()
+                if path.is_dir() and path.name.isdigit()
+            ]
+            checkpoint_pretrained_dirs.sort(
+                key=lambda path: int(path.parent.name),
+                reverse=True,
+            )
+            for checkpoint_pretrained_dir in checkpoint_pretrained_dirs:
+                if (checkpoint_pretrained_dir / "model.safetensors").exists():
+                    return checkpoint_pretrained_dir
 
     probe_lines = "\n".join(f"- {path}" for path in ordered)
     raise FileNotFoundError(
@@ -107,7 +121,8 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         "Expected one of:\n"
         "- <base>/model.safetensors\n"
         "- <base>/pretrained_model/model.safetensors\n"
-        "- <base>/checkpoints/last/pretrained_model/model.safetensors"
+        "- <base>/checkpoints/last/pretrained_model/model.safetensors\n"
+        "- <base>/checkpoints/<step>/pretrained_model/model.safetensors"
     )
 
 
