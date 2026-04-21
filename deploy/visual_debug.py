@@ -15,29 +15,53 @@ def _array(value: Any, *, dtype=None) -> np.ndarray | None:
     return arr
 
 
-def _first_row(value: Any) -> np.ndarray | None:
-    arr = _array(value, dtype=np.float32)
-    if arr is None:
-        return None
-    arr = np.squeeze(arr)
-    if arr.ndim == 0:
-        return arr.reshape(1)
-    if arr.ndim == 2:
-        return arr[0]
-    return arr.reshape(-1)
+def _even(value: int) -> int:
+    value = int(value)
+    return value if value % 2 == 0 else value + 1
 
 
-def _image_to_bgr(image: np.ndarray | None, *, color_order: str, width: int, height: int) -> np.ndarray:
+def _fit_bgr_to_canvas(
+    frame: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    pad_color: tuple[int, int, int] = (0, 0, 0),
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    canvas = np.full((height, width, 3), pad_color, dtype=np.uint8)
+    src_h, src_w = int(frame.shape[0]), int(frame.shape[1])
+    if src_h <= 0 or src_w <= 0:
+        return canvas, (0, 0, width, height)
+    scale = min(width / float(src_w), height / float(src_h))
+    fit_w = max(1, min(width, int(round(src_w * scale))))
+    fit_h = max(1, min(height, int(round(src_h * scale))))
+    x0 = (width - fit_w) // 2
+    y0 = (height - fit_h) // 2
+    resized = cv2.resize(frame, (fit_w, fit_h), interpolation=cv2.INTER_LINEAR)
+    canvas[y0 : y0 + fit_h, x0 : x0 + fit_w] = resized
+    return canvas, (x0, y0, fit_w, fit_h)
+
+
+def _image_to_bgr(
+    image: np.ndarray | None,
+    *,
+    color_order: str,
+    width: int,
+    height: int,
+    preserve_aspect: bool = True,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     if image is None:
-        return np.zeros((height, width, 3), dtype=np.uint8)
+        return np.zeros((height, width, 3), dtype=np.uint8), (0, 0, width, height)
     frame = np.asarray(image, dtype=np.uint8)
     if frame.ndim != 3 or frame.shape[2] != 3:
-        return np.zeros((height, width, 3), dtype=np.uint8)
-    if frame.shape[1] != width or frame.shape[0] != height:
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+        return np.zeros((height, width, 3), dtype=np.uint8), (0, 0, width, height)
     if color_order == "rgb":
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    return np.ascontiguousarray(frame)
+    if preserve_aspect:
+        frame, rect = _fit_bgr_to_canvas(frame, width=width, height=height)
+        return np.ascontiguousarray(frame), rect
+    if frame.shape[1] != width or frame.shape[0] != height:
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(frame), (0, 0, width, height)
 
 
 def _draw_label(image: np.ndarray, text: str, x: int, y: int, scale: float = 0.5) -> None:
@@ -107,7 +131,7 @@ def _draw_bar_row(
     values = np.asarray(values, dtype=np.float32).reshape(-1)
     n = int(values.shape[0])
     gap = 5
-    slot_w = max(14, int((width - gap * max(0, n - 1)) / max(1, n)))
+    slot_w = max(1, int((width - gap * max(0, n - 1)) / max(1, n)))
     if symmetric:
         max_abs = float(np.max(np.abs(values))) if values.size else 0.0
         denom = max(max_abs, 1e-6)
@@ -135,6 +159,194 @@ def _draw_bar_row(
         cv2.rectangle(canvas, (x0, y), (x0 + slot_w, y + height), (230, 230, 230), 1)
         cv2.rectangle(canvas, (x0 + 1, y0), (x0 + slot_w - 1, y + height - 1), color, -1)
         cv2.putText(canvas, str(idx), (x0 + 2, y + height + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (70, 70, 70), 1, cv2.LINE_AA)
+
+
+def _slot_vector(value: Any, *, num_slots: int | None = None) -> np.ndarray | None:
+    arr = _array(value, dtype=np.float32)
+    if arr is None:
+        return None
+    arr = np.squeeze(arr)
+    if arr.ndim == 0:
+        return arr.reshape(1)
+    if arr.ndim == 1:
+        return arr.reshape(-1)
+    if arr.ndim == 2:
+        if num_slots is not None and arr.shape[0] == num_slots:
+            return arr.reshape(num_slots, -1).mean(axis=1)
+        return arr[0].reshape(-1)
+    if arr.ndim >= 3:
+        if arr.shape[0] == 1:
+            arr = arr[0]
+        if num_slots is not None and arr.shape[0] == num_slots:
+            return arr.reshape(num_slots, -1).mean(axis=1)
+        return arr.reshape(arr.shape[0], -1).mean(axis=1)
+    return arr.reshape(-1)
+
+
+def _infer_num_slots(
+    *,
+    slot: dict[str, Any],
+    stats: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> int:
+    try:
+        num_slots = int(stats.get("num_slots", 0) or slot.get("num_slots", 0) or 0)
+    except (TypeError, ValueError):
+        num_slots = 0
+    if num_slots > 0:
+        return num_slots
+    for payload in [slot, *history]:
+        for key in (
+            "routing_weights",
+            "routing_distribution",
+            "routing_weights_zero_signature",
+            "write_strength",
+            "readout_weights",
+            "memory_next_norm",
+            "memory_delta_norm",
+        ):
+            values = _slot_vector(payload.get(key), num_slots=None)
+            if values is not None and values.size:
+                return int(values.size)
+    return 0
+
+
+def _slot_colors(num_slots: int) -> list[tuple[int, int, int]]:
+    if num_slots <= 0:
+        return []
+    colors = []
+    for idx in range(num_slots):
+        hue = int(round((idx / max(1, num_slots)) * 179))
+        hsv = np.array([[[hue, 175, 215]]], dtype=np.uint8)
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+        colors.append((int(bgr[0]), int(bgr[1]), int(bgr[2])))
+    return colors
+
+
+def _draw_slot_legend(
+    canvas: np.ndarray,
+    *,
+    colors: list[tuple[int, int, int]],
+    x: int,
+    y: int,
+    width: int,
+) -> int:
+    if not colors:
+        return y
+    col_w = 64
+    cols = max(1, width // col_w)
+    for idx, color in enumerate(colors):
+        col = idx % cols
+        row = idx // cols
+        x0 = x + col * col_w
+        y0 = y + row * 18
+        cv2.line(canvas, (x0, y0), (x0 + 20, y0), color, 3, cv2.LINE_AA)
+        cv2.putText(canvas, f"s{idx}", (x0 + 25, y0 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (55, 55, 55), 1, cv2.LINE_AA)
+    return y + ((len(colors) - 1) // cols + 1) * 18
+
+
+def _history_matrix(
+    history: list[dict[str, Any]],
+    *,
+    key: str,
+    num_slots: int,
+) -> np.ndarray | None:
+    if not history or num_slots <= 0:
+        return None
+    matrix = np.full((len(history), num_slots), np.nan, dtype=np.float32)
+    found = False
+    for row_idx, payload in enumerate(history):
+        values = _slot_vector(payload.get(key), num_slots=num_slots)
+        if values is None or values.size == 0:
+            continue
+        count = min(num_slots, int(values.size))
+        matrix[row_idx, :count] = values[:count]
+        found = True
+    return matrix if found else None
+
+
+def _draw_multislot_history_plot(
+    canvas: np.ndarray,
+    *,
+    title: str,
+    matrix: np.ndarray | None,
+    colors: list[tuple[int, int, int]],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    current_step: int | None,
+    total_steps: int | None,
+    fixed_min: float | None = None,
+    fixed_max: float | None = None,
+) -> None:
+    cv2.putText(canvas, title, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (35, 35, 35), 1, cv2.LINE_AA)
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (205, 205, 205), 1)
+    if matrix is None or matrix.size == 0 or np.all(np.isnan(matrix)):
+        cv2.putText(canvas, "n/a", (x + 12, y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 120), 1, cv2.LINE_AA)
+        return
+
+    values = matrix[np.isfinite(matrix)]
+    y_min = float(values.min()) if fixed_min is None else float(fixed_min)
+    y_max = float(values.max()) if fixed_max is None else float(fixed_max)
+    if y_max <= y_min + 1e-9:
+        y_max = y_min + 1.0
+    cv2.line(canvas, (x, y + height // 2), (x + width, y + height // 2), (232, 232, 232), 1)
+
+    total = max(int(total_steps or matrix.shape[0]), int(matrix.shape[0]), 1)
+    denom = max(1, total - 1)
+
+    def point(step_idx: int, value: float) -> tuple[int, int]:
+        px = x + int(round((step_idx / denom) * width))
+        py = y + height - int(round(((float(value) - y_min) / (y_max - y_min)) * height))
+        return px, py
+
+    for slot_idx in range(matrix.shape[1]):
+        color = colors[slot_idx % len(colors)] if colors else (50, 145, 215)
+        last_point: tuple[int, int] | None = None
+        last_valid = False
+        for step_idx, value in enumerate(matrix[:, slot_idx]):
+            valid = bool(np.isfinite(value))
+            if valid:
+                current_point = point(step_idx, float(value))
+                if last_valid and last_point is not None:
+                    cv2.line(canvas, last_point, current_point, color, 2, cv2.LINE_AA)
+                cv2.circle(canvas, current_point, 2, color, -1, cv2.LINE_AA)
+                last_point = current_point
+            last_valid = valid
+
+    if current_step is not None:
+        current_step = max(0, min(int(current_step), total - 1))
+        current_x = x + int(round((current_step / denom) * width))
+        cv2.line(canvas, (current_x, y - 2), (current_x, y + height + 2), (25, 25, 25), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"t={current_step}", (min(current_x + 6, x + width - 58), y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (25, 25, 25), 1, cv2.LINE_AA)
+
+    cv2.putText(canvas, f"{y_min:.3g}", (x + 4, y + height - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (95, 95, 95), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"{y_max:.3g}", (x + 4, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (95, 95, 95), 1, cv2.LINE_AA)
+
+
+def make_slot_memory_history_sample(debug: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(debug, dict):
+        return {}
+    slot = dict(debug.get("slot_memory") or {})
+    stats = dict(debug.get("visual_memory_stats") or {})
+    sample: dict[str, Any] = {}
+    if "num_slots" in stats:
+        sample["num_slots"] = stats["num_slots"]
+    for key in (
+        "routing_weights",
+        "routing_distribution",
+        "routing_weights_zero_signature",
+        "routing_delta_from_zero_signature",
+        "write_strength",
+        "readout_weights",
+        "memory_next_norm",
+        "memory_delta_norm",
+    ):
+        if key in slot:
+            value = _array(slot.get(key), dtype=np.float32)
+            sample[key] = None if value is None else value.copy()
+    return sample
 
 
 def render_attention_panel(
@@ -172,9 +384,14 @@ def render_attention_panel(
             uniform_image_token_mass = token_attention_sum / float(max(1, image_token_count))
             maps = [image_attention[idx] for idx in range(num_cameras)]
 
-    header_h = 44
-    footer_h = 82
     width = max(1, len(camera_keys)) * tile_width
+    extra_labels = list(layout.get("extra_memory_token_labels") or [])
+    extra_label_cols = max(1, width // 158)
+    extra_label_rows = (
+        0 if not extra_labels else ((len(extra_labels) - 1) // extra_label_cols) + 1
+    )
+    header_h = 44
+    footer_h = 82 + max(0, extra_label_rows - 1) * 38
     canvas = np.full((header_h + tile_height + footer_h, width, 3), 245, dtype=np.uint8)
     cv2.putText(
         canvas,
@@ -188,7 +405,7 @@ def render_attention_panel(
     )
     for idx, camera_key in enumerate(camera_keys):
         x0 = idx * tile_width
-        frame = _image_to_bgr(
+        frame, content_rect = _image_to_bgr(
             images.get(camera_key),
             color_order=color_order,
             width=tile_width,
@@ -200,9 +417,17 @@ def render_attention_panel(
                 heat,
                 uniform_token_mass=uniform_image_token_mass,
             )
-            heat_u8 = cv2.resize(heat_u8, (tile_width, tile_height), interpolation=cv2.INTER_LINEAR)
+            rect_x, rect_y, rect_w, rect_h = content_rect
+            heat_u8 = cv2.resize(heat_u8, (rect_w, rect_h), interpolation=cv2.INTER_LINEAR)
             heat_color = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
-            frame = cv2.addWeighted(frame, 1.0 - overlay_alpha, heat_color, overlay_alpha, 0.0)
+            content = frame[rect_y : rect_y + rect_h, rect_x : rect_x + rect_w]
+            frame[rect_y : rect_y + rect_h, rect_x : rect_x + rect_w] = cv2.addWeighted(
+                content,
+                1.0 - overlay_alpha,
+                heat_color,
+                overlay_alpha,
+                0.0,
+            )
             heat_sum = float(np.asarray(heat, dtype=np.float32).sum())
             peak_lift = (
                 float(np.asarray(heat, dtype=np.float32).max() / uniform_image_token_mass)
@@ -234,33 +459,45 @@ def render_attention_panel(
         1,
         cv2.LINE_AA,
     )
-    extra_labels = list(layout.get("extra_memory_token_labels") or [])
     if attn is not None and attn.ndim == 2 and extra_labels:
         query_idx = min(query_step, attn.shape[0] - 1)
         values = attn[query_idx, : len(extra_labels)]
-        x = 12
-        y = footer_y + 22
         max_v = max(float(np.max(values)), 1e-6)
-        for label, value in zip(extra_labels, values, strict=False):
+        for idx, (label, value) in enumerate(zip(extra_labels, values, strict=False)):
+            col = idx % extra_label_cols
+            row = idx // extra_label_cols
+            x = 12 + col * 158
+            y = footer_y + 22 + row * 38
             bar_w = int(130 * float(value) / max_v)
             cv2.rectangle(canvas, (x, y - 12), (x + 130, y + 2), (222, 222, 222), 1)
             cv2.rectangle(canvas, (x, y - 11), (x + bar_w, y + 1), (70, 145, 210), -1)
             cv2.putText(canvas, f"{label}:{float(value):.3f}", (x, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (55, 55, 55), 1, cv2.LINE_AA)
-            x += 158
-            if x + 150 > width:
-                break
     return canvas
 
 
 def render_slot_memory_panel(
     *,
     debug: dict[str, Any] | None,
+    history: list[dict[str, Any]] | None = None,
+    current_step: int | None = None,
+    total_steps: int | None = None,
     width: int = 760,
     height: int = 560,
 ) -> np.ndarray:
     debug = debug or {}
     slot = dict(debug.get("slot_memory") or {})
     stats = dict(debug.get("visual_memory_stats") or {})
+    history = list(history or [])
+    num_slots = _infer_num_slots(slot=slot, stats=stats, history=history)
+    if num_slots > 0:
+        width = max(int(width), 260 + num_slots * 28)
+    has_history = bool(history)
+    if has_history:
+        legend_cols = max(1, (int(width) - 48) // 64)
+        legend_rows = ((max(1, num_slots) - 1) // legend_cols) + 1
+        height = max(int(height), 1010 + max(0, legend_rows - 1) * 18)
+    width = _even(width)
+    height = _even(height)
     canvas = np.full((height, width, 3), 248, dtype=np.uint8)
     cv2.putText(canvas, "signature-indexed slot memory routing", (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (25, 25, 25), 1, cv2.LINE_AA)
     cv2.putText(
@@ -278,14 +515,14 @@ def render_slot_memory_panel(
         cv2.putText(canvas, "No slot-memory debug payload yet.", (18, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (95, 95, 95), 1, cv2.LINE_AA)
         return canvas
 
-    routing = _first_row(slot.get("routing_weights"))
-    zero_routing = _first_row(slot.get("routing_weights_zero_signature"))
-    routing_delta = _first_row(slot.get("routing_delta_from_zero_signature"))
-    gate = _first_row(slot.get("gate"))
-    write_strength = _first_row(slot.get("write_strength"))
-    readout = _first_row(slot.get("readout_weights"))
-    memory_delta = _first_row(slot.get("memory_delta_norm"))
-    memory_next = _first_row(slot.get("memory_next_norm"))
+    routing = _slot_vector(slot.get("routing_weights"), num_slots=num_slots or None)
+    zero_routing = _slot_vector(slot.get("routing_weights_zero_signature"), num_slots=num_slots or None)
+    routing_delta = _slot_vector(slot.get("routing_delta_from_zero_signature"), num_slots=num_slots or None)
+    gate = _slot_vector(slot.get("gate"), num_slots=num_slots or None)
+    write_strength = _slot_vector(slot.get("write_strength"), num_slots=num_slots or None)
+    readout = _slot_vector(slot.get("readout_weights"), num_slots=num_slots or None)
+    memory_delta = _slot_vector(slot.get("memory_delta_norm"), num_slots=num_slots or None)
+    memory_next = _slot_vector(slot.get("memory_next_norm"), num_slots=num_slots or None)
 
     cv2.putText(
         canvas,
@@ -299,13 +536,49 @@ def render_slot_memory_panel(
     )
     left_x = 24
     bar_w = width - 48
-    _draw_bar_row(canvas, title="routing weights", values=routing, x=left_x, y=135, width=bar_w, height=46, color=(50, 145, 215))
-    _draw_bar_row(canvas, title="zero-signature routing baseline", values=zero_routing, x=left_x, y=221, width=bar_w, height=46, color=(145, 145, 145))
-    _draw_bar_row(canvas, title="routing delta caused by signature", values=routing_delta, x=left_x, y=307, width=bar_w, height=52, color=(40, 170, 90), symmetric=True)
-    _draw_bar_row(canvas, title="slot write gate", values=gate, x=left_x, y=407, width=bar_w // 2 - 20, height=40, color=(90, 120, 210))
-    _draw_bar_row(canvas, title="write strength", values=write_strength, x=left_x + bar_w // 2, y=407, width=bar_w // 2 - 10, height=40, color=(70, 170, 150))
-    _draw_bar_row(canvas, title="readout weights", values=readout, x=left_x, y=496, width=bar_w // 2 - 20, height=36, color=(215, 130, 55))
-    _draw_bar_row(canvas, title="memory delta norm", values=memory_delta, x=left_x + bar_w // 2, y=496, width=bar_w // 2 - 10, height=36, color=(155, 100, 190))
+    bar_y = 135
+    colors = _slot_colors(num_slots)
+    if has_history:
+        legend_bottom = _draw_slot_legend(canvas, colors=colors, x=left_x, y=122, width=bar_w)
+        plot_y = max(150, legend_bottom + 24)
+        routing_history = _history_matrix(history, key="routing_weights", num_slots=num_slots)
+        memory_history = _history_matrix(history, key="memory_next_norm", num_slots=num_slots)
+        _draw_multislot_history_plot(
+            canvas,
+            title="routing weights over time",
+            matrix=routing_history,
+            colors=colors,
+            x=left_x,
+            y=plot_y,
+            width=bar_w,
+            height=140,
+            current_step=current_step,
+            total_steps=total_steps,
+            fixed_min=0.0,
+            fixed_max=max(1.0, float(np.nanmax(routing_history)) if routing_history is not None and not np.all(np.isnan(routing_history)) else 1.0),
+        )
+        _draw_multislot_history_plot(
+            canvas,
+            title="slot memory norm over time",
+            matrix=memory_history,
+            colors=colors,
+            x=left_x,
+            y=plot_y + 188,
+            width=bar_w,
+            height=140,
+            current_step=current_step,
+            total_steps=total_steps,
+            fixed_min=0.0,
+        )
+        bar_y = plot_y + 376
+
+    _draw_bar_row(canvas, title="routing weights", values=routing, x=left_x, y=bar_y, width=bar_w, height=46, color=(50, 145, 215))
+    _draw_bar_row(canvas, title="zero-signature routing baseline", values=zero_routing, x=left_x, y=bar_y + 86, width=bar_w, height=46, color=(145, 145, 145))
+    _draw_bar_row(canvas, title="routing delta caused by signature", values=routing_delta, x=left_x, y=bar_y + 172, width=bar_w, height=52, color=(40, 170, 90), symmetric=True)
+    _draw_bar_row(canvas, title="slot write gate", values=gate, x=left_x, y=bar_y + 272, width=bar_w // 2 - 20, height=40, color=(90, 120, 210))
+    _draw_bar_row(canvas, title="write strength", values=write_strength, x=left_x + bar_w // 2, y=bar_y + 272, width=bar_w // 2 - 10, height=40, color=(70, 170, 150))
+    _draw_bar_row(canvas, title="readout weights", values=readout, x=left_x, y=bar_y + 361, width=bar_w // 2 - 20, height=36, color=(215, 130, 55))
+    _draw_bar_row(canvas, title="memory delta norm", values=memory_delta, x=left_x + bar_w // 2, y=bar_y + 361, width=bar_w // 2 - 10, height=36, color=(155, 100, 190))
 
     summary = (
         f"emb_norms visual={float(slot.get('visual_embedding_norm', 0.0)):.2f} "

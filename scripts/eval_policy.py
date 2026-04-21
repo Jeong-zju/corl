@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from deploy.visual_debug import (  # noqa: E402
+    make_slot_memory_history_sample,
     render_attention_panel,
     render_signature_panel,
     render_slot_memory_panel,
@@ -1720,6 +1721,7 @@ def run_dataset_evaluation(
         )
         episode_debug_writers = {}
         episode_debug_paths: dict[str, str] = {}
+        slot_memory_history: list[dict[str, object]] = []
 
         evaluated_steps = planned_episode_steps
 
@@ -1876,16 +1878,17 @@ def run_dataset_evaluation(
 
             with torch.no_grad():
                 predicted_action = policy.select_action(obs)
-            deploy_debug = (
-                get_policy_deploy_debug_snapshot(policy)
-                if save_episode_debug
-                else None
-            )
+                deploy_debug = (
+                    get_policy_deploy_debug_snapshot(policy)
+                    if save_episode_debug
+                    else None
+                )
             predicted_action = postprocessor(predicted_action)
             predicted_np = tensor_to_numpy_vector(predicted_action.squeeze(0))
             ground_truth_np = tensor_to_numpy_vector(item[action_key])
 
             if save_episode_debug:
+                slot_memory_history.append(make_slot_memory_history_sample(deploy_debug))
                 signature_debug = make_signature_debug_payload(
                     signature_vec=signature_vec,
                     delta_signature_vec=delta_signature_vec,
@@ -1909,7 +1912,12 @@ def run_dataset_evaluation(
                         overlay_alpha=float(args.debug_overlay_alpha),
                         query_step=int(args.debug_attention_query_step),
                     ),
-                    "slot_memory": render_slot_memory_panel(debug=deploy_debug),
+                    "slot_memory": render_slot_memory_panel(
+                        debug=deploy_debug,
+                        history=slot_memory_history,
+                        current_step=len(slot_memory_history) - 1,
+                        total_steps=evaluated_steps,
+                    ),
                     "signature": render_signature_panel(
                         signature_debug=signature_debug,
                     ),
