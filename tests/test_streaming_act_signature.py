@@ -238,12 +238,16 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
 
     actions, _latent = policy.model(policy._prepare_observation_batch(batch))
     aux_losses = policy.model.get_visual_prefix_memory_aux_losses()
+    log_stats = policy.model.get_visual_prefix_memory_log_stats()
 
     assert actions.shape == (batch_size, 2, 17)
     assert "slot_memory_balance_loss" in aux_losses
     assert "slot_memory_consistency_loss" in aux_losses
     assert torch.isfinite(aux_losses["slot_memory_balance_loss"])
     assert torch.isfinite(aux_losses["slot_memory_consistency_loss"])
+    assert "slot_memory/routing_weight/slot_0" in log_stats
+    assert "slot_memory/routing_weight/slot_1" in log_stats
+    assert "slot_memory/routing_entropy_normalized" in log_stats
 
 
 def test_prefix_sequence_cache_applies_current_frame_transform() -> None:

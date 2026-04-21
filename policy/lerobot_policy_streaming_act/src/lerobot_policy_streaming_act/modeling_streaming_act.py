@@ -245,6 +245,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = loss + consistency_weighted
             loss_dict["slot_memory_consistency_loss"] = consistency_raw.item()
             loss_dict["slot_memory_consistency_loss_weighted"] = consistency_weighted.item()
+        loss_dict.update(self.model.get_visual_prefix_memory_log_stats())
 
         return loss, loss_dict
 
@@ -391,6 +392,7 @@ class StreamingACT(nn.Module):
         self.use_memory_conditioned_encoder_film = config.use_memory_conditioned_encoder_film
         self.active_memory_num_slots = config.active_visual_prefix_memory_num_slots
         self._last_visual_prefix_memory_aux_losses: dict[str, Tensor] = {}
+        self._last_visual_prefix_memory_log_stats: dict[str, float] = {}
         self.reset_deploy_debug()
 
         if self.use_path_signature:
@@ -601,6 +603,9 @@ class StreamingACT(nn.Module):
 
     def get_visual_prefix_memory_aux_losses(self) -> dict[str, Tensor]:
         return dict(self._last_visual_prefix_memory_aux_losses)
+
+    def get_visual_prefix_memory_log_stats(self) -> dict[str, float]:
+        return dict(self._last_visual_prefix_memory_log_stats)
 
     def reset_deploy_debug(self) -> None:
         self._latest_deploy_debug: dict[str, object] = {}
@@ -1466,6 +1471,44 @@ class StreamingACT(nn.Module):
         routing_distribution_sum = None
         consistency_loss_sum = None
         valid_step_count = None
+        collect_slot_metrics = self.use_signature_indexed_slot_memory
+        metric_valid_count = None
+        metric_routing_weight_sum = None
+        metric_routing_distribution_sum = None
+        metric_readout_weight_sum = None
+        metric_write_strength_sum = None
+        metric_routing_entropy_sum = None
+        metric_routing_max_sum = None
+        metric_routing_std_sum = None
+        metric_readout_entropy_sum = None
+        metric_routing_delta_abs_sum = None
+        if collect_slot_metrics:
+            metric_device = hidden.device
+            metric_slot_shape = (self.active_memory_num_slots,)
+            metric_valid_count = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_routing_weight_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_routing_distribution_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_readout_weight_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_write_strength_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_routing_entropy_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
+            metric_routing_max_sum = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_routing_std_sum = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_readout_entropy_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
+            metric_routing_delta_abs_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
         for step_idx in range(time_steps):
             hidden, step_stats = self._update_visual_prefix_memory_step(
                 memory_prev=hidden,
@@ -1492,6 +1535,57 @@ class StreamingACT(nn.Module):
                     routing_distribution_sum = step_distribution_sum
                 else:
                     routing_distribution_sum = routing_distribution_sum + step_distribution_sum
+            if collect_slot_metrics:
+                metric_mask = prefix_mask[:, step_idx].to(dtype=torch.float32)
+                metric_mask_2d = metric_mask.unsqueeze(-1)
+                metric_valid_count = metric_valid_count + metric_mask.sum()
+
+                routing_weights = step_stats["routing_weights"].detach().float()
+                routing_distribution = step_stats["routing_distribution"].detach().float()
+                readout_weights = step_stats["readout_weights"].detach().float()
+                write_strength = step_stats["write_strength"].detach().float()
+
+                metric_routing_weight_sum = metric_routing_weight_sum + (
+                    routing_weights * metric_mask_2d
+                ).sum(dim=0)
+                metric_routing_distribution_sum = metric_routing_distribution_sum + (
+                    routing_distribution * metric_mask_2d
+                ).sum(dim=0)
+                metric_readout_weight_sum = metric_readout_weight_sum + (
+                    readout_weights * metric_mask_2d
+                ).sum(dim=0)
+                metric_write_strength_sum = metric_write_strength_sum + (
+                    write_strength * metric_mask_2d
+                ).sum(dim=0)
+
+                routing_distribution_safe = routing_distribution.clamp_min(1e-8)
+                routing_entropy = -(
+                    routing_distribution_safe * routing_distribution_safe.log()
+                ).sum(dim=-1)
+                readout_weights_safe = readout_weights.clamp_min(1e-8)
+                readout_entropy = -(
+                    readout_weights_safe * readout_weights_safe.log()
+                ).sum(dim=-1)
+                metric_routing_entropy_sum = metric_routing_entropy_sum + (
+                    routing_entropy * metric_mask
+                ).sum()
+                metric_routing_max_sum = metric_routing_max_sum + (
+                    routing_weights.max(dim=-1).values * metric_mask
+                ).sum()
+                metric_routing_std_sum = metric_routing_std_sum + (
+                    routing_weights.std(dim=-1, unbiased=False) * metric_mask
+                ).sum()
+                metric_readout_entropy_sum = metric_readout_entropy_sum + (
+                    readout_entropy * metric_mask
+                ).sum()
+                if "routing_weights_zero_signature" in step_stats:
+                    zero_routing_weights = (
+                        step_stats["routing_weights_zero_signature"].detach().float()
+                    )
+                    metric_routing_delta_abs_sum = metric_routing_delta_abs_sum + (
+                        (routing_weights - zero_routing_weights).abs().mean(dim=-1)
+                        * metric_mask
+                    ).sum()
             if need_consistency_loss:
                 readout_context = step_stats["readout_context"]
                 write_base = step_stats["write_base"]
@@ -1520,6 +1614,65 @@ class StreamingACT(nn.Module):
             device=hidden.device,
             dtype=hidden.dtype,
         )
+        if collect_slot_metrics:
+            assert metric_valid_count is not None
+            metric_denom = metric_valid_count.clamp_min(1.0)
+            max_entropy = math.log(float(max(1, self.active_memory_num_slots)))
+            routing_entropy = metric_routing_entropy_sum / metric_denom
+            readout_entropy = metric_readout_entropy_sum / metric_denom
+            log_stats: dict[str, float] = {
+                "slot_memory/valid_prefix_steps": float(
+                    metric_valid_count.detach().cpu().item()
+                ),
+                "slot_memory/routing_entropy": float(
+                    routing_entropy.detach().cpu().item()
+                ),
+                "slot_memory/routing_max": float(
+                    (metric_routing_max_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/routing_std": float(
+                    (metric_routing_std_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/routing_delta_from_zero_abs_mean": float(
+                    (metric_routing_delta_abs_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/readout_entropy": float(
+                    readout_entropy.detach().cpu().item()
+                ),
+                "slot_memory/write_strength_mean": float(
+                    (metric_write_strength_sum.sum() / metric_denom)
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                "slot_memory/memory_final_slot_std": self._debug_slot_std(hidden),
+            }
+            if max_entropy > 0.0:
+                log_stats["slot_memory/routing_entropy_normalized"] = float(
+                    (routing_entropy / max_entropy).detach().cpu().item()
+                )
+                log_stats["slot_memory/readout_entropy_normalized"] = float(
+                    (readout_entropy / max_entropy).detach().cpu().item()
+                )
+
+            routing_weight_mean = metric_routing_weight_sum / metric_denom
+            routing_distribution_mean = metric_routing_distribution_sum / metric_denom
+            readout_weight_mean = metric_readout_weight_sum / metric_denom
+            write_strength_mean = metric_write_strength_sum / metric_denom
+            for slot_idx in range(int(self.active_memory_num_slots)):
+                log_stats[f"slot_memory/routing_weight/slot_{slot_idx}"] = float(
+                    routing_weight_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/routing_distribution/slot_{slot_idx}"] = float(
+                    routing_distribution_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/readout_weight/slot_{slot_idx}"] = float(
+                    readout_weight_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/write_strength/slot_{slot_idx}"] = float(
+                    write_strength_mean[slot_idx].detach().cpu().item()
+                )
+            self._last_visual_prefix_memory_log_stats = log_stats
         return hidden, aux_losses
 
     def _compute_visual_prefix_memory_context(
@@ -1798,6 +1951,7 @@ class StreamingACT(nn.Module):
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
         self._last_visual_prefix_memory_aux_losses = {}
+        self._last_visual_prefix_memory_log_stats = {}
         if not skip_prefix_sequence_validation:
             self._validate_prefix_sequence_inputs(batch, batch_size)
 

@@ -2474,6 +2474,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("slot_memory_routing_hidden_dim", 512),
             help="Hidden dimension used by the SISM routing network.",
         )
+        parser.add_argument(
+            "--slot-memory-identity-scale",
+            type=float,
+            default=defaults.get("slot_memory_identity_scale", 0.1),
+            help=(
+                "Scale for the fixed deterministic SISM slot identity used to "
+                "break slot permutation symmetry."
+            ),
+        )
         slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
         slot_memory_delta_routing_group.add_argument(
             "--enable-slot-memory-delta-routing",
@@ -3317,6 +3326,7 @@ def main(argv: list[str] | None = None) -> None:
             num_memory_slots=int(args.num_memory_slots),
             slot_memory_num_slots=int(args.slot_memory_num_slots),
             slot_memory_routing_hidden_dim=int(args.slot_memory_routing_hidden_dim),
+            slot_memory_identity_scale=float(args.slot_memory_identity_scale),
             slot_memory_use_delta_routing=bool(args.slot_memory_use_delta_routing),
             slot_memory_use_softmax_routing=bool(args.slot_memory_use_softmax_routing),
             slot_memory_use_readout_pooling=bool(args.slot_memory_use_readout_pooling),
@@ -3755,6 +3765,7 @@ def main(argv: list[str] | None = None) -> None:
                     "- slot_memory: "
                     f"num_slots={int(args.slot_memory_num_slots)}, "
                     f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                    f"identity_scale={float(args.slot_memory_identity_scale)}, "
                     "delta_routing="
                     f"{bool(args.slot_memory_use_delta_routing)}, "
                     "softmax_routing="
