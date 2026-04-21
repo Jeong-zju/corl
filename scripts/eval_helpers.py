@@ -130,6 +130,18 @@ def resolve_policy_dir(policy_path: Path) -> Path:
     raw = policy_path.expanduser()
     ordered = _resolve_path_candidates(raw)
 
+    def sorted_checkpoint_dirs(checkpoints_dir: Path) -> list[Path]:
+        checkpoint_dirs = [
+            path
+            for path in checkpoints_dir.iterdir()
+            if path.is_dir() and path.name != "last"
+        ]
+        numeric_dirs = [path for path in checkpoint_dirs if path.name.isdigit()]
+        numeric_dirs.sort(key=lambda path: int(path.name), reverse=True)
+        other_dirs = [path for path in checkpoint_dirs if not path.name.isdigit()]
+        other_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        return numeric_dirs + other_dirs
+
     def iter_weight_candidates(base: Path) -> list[Path]:
         candidates = [
             base,
@@ -138,12 +150,7 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         ]
         checkpoints_dir = base / "checkpoints"
         if checkpoints_dir.is_dir():
-            checkpoint_dirs = sorted(
-                [path for path in checkpoints_dir.iterdir() if path.is_dir() and path.name != "last"],
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for checkpoint_dir in checkpoint_dirs:
+            for checkpoint_dir in sorted_checkpoint_dirs(checkpoints_dir):
                 candidates.append(checkpoint_dir / "pretrained_model")
                 candidates.append(checkpoint_dir)
 
@@ -161,16 +168,7 @@ def resolve_policy_dir(policy_path: Path) -> Path:
                 )
                 latest_run_checkpoints = latest_run_dir / "checkpoints"
                 if latest_run_checkpoints.is_dir():
-                    run_checkpoint_dirs = sorted(
-                        [
-                            path
-                            for path in latest_run_checkpoints.iterdir()
-                            if path.is_dir() and path.name != "last"
-                        ],
-                        key=lambda path: path.stat().st_mtime,
-                        reverse=True,
-                    )
-                    for checkpoint_dir in run_checkpoint_dirs:
+                    for checkpoint_dir in sorted_checkpoint_dirs(latest_run_checkpoints):
                         candidates.append(checkpoint_dir / "pretrained_model")
                         candidates.append(checkpoint_dir)
         return candidates

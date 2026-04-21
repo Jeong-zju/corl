@@ -79,4 +79,5 @@ eval:
   seed: 42
   device: "cuda"
   n_action_steps: 50
+  temporal_ensemble_coeff: 0
   signature_backend: "auto"

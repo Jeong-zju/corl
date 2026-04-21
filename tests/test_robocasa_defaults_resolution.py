@@ -9,8 +9,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
-from policy_defaults import load_policy_mode_defaults_for_dataset, resolve_dataset_defaults_path
-from train_policy import resolve_training_dataset_root
+from policy_defaults import (
+    load_policy_mode_defaults_for_cli,
+    load_policy_mode_defaults_for_dataset,
+    resolve_cli_dataset_defaults_path,
+    resolve_dataset_defaults_path,
+)
+from train_policy import parse_args, resolve_training_dataset_root
 
 
 def _make_fake_lerobot_dataset_root(dataset_root: Path) -> Path:
@@ -131,6 +136,112 @@ def test_resolve_dataset_defaults_path_keeps_broad_robocasa_atomic_defaults() ->
     assert defaults["dataset_repo_id"] == "robocasa/atomic"
     assert defaults["dataset_tasks"] == ["CloseFridge"]
     assert defaults["output_root"].endswith("robocasa/atomic/streaming-act-prism")
+
+
+def test_resolve_cli_dataset_defaults_path_prefers_task_defaults_for_broad_robocasa_dataset() -> None:
+    path = resolve_cli_dataset_defaults_path(
+        dataset_selector="robocasa",
+        task_selector="CloseFridge",
+        policy_name="streaming_act",
+    )
+
+    assert path is not None
+    assert path.as_posix().endswith(
+        "main/bash/defaults/robocasa/atomic/CloseFridge/streaming_act.yaml"
+    )
+
+    defaults, defaults_path = load_policy_mode_defaults_for_cli(
+        mode="train",
+        dataset_selector="robocasa",
+        task_selector="CloseFridge",
+        policy_name="streaming_act",
+    )
+
+    assert defaults_path == path
+    assert defaults["dataset_root"] == "data/robocasa/atomic/CloseFridge"
+    assert defaults["dataset_repo_id"] == "robocasa/atomic/CloseFridge"
+    assert defaults["signature_cache_mode"] == "ram"
+
+
+def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_robocasa_dataset() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "robocasa",
+            "--task",
+            "CloseFridge",
+            "--policy",
+            "streaming_act",
+        ]
+    )
+
+    assert args.task == "CloseFridge"
+    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
+    assert args._policy_defaults_dataset_repo_id == "robocasa/atomic/CloseFridge"
+    assert args.output_root.as_posix() == (
+        "outputs/train/robocasa/atomic/CloseFridge/streaming-act-prism"
+    )
+    assert args.signature_cache_mode == "ram"
+
+
+@pytest.mark.parametrize(
+    ("policy_name", "expected_output_suffix"),
+    (
+        ("act", "robocasa/composite/OrganizeVegetables/act"),
+        ("diffusion", "robocasa/composite/OrganizeVegetables/diffusion"),
+        ("streaming_act", "robocasa/composite/OrganizeVegetables/streaming-act-prism"),
+    ),
+)
+def test_resolve_dataset_defaults_path_supports_organize_vegetables_policy_defaults(
+    policy_name: str,
+    expected_output_suffix: str,
+) -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="train",
+        dataset_selector="robocasa/composite/OrganizeVegetables",
+        policy_name=policy_name,
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        f"main/bash/defaults/robocasa/composite/OrganizeVegetables/{policy_name}.yaml"
+    )
+    assert defaults["dataset_root"] == "data/robocasa/composite/OrganizeVegetables"
+    assert defaults["dataset_repo_id"] == "robocasa/composite/OrganizeVegetables"
+    assert defaults["output_root"].endswith(expected_output_suffix)
+
+
+@pytest.mark.parametrize(
+    "task_name",
+    (
+        "OrganizeVegetables",
+        "PackFoodByTemp",
+        "StoreLeftoversByType",
+        "BeverageSorting",
+        "PackIdenticalLunches",
+        "CreateChildFriendlyFridge",
+        "LoadCondimentsInFridge",
+    ),
+)
+def test_resolve_dataset_defaults_path_supports_task_specific_composite_memory_defaults(
+    task_name: str,
+) -> None:
+    defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+        mode="train",
+        dataset_selector=f"robocasa/composite/{task_name}",
+        policy_name="streaming_act",
+    )
+
+    assert defaults_path is not None
+    assert defaults_path.as_posix().endswith(
+        f"main/bash/defaults/robocasa/composite/{task_name}/streaming_act.yaml"
+    )
+    assert defaults["dataset_root"] == f"data/robocasa/composite/{task_name}"
+    assert defaults["dataset_repo_id"] == f"robocasa/composite/{task_name}"
+    assert defaults["use_visual_prefix_memory"] is True
+    assert defaults["use_signature_indexed_slot_memory"] is True
+    assert defaults["use_memory_conditioned_encoder_film"] is True
+    assert defaults["signature_cache_mode"] == "ram"
 
 
 def test_resolve_training_dataset_root_uses_exact_named_child_from_dataset_tasks(
