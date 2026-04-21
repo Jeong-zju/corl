@@ -78,7 +78,8 @@ train:
 
 eval:
   train_output_root: "outputs/train/robocasa/composite/OrganizeVegetables/streaming-act-prism"
-  output_dir: "outputs/eval/robocasa/composite/OrganizeVegetables/streaming-act-prism/{run_tag}"
+  output_dir: "outputs/eval/robocasa/composite/OrganizeVegetables/streaming-act-p\
+    rism/{run_tag}"
   task: "OrganizeVegetables"
   eval_split: "test"
   test_ratio: 0.2
@@ -88,7 +89,7 @@ eval:
   max_steps_per_episode: null
   seed: 42
   device: "cuda"
-  n_action_steps: 100
+  n_action_steps: 1
   temporal_ensemble_coeff: 0
   signature_backend: "auto"
   robocasa_conda_env: "robocasa"
@@ -96,4 +97,4 @@ eval:
   num_rollouts: 20
   max_steps: null
   fps: 20
-  max_episodes_rendered: 4
+  max_episodes_rendered: 20
