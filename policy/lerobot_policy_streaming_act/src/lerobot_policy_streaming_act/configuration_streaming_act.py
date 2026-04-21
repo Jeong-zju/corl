@@ -129,6 +129,9 @@ class StreamingACTConfig(PreTrainedConfig):
             `use_signature_indexed_slot_memory=True`.
         slot_memory_routing_hidden_dim: Hidden dimension used by the SISM routing
             network and slot-addressing projections.
+        slot_memory_identity_scale: Scale for a fixed deterministic slot identity
+            added to SISM slot addressing paths. This breaks permutation symmetry
+            between slots; set to 0.0 only for exact legacy behavior.
         slot_memory_use_delta_routing: Whether delta signatures participate in the
             explicit SISM routing signal in addition to path signatures.
         slot_memory_use_softmax_routing: Whether SISM routing weights are produced
@@ -199,6 +202,7 @@ class StreamingACTConfig(PreTrainedConfig):
     num_memory_slots: int = 1
     slot_memory_num_slots: int = 4
     slot_memory_routing_hidden_dim: int = 512
+    slot_memory_identity_scale: float = 0.1
     slot_memory_use_delta_routing: bool = False
     slot_memory_use_softmax_routing: bool = True
     slot_memory_use_readout_pooling: bool = True
@@ -322,6 +326,12 @@ class StreamingACTConfig(PreTrainedConfig):
                     "`slot_memory_routing_hidden_dim` must be > 0 when "
                     "`use_signature_indexed_slot_memory=True`. "
                     f"Got {self.slot_memory_routing_hidden_dim}."
+                )
+            if self.slot_memory_identity_scale < 0.0:
+                raise ValueError(
+                    "`slot_memory_identity_scale` must be >= 0.0 when "
+                    "`use_signature_indexed_slot_memory=True`. "
+                    f"Got {self.slot_memory_identity_scale}."
                 )
             if self.slot_memory_use_delta_routing and not self.use_delta_signature:
                 raise ValueError(

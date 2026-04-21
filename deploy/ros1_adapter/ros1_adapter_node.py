@@ -30,6 +30,11 @@ from config import DeployConfig, load_deploy_config
 from policy_runtime.loader import PolicyRuntime
 from ros1_adapter.ros_publishers import CommandPublishers
 from ros1_adapter.ros_topics import ALL_REQUIRED_SOURCES
+from visual_debug import (
+    render_attention_panel,
+    render_signature_panel,
+    render_slot_memory_panel,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -62,9 +67,10 @@ class DeployRosNode:
     def __init__(self, config: DeployConfig) -> None:
         import rospy
         from nav_msgs.msg import Odometry
-        from sensor_msgs.msg import CompressedImage, JointState
+        from sensor_msgs.msg import CompressedImage, Image, JointState
 
         self.rospy = rospy
+        self._Image = Image
         self.config = config
         self.cache = SensorCache()
         self.policy_runtime = PolicyRuntime(config)
@@ -78,8 +84,29 @@ class DeployRosNode:
         self.lock = threading.Lock()
         self.seq = 0
         self.pending_reset = True
+        self._last_debug_publish_s = 0.0
+        self._camera_labels = {value: key for key, value in config.policy.image_keys.items()}
 
         rospy.init_node(config.ros.node_name, anonymous=False)
+        self._debug_publishers = {}
+        if config.debug.enabled:
+            self._debug_publishers = {
+                "attention": rospy.Publisher(
+                    config.debug.attention_topic,
+                    Image,
+                    queue_size=config.ros.queue_size,
+                ),
+                "slot_memory": rospy.Publisher(
+                    config.debug.slot_memory_topic,
+                    Image,
+                    queue_size=config.ros.queue_size,
+                ),
+                "signature": rospy.Publisher(
+                    config.debug.signature_topic,
+                    Image,
+                    queue_size=config.ros.queue_size,
+                ),
+            }
 
         self._subscribers = [
             rospy.Subscriber(
@@ -290,6 +317,66 @@ class DeployRosNode:
         )
         self.publishers.publish(command_packet)
 
+    def _make_debug_image_msg(self, bgr_image: np.ndarray):
+        image = np.ascontiguousarray(np.asarray(bgr_image, dtype=np.uint8))
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise RuntimeError(f"Expected BGR debug image with shape (H, W, 3), got {image.shape}.")
+        msg = self._Image()
+        msg.header.stamp = self.rospy.Time.now()
+        msg.height = int(image.shape[0])
+        msg.width = int(image.shape[1])
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = int(image.shape[1] * 3)
+        msg.data = image.tobytes()
+        return msg
+
+    def _publish_visual_debug_locked(
+        self,
+        *,
+        observation: dict[str, object],
+        inference_result: dict[str, object],
+    ) -> None:
+        if not self.config.debug.enabled or not self._debug_publishers:
+            return
+        now_s = time.monotonic()
+        if self.config.debug.publish_hz > 0.0:
+            min_period_s = 1.0 / float(self.config.debug.publish_hz)
+            if now_s - self._last_debug_publish_s < min_period_s:
+                return
+        self._last_debug_publish_s = now_s
+
+        try:
+            debug = inference_result.get("debug")
+            images = observation.get("images", {})
+            if not isinstance(images, dict):
+                images = {}
+            attention_panel = render_attention_panel(
+                images=images,
+                debug=debug if isinstance(debug, dict) else None,
+                color_order=self.config.image.color_order,
+                camera_labels=self._camera_labels,
+                overlay_alpha=self.config.debug.overlay_alpha,
+                query_step=self.config.debug.attention_query_step,
+            )
+            slot_panel = render_slot_memory_panel(
+                debug=debug if isinstance(debug, dict) else None,
+            )
+            signature_panel = render_signature_panel(
+                signature_debug=self.signature_runtime.debug_snapshot(),
+            )
+            self._debug_publishers["attention"].publish(
+                self._make_debug_image_msg(attention_panel)
+            )
+            self._debug_publishers["slot_memory"].publish(
+                self._make_debug_image_msg(slot_panel)
+            )
+            self._debug_publishers["signature"].publish(
+                self._make_debug_image_msg(signature_panel)
+            )
+        except Exception as exc:
+            self.rospy.logwarn_throttle(2.0, f"Failed to publish visual debug images: {exc}")
+
     def _control_step(self, _event) -> None:
         with self.lock:
             observation, error = self._build_observation_locked()
@@ -299,7 +386,10 @@ class DeployRosNode:
                 return
 
             try:
-                result = self.policy_runtime.infer(observation)
+                result = self.policy_runtime.infer(
+                    observation,
+                    collect_debug=self.config.debug.enabled,
+                )
             except Exception as exc:
                 self.rospy.logerr_throttle(2.0, f"Policy inference failed: {exc}")
                 self._reset_runtime()
@@ -317,6 +407,10 @@ class DeployRosNode:
                 runtime_ms=float(result["runtime_ms"]),
             )
             self.publishers.publish(command_packet)
+            self._publish_visual_debug_locked(
+                observation=observation,
+                inference_result=result,
+            )
             self.pending_reset = False
             self.seq += 1
 
@@ -342,6 +436,14 @@ class DeployRosNode:
             self.config.runtime.control_hz,
             signature_status,
         )
+        if self.config.debug.enabled:
+            self.rospy.loginfo(
+                "Deploy visual debug enabled: attention=%s slot_memory=%s signature=%s hz=%.2f",
+                self.config.debug.attention_topic,
+                self.config.debug.slot_memory_topic,
+                self.config.debug.signature_topic,
+                self.config.debug.publish_hz,
+            )
         self.rospy.spin()
 
 

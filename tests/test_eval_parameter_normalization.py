@@ -109,3 +109,27 @@ def test_parse_args_robocasa_explicit_max_steps_is_preserved() -> None:
 
     assert args.max_steps == 250
     assert args.eval_max_steps == 250
+
+
+def test_parse_args_accepts_dataset_debug_video_options() -> None:
+    args = parse_args(
+        [
+            "--policy",
+            "streaming_act",
+            "--save-debug-videos",
+            "--debug-video-fps",
+            "12",
+            "--debug-video-max-episodes",
+            "3",
+            "--debug-attention-query-step",
+            "2",
+            "--debug-overlay-alpha",
+            "0.3",
+        ]
+    )
+
+    assert args.save_debug_videos is True
+    assert args.debug_video_fps == 12
+    assert args.debug_video_max_episodes == 3
+    assert args.debug_attention_query_step == 2
+    assert args.debug_overlay_alpha == 0.3

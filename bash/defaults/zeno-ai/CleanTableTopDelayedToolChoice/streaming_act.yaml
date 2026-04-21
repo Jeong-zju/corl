@@ -51,6 +51,7 @@ train:
   num_memory_slots: 1
   slot_memory_num_slots: 4
   slot_memory_routing_hidden_dim: 512
+  slot_memory_identity_scale: 0.1
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true

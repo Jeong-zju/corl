@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,6 +53,14 @@ DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from deploy.visual_debug import (  # noqa: E402
+    render_attention_panel,
+    render_signature_panel,
+    render_slot_memory_panel,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +212,146 @@ def maybe_write_per_frame_mae_plot(
     fig.savefig(plot_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return plot_path
+
+
+def start_ffmpeg_rgb_writer(output_path: Path, width: int, height: int, fps: int):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{int(width)}x{int(height)}",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    try:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required to export dataset debug videos.") from exc
+
+
+def write_bgr_frame_to_ffmpeg(writer, frame_bgr: np.ndarray) -> None:
+    if writer.stdin is None:
+        raise RuntimeError("ffmpeg stdin is closed.")
+    import cv2
+
+    frame_bgr = np.asarray(frame_bgr, dtype=np.uint8)
+    if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+        raise ValueError(f"Expected BGR frame with shape (H, W, 3), got {frame_bgr.shape}.")
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    writer.stdin.write(np.ascontiguousarray(frame_rgb).tobytes())
+
+
+def close_ffmpeg_writer(writer, *, output_path: Path) -> None:
+    if writer.stdin is not None and not writer.stdin.closed:
+        writer.stdin.close()
+    return_code = writer.wait()
+    if return_code != 0:
+        raise RuntimeError(f"ffmpeg failed with code {return_code} for {output_path}")
+
+
+def tensor_image_to_uint8_hwc(value) -> np.ndarray:
+    import torch
+
+    if torch.is_tensor(value):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    array = np.asarray(array)
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    if array.ndim == 3 and array.shape[0] in {1, 3, 4}:
+        array = np.moveaxis(array, 0, -1)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=2)
+    if array.ndim != 3:
+        raise ValueError(f"Expected image-like tensor with 2 or 3 dims, got {array.shape}.")
+    if array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    elif array.shape[2] > 3:
+        array = array[..., :3]
+    if np.issubdtype(array.dtype, np.floating):
+        max_value = float(np.nanmax(array)) if array.size else 0.0
+        min_value = float(np.nanmin(array)) if array.size else 0.0
+        if min_value >= -1e-5 and max_value <= 1.0 + 1e-5:
+            array = array * 255.0
+    return np.clip(array, 0, 255).astype(np.uint8)
+
+
+def debug_payload_to_numpy(value):
+    import torch
+
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    if isinstance(value, dict):
+        return {str(key): debug_payload_to_numpy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [debug_payload_to_numpy(item) for item in value]
+    return value
+
+
+def get_policy_deploy_debug_snapshot(policy) -> dict[str, object] | None:
+    getter = getattr(policy, "get_deploy_debug_snapshot", None)
+    if not callable(getter):
+        return None
+    snapshot = getter()
+    if not isinstance(snapshot, dict):
+        return None
+    return debug_payload_to_numpy(snapshot)
+
+
+def load_feature_stats(dataset_root: Path, feature_key: str) -> dict[str, object] | None:
+    stats_path = dataset_root / "meta" / "stats.json"
+    if not stats_path.is_file():
+        return None
+    try:
+        stats_payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    feature_stats = stats_payload.get(feature_key)
+    return dict(feature_stats) if isinstance(feature_stats, dict) else None
+
+
+def make_signature_debug_payload(
+    *,
+    signature_vec: np.ndarray | None,
+    delta_signature_vec: np.ndarray | None,
+    signature_stats: dict[str, object] | None,
+    delta_signature_stats: dict[str, object] | None,
+    signature_backend: str | None,
+    history_length: int | None,
+    window_length: int,
+    dataset_root: Path,
+) -> dict[str, object]:
+    return {
+        "enabled": signature_vec is not None,
+        "backend": signature_backend or "disabled",
+        "history_length": history_length,
+        "window_length": int(window_length),
+        "dataset_root": str(dataset_root),
+        "signature": None if signature_vec is None else np.asarray(signature_vec, dtype=np.float32),
+        "delta_signature": (
+            None
+            if delta_signature_vec is None
+            else np.asarray(delta_signature_vec, dtype=np.float32)
+        ),
+        "signature_stats": signature_stats,
+        "delta_signature_stats": delta_signature_stats,
+    }
 
 
 def ensure_streaming_act_importable(project_root: Path) -> None:
@@ -686,6 +835,42 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default=defaults.get("max_steps_per_episode"),
         help="Optional cap on the number of timesteps evaluated per episode in dataset mode.",
     )
+    parser.add_argument(
+        "--save-debug-videos",
+        action="store_true",
+        default=bool(defaults.get("save_debug_videos", False)),
+        help=(
+            "In dataset mode, save deploy-style debug videos for attention, "
+            "slot memory routing, and path signature distribution panels."
+        ),
+    )
+    parser.add_argument(
+        "--debug-video-fps",
+        type=int,
+        default=defaults.get("debug_video_fps", defaults.get("fps", 20)),
+        help="FPS for dataset debug videos saved by --save-debug-videos.",
+    )
+    parser.add_argument(
+        "--debug-video-max-episodes",
+        type=int,
+        default=defaults.get("debug_video_max_episodes"),
+        help=(
+            "Optional cap on the number of episodes that write debug videos. "
+            "Metrics are still computed for all selected episodes."
+        ),
+    )
+    parser.add_argument(
+        "--debug-attention-query-step",
+        type=int,
+        default=defaults.get("debug_attention_query_step", 0),
+        help="Decoder query step used for saved attention heatmap overlays.",
+    )
+    parser.add_argument(
+        "--debug-overlay-alpha",
+        type=float,
+        default=defaults.get("debug_overlay_alpha", 0.45),
+        help="Heatmap opacity for saved attention debug videos.",
+    )
 
     parser.add_argument(
         "--num-rollouts",
@@ -850,6 +1035,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, attr)
         if value is not None and not isinstance(value, Path):
             setattr(args, attr, Path(value))
+    if int(getattr(args, "debug_video_fps", 0)) <= 0:
+        parser.error("--debug-video-fps must be positive.")
+    if (
+        getattr(args, "debug_video_max_episodes", None) is not None
+        and int(args.debug_video_max_episodes) <= 0
+    ):
+        parser.error("--debug-video-max-episodes must be positive when provided.")
+    if int(getattr(args, "debug_attention_query_step", 0)) < 0:
+        parser.error("--debug-attention-query-step must be >= 0.")
+    if not (0.0 <= float(getattr(args, "debug_overlay_alpha", 0.45)) <= 1.0):
+        parser.error("--debug-overlay-alpha must be in [0, 1].")
     return normalize_eval_args(args)
 
 
@@ -1249,6 +1445,33 @@ def run_dataset_evaluation(
                 f"{bool(initial_memory_debug.get('signature_indexed_slot_memory', False))}"
             )
 
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_debug_videos = bool(getattr(args, "save_debug_videos", False))
+    debug_videos_dir = output_dir / "debug_videos"
+    debug_video_records: list[dict[str, object]] = []
+    signature_stats = (
+        load_feature_stats(dataset_root, DEFAULT_PATH_SIGNATURE_KEY)
+        if use_path_signature
+        else None
+    )
+    delta_signature_stats = (
+        load_feature_stats(dataset_root, DEFAULT_DELTA_SIGNATURE_KEY)
+        if use_delta_signature
+        else None
+    )
+    camera_labels = {key: key.rsplit(".", 1)[-1] for key in visual_keys}
+    if save_debug_videos:
+        print(
+            "[info] dataset debug video export enabled: "
+            f"dir={debug_videos_dir}, fps={int(args.debug_video_fps)}"
+        )
+        if use_path_signature and signature_stats is None:
+            print(
+                "[info] dataset stats do not contain observation.path_signature; "
+                "signature debug videos will show current signature without a distribution band."
+            )
+
     action_dim: int | None = None
     total_abs_error: np.ndarray | None = None
     total_sq_error: np.ndarray | None = None
@@ -1311,6 +1534,12 @@ def run_dataset_evaluation(
         episode_frame_mae: list[float] = []
         episode_frame_rmse: list[float] = []
         episode_frame_l2_error: list[float] = []
+        save_episode_debug = save_debug_videos and (
+            getattr(args, "debug_video_max_episodes", None) is None
+            or len(debug_video_records) < int(args.debug_video_max_episodes)
+        )
+        episode_debug_writers = {}
+        episode_debug_paths: dict[str, str] = {}
 
         evaluated_steps = planned_episode_steps
 
@@ -1339,10 +1568,14 @@ def run_dataset_evaluation(
             obs = {state_key: as_tensor_copy(item[state_key])}
             if env_state_key is not None:
                 obs[env_state_key] = as_tensor_copy(item[env_state_key])
+            debug_images = {}
             for visual_key in visual_keys:
                 obs[visual_key] = as_tensor_copy(item[visual_key])
+                if save_episode_debug:
+                    debug_images[visual_key] = tensor_image_to_uint8_hwc(item[visual_key])
 
             signature_vec: np.ndarray | None = None
+            delta_signature_vec: np.ndarray | None = None
             if use_path_signature:
                 assert state_history is not None
                 path_signature_value_present = DEFAULT_PATH_SIGNATURE_KEY in item
@@ -1382,6 +1615,7 @@ def run_dataset_evaluation(
 
                 if use_delta_signature:
                     assert delta_signature_tensor is not None
+                    delta_signature_vec = tensor_to_numpy_vector(delta_signature_tensor)
                     obs[DEFAULT_DELTA_SIGNATURE_KEY] = delta_signature_tensor
                     if (
                         delta_signature_value_present
@@ -1462,9 +1696,64 @@ def run_dataset_evaluation(
 
             with torch.no_grad():
                 predicted_action = policy.select_action(obs)
+            deploy_debug = (
+                get_policy_deploy_debug_snapshot(policy)
+                if save_episode_debug
+                else None
+            )
             predicted_action = postprocessor(predicted_action)
             predicted_np = tensor_to_numpy_vector(predicted_action.squeeze(0))
             ground_truth_np = tensor_to_numpy_vector(item[action_key])
+
+            if save_episode_debug:
+                signature_debug = make_signature_debug_payload(
+                    signature_vec=signature_vec,
+                    delta_signature_vec=delta_signature_vec,
+                    signature_stats=signature_stats,
+                    delta_signature_stats=delta_signature_stats,
+                    signature_backend=signature_backend,
+                    history_length=(
+                        None
+                        if not use_path_signature
+                        else int(getattr(cfg, "history_length", 0) or 0) or None
+                    ),
+                    window_length=0 if state_history is None else len(state_history),
+                    dataset_root=dataset_root,
+                )
+                debug_panels = {
+                    "attention": render_attention_panel(
+                        images=debug_images,
+                        debug=deploy_debug,
+                        color_order="rgb",
+                        camera_labels=camera_labels,
+                        overlay_alpha=float(args.debug_overlay_alpha),
+                        query_step=int(args.debug_attention_query_step),
+                    ),
+                    "slot_memory": render_slot_memory_panel(debug=deploy_debug),
+                    "signature": render_signature_panel(
+                        signature_debug=signature_debug,
+                    ),
+                }
+                for debug_name, panel in debug_panels.items():
+                    if debug_name not in episode_debug_writers:
+                        video_path = (
+                            debug_videos_dir
+                            / f"episode_{int(episode_index):06d}_{debug_name}.mp4"
+                        )
+                        writer = start_ffmpeg_rgb_writer(
+                            video_path,
+                            width=int(panel.shape[1]),
+                            height=int(panel.shape[0]),
+                            fps=int(args.debug_video_fps),
+                        )
+                        if writer.stdin is None:
+                            raise RuntimeError(
+                                f"Failed to open ffmpeg stdin for {video_path}"
+                            )
+                        episode_debug_writers[debug_name] = (writer, video_path)
+                        episode_debug_paths[debug_name] = str(video_path)
+                    writer, _ = episode_debug_writers[debug_name]
+                    write_bgr_frame_to_ffmpeg(writer, panel)
 
             if action_dim is None:
                 action_dim = int(ground_truth_np.shape[0])
@@ -1528,6 +1817,17 @@ def run_dataset_evaluation(
             episode_frame_rmse.append(frame_rmse)
             episode_frame_l2_error.append(l2_error)
 
+        for writer, video_path in episode_debug_writers.values():
+            close_ffmpeg_writer(writer, output_path=video_path)
+        if episode_debug_paths:
+            debug_video_records.append(
+                {
+                    "episode_index": int(episode_index),
+                    "steps": int(evaluated_steps),
+                    "videos": dict(sorted(episode_debug_paths.items())),
+                }
+            )
+
         assert action_dim is not None
         assert episode_abs_error is not None
         assert episode_sq_error is not None
@@ -1590,13 +1890,18 @@ def run_dataset_evaluation(
     assert total_abs_error is not None
     assert total_sq_error is not None
 
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     per_frame_metrics_path = write_per_frame_metrics_json(output_dir, per_frame_metrics)
     per_frame_mae_plot_path = maybe_write_per_frame_mae_plot(
         output_dir,
         per_frame_metrics,
     )
+    debug_video_manifest_path = None
+    if debug_video_records:
+        debug_video_manifest_path = output_dir / "debug_videos.json"
+        debug_video_manifest_path.write_text(
+            json.dumps({"episodes": debug_video_records}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     summary = {
         "policy_type": args.policy,
         "policy_dir": str(policy_dir),
@@ -1625,6 +1930,14 @@ def run_dataset_evaluation(
             "per_frame_mae_plot": (
                 None if per_frame_mae_plot_path is None else str(per_frame_mae_plot_path)
             ),
+            "debug_videos_dir": (
+                str(debug_videos_dir) if debug_video_records else None
+            ),
+            "debug_video_manifest": (
+                None
+                if debug_video_manifest_path is None
+                else str(debug_video_manifest_path)
+            ),
         },
     }
     if use_visual_prefix_memory:
@@ -1639,6 +1952,9 @@ def run_dataset_evaluation(
         print(f"Per-frame MAE plot: {per_frame_mae_plot_path}")
     else:
         print("[info] matplotlib unavailable; skipped per-frame MAE plot.")
+    if debug_video_manifest_path is not None:
+        print(f"Debug videos: {debug_videos_dir}")
+        print(f"Debug video manifest: {debug_video_manifest_path}")
     print(
         f"MAE: {summary['metrics']['mae']:.6f}, "
         f"RMSE: {summary['metrics']['rmse']:.6f}, "
@@ -1767,6 +2083,12 @@ def main(argv: list[str] | None = None) -> None:
             "Online visual prefix memory is updated every observation step, but new "
             "memory state does not affect actions already queued for execution. "
             "For the most responsive streaming evaluation, prefer `--n-action-steps 1`."
+        )
+    if bool(getattr(args, "save_debug_videos", False)) and cfg.n_action_steps > 1:
+        print(
+            "[warn] dataset debug attention videos are refreshed only when a new "
+            "action chunk is planned. Use `--n-action-steps 1` if you want "
+            "per-frame attention overlays during dataset validation."
         )
     policy.eval()
     if args.n_action_steps is not None and hasattr(policy, "reset"):

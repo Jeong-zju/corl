@@ -55,6 +55,26 @@ def _resolve_dataset_root(split_payload: dict[str, Any]) -> Path | None:
     return dataset_root
 
 
+def _maybe_resolve_training_dataset_root(policy_dir: Path | None) -> Path | None:
+    if policy_dir is None:
+        return None
+    split_artifact = _find_training_split_artifact(policy_dir)
+    if split_artifact is None:
+        return None
+    return _resolve_dataset_root(_load_json(split_artifact))
+
+
+def _load_feature_stats(dataset_root: Path | None, feature_key: str) -> dict[str, Any] | None:
+    if dataset_root is None:
+        return None
+    stats_path = dataset_root / "meta" / "stats.json"
+    if not stats_path.is_file():
+        return None
+    stats = _load_json(stats_path)
+    feature_stats = stats.get(feature_key)
+    return dict(feature_stats) if isinstance(feature_stats, dict) else None
+
+
 @dataclass(frozen=True)
 class SignatureDatasetSpec:
     dataset_root: Path
@@ -151,15 +171,21 @@ class OnlineSignatureRuntime:
         )
 
         self._previous_signature_raw: np.ndarray | None = None
+        self._latest_signature: np.ndarray | None = None
+        self._latest_delta: np.ndarray | None = None
+        self._latest_window_length = 0
         self._backend = (
             resolve_signature_backend(policy_config.signature_backend)
             if self.enabled
             else "disabled"
         )
+        self._dataset_root = _maybe_resolve_training_dataset_root(policy_dir)
         self._dataset_spec = _maybe_load_signature_dataset_spec(
             loaded_policy_cfg=loaded_policy_cfg,
             policy_dir=policy_dir,
         )
+        self._signature_stats = _load_feature_stats(self._dataset_root, PATH_SIGNATURE_KEY)
+        self._delta_signature_stats = _load_feature_stats(self._dataset_root, DELTA_SIGNATURE_KEY)
         if self._dataset_spec is not None:
             dataset_window = (self._dataset_spec.window or "").strip().lower()
             if dataset_window == "full_prefix":
@@ -202,6 +228,9 @@ class OnlineSignatureRuntime:
     def reset(self) -> None:
         self._history.clear()
         self._previous_signature_raw = None
+        self._latest_signature = None
+        self._latest_delta = None
+        self._latest_window_length = 0
 
     def update(self, state: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
         if not self.enabled:
@@ -210,6 +239,7 @@ class OnlineSignatureRuntime:
         state_vec = np.asarray(state, dtype=np.float32).reshape(-1)
         self._history.append(state_vec.astype(np.float32, copy=True))
         window = np.stack(list(self._history), axis=0)
+        self._latest_window_length = int(window.shape[0])
         if self._history_length is not None and window.shape[0] < self._history_length:
             pad_len = self._history_length - window.shape[0]
             pad = np.repeat(window[:1], pad_len, axis=0)
@@ -245,4 +275,20 @@ class OnlineSignatureRuntime:
         delta = raw_delta
         if not self._use_path:
             signature = None
+        self._latest_signature = None if signature is None else signature.astype(np.float32, copy=True)
+        self._latest_delta = None if delta is None else delta.astype(np.float32, copy=True)
         return signature, delta
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "backend": self._backend,
+            "history_length": self._history_length,
+            "window_length": int(self._latest_window_length),
+            "dataset_root": None if self._dataset_root is None else str(self._dataset_root),
+            "dataset_summary": self.dataset_summary,
+            "signature": None if self._latest_signature is None else self._latest_signature.copy(),
+            "delta_signature": None if self._latest_delta is None else self._latest_delta.copy(),
+            "signature_stats": self._signature_stats,
+            "delta_signature_stats": self._delta_signature_stats,
+        }

@@ -124,7 +124,24 @@ class PolicyRuntime:
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
 
-    def infer(self, observation_packet: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _debug_to_numpy(value: Any) -> Any:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        if isinstance(value, dict):
+            return {str(key): PolicyRuntime._debug_to_numpy(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [PolicyRuntime._debug_to_numpy(item) for item in value]
+        return value
+
+    def infer(
+        self,
+        observation_packet: dict[str, Any],
+        *,
+        collect_debug: bool = False,
+    ) -> dict[str, Any]:
         if self.policy is None or self.cfg is None:
             raise RuntimeError("Policy has not been loaded.")
 
@@ -144,7 +161,12 @@ class PolicyRuntime:
         runtime_ms = (time.perf_counter() - start_s) * 1000.0
 
         action = predicted_action.detach().cpu().numpy().reshape(-1).astype(np.float32)
-        return {
+        result = {
             "action": action,
             "runtime_ms": float(runtime_ms),
         }
+        if collect_debug:
+            getter = getattr(self.policy, "get_deploy_debug_snapshot", None)
+            if callable(getter):
+                result["debug"] = self._debug_to_numpy(getter())
+        return result

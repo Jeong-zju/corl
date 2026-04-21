@@ -18,6 +18,15 @@ policy:
 runtime:
   control_hz: 30.0
 
+debug:
+  enabled: true
+  publish_hz: 5.0
+  attention_topic: /deploy/debug/attention
+  slot_memory_topic: /deploy/debug/slot_memory
+  signature_topic: /deploy/debug/signature
+  overlay_alpha: 0.45
+  attention_query_step: 0
+
 image:
   width: 224
   height: 224
