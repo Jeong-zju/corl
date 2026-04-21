@@ -51,6 +51,7 @@ train:
   num_memory_slots: 1
   slot_memory_num_slots: 4
   slot_memory_routing_hidden_dim: 512
+  slot_memory_identity_scale: 0.1
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
@@ -71,7 +72,7 @@ eval:
   output_dir: "outputs/eval/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-\
     prism/{run_tag}"
   eval_split: "test"
-  test_ratio: 0
+  test_ratio: 0.2
   split_seed: 42
   split_shuffle: true
   max_episodes: 20

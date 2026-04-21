@@ -12,7 +12,45 @@ from pathlib import Path
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _iter_repo_root_candidates(preferred_root: Path | None = None) -> list[Path]:
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        resolved = path.resolve(strict=False)
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        ordered.append(resolved)
+
+    if preferred_root is not None:
+        resolved_root = preferred_root.resolve(strict=False)
+        add(resolved_root)
+        for parent in resolved_root.parents:
+            add(parent)
+
+    script_path = Path(__file__).resolve()
+    for parent in script_path.parents:
+        add(parent)
+
+    return ordered
+
+
+def resolve_code_root(preferred_root: Path | None = None) -> Path:
+    probed: list[Path] = []
+    for base in _iter_repo_root_candidates(preferred_root):
+        if (base / "scripts").is_dir() and (base / "policy").is_dir():
+            return base
+        probed.append(base)
+
+    probe_lines = "\n".join(f"- {path}" for path in probed)
+    raise FileNotFoundError(
+        "Could not resolve the code root. Expected an ancestor containing both "
+        "`scripts/` and `policy/`. Checked:\n"
+        f"{probe_lines}"
+    )
 
 
 def compute_delta_signature_sequence_np(signatures: np.ndarray) -> np.ndarray:
@@ -70,11 +108,13 @@ def resolve_single_visual_observation_feature(cfg) -> tuple[str, tuple[int, ...]
 
 
 def _resolve_path_candidates(raw: Path) -> list[Path]:
+    code_root = resolve_code_root()
     candidates = []
     if raw.is_absolute():
         candidates.append(raw)
     else:
-        candidates.extend([Path.cwd() / raw, PROJECT_ROOT / raw])
+        candidates.append(Path.cwd() / raw)
+        candidates.append(code_root / raw)
 
     ordered = []
     seen = set()
@@ -90,29 +130,60 @@ def resolve_policy_dir(policy_path: Path) -> Path:
     raw = policy_path.expanduser()
     ordered = _resolve_path_candidates(raw)
 
-    for base in ordered:
-        if (base / "model.safetensors").exists():
-            return base
-        nested = base / "pretrained_model"
-        if (nested / "model.safetensors").exists():
-            return nested
-        last_nested = base / "checkpoints" / "last" / "pretrained_model"
-        if (last_nested / "model.safetensors").exists():
-            return last_nested
+    def iter_weight_candidates(base: Path) -> list[Path]:
+        candidates = [
+            base,
+            base / "pretrained_model",
+            base / "checkpoints" / "last" / "pretrained_model",
+        ]
         checkpoints_dir = base / "checkpoints"
         if checkpoints_dir.is_dir():
-            checkpoint_pretrained_dirs = [
-                path / "pretrained_model"
-                for path in checkpoints_dir.iterdir()
-                if path.is_dir() and path.name.isdigit()
-            ]
-            checkpoint_pretrained_dirs.sort(
-                key=lambda path: int(path.parent.name),
+            checkpoint_dirs = sorted(
+                [path for path in checkpoints_dir.iterdir() if path.is_dir() and path.name != "last"],
+                key=lambda path: path.stat().st_mtime,
                 reverse=True,
             )
-            for checkpoint_pretrained_dir in checkpoint_pretrained_dirs:
-                if (checkpoint_pretrained_dir / "model.safetensors").exists():
-                    return checkpoint_pretrained_dir
+            for checkpoint_dir in checkpoint_dirs:
+                candidates.append(checkpoint_dir / "pretrained_model")
+                candidates.append(checkpoint_dir)
+
+        # Support deploy/eval configs that point to a train output root containing
+        # multiple timestamped run directories instead of one concrete checkpoint.
+        if not checkpoints_dir.is_dir() and not (base / "pretrained_model").is_dir():
+            latest_run_dir = find_latest_run_dir(base)
+            if latest_run_dir is not None and latest_run_dir != base:
+                candidates.extend(
+                    [
+                        latest_run_dir,
+                        latest_run_dir / "pretrained_model",
+                        latest_run_dir / "checkpoints" / "last" / "pretrained_model",
+                    ]
+                )
+                latest_run_checkpoints = latest_run_dir / "checkpoints"
+                if latest_run_checkpoints.is_dir():
+                    run_checkpoint_dirs = sorted(
+                        [
+                            path
+                            for path in latest_run_checkpoints.iterdir()
+                            if path.is_dir() and path.name != "last"
+                        ],
+                        key=lambda path: path.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for checkpoint_dir in run_checkpoint_dirs:
+                        candidates.append(checkpoint_dir / "pretrained_model")
+                        candidates.append(checkpoint_dir)
+        return candidates
+
+    for base in ordered:
+        seen: set[Path] = set()
+        for candidate in iter_weight_candidates(base):
+            resolved_candidate = candidate.resolve(strict=False)
+            if resolved_candidate in seen:
+                continue
+            seen.add(resolved_candidate)
+            if (resolved_candidate / "model.safetensors").exists():
+                return resolved_candidate
 
     probe_lines = "\n".join(f"- {path}" for path in ordered)
     raise FileNotFoundError(
@@ -122,21 +193,16 @@ def resolve_policy_dir(policy_path: Path) -> Path:
         "- <base>/model.safetensors\n"
         "- <base>/pretrained_model/model.safetensors\n"
         "- <base>/checkpoints/last/pretrained_model/model.safetensors\n"
-        "- <base>/checkpoints/<step>/pretrained_model/model.safetensors"
+        "- <base>/checkpoints/<step>/pretrained_model/model.safetensors\n"
+        "- <train_output_root>/<latest_run>/checkpoints/.../pretrained_model/model.safetensors"
     )
 
 
 def _ensure_local_streaming_act_modules(
     repo_root: Path | None = None,
 ):
-    repo_root = (
-        repo_root.resolve(strict=False)
-        if repo_root is not None
-        else PROJECT_ROOT
-    )
-    streaming_act_src = (
-        repo_root / "policy" / "lerobot_policy_streaming_act" / "src"
-    )
+    code_root = resolve_code_root(repo_root)
+    streaming_act_src = code_root / "policy" / "lerobot_policy_streaming_act" / "src"
     if not streaming_act_src.exists():
         raise FileNotFoundError(
             f"Streaming ACT package source not found: {streaming_act_src}"
@@ -147,8 +213,9 @@ def _ensure_local_streaming_act_modules(
         sys.path.insert(0, streaming_act_src_str)
 
     for module_name, module in list(sys.modules.items()):
-        if module_name != "lerobot_policy_streaming_act" and not module_name.startswith(
-            "lerobot_policy_streaming_act."
+        if (
+            module_name != "lerobot_policy_streaming_act"
+            and not module_name.startswith("lerobot_policy_streaming_act.")
         ):
             continue
 
@@ -193,7 +260,9 @@ def _parse_config_with_class(
     dropped_fields: tuple[str, ...] = ()
     if drop_unknown_fields:
         valid_fields = {field.name for field in fields(config_cls)}
-        dropped_fields = tuple(sorted(key for key in raw_config if key not in valid_fields))
+        dropped_fields = tuple(
+            sorted(key for key in raw_config if key not in valid_fields)
+        )
         if dropped_fields:
             raw_config = {
                 key: value for key, value in raw_config.items() if key in valid_fields
@@ -349,7 +418,9 @@ def build_prefix_sequence_eval_inputs(
     else:
         resolved_image_keys = list(image_keys)
     if not resolved_image_keys:
-        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+        raise ValueError(
+            "At least one image key is required for prefix-sequence inputs."
+        )
 
     if prefix_image_histories is None:
         if prefix_image_history is None:
@@ -366,7 +437,9 @@ def build_prefix_sequence_eval_inputs(
     else:
         resolved_prefix_image_histories = prefix_image_histories
         missing_histories = [
-            key for key in resolved_image_keys if key not in resolved_prefix_image_histories
+            key
+            for key in resolved_image_keys
+            if key not in resolved_prefix_image_histories
         ]
         if missing_histories:
             raise KeyError(
@@ -422,14 +495,18 @@ def build_prefix_sequence_eval_inputs(
             pad_value=float(cfg.prefix_pad_value),
         )
         if not torch.equal(prefix_mask, prefix_signature_mask):
-            raise RuntimeError("Prefix state/signature masks diverged during online eval.")
+            raise RuntimeError(
+                "Prefix state/signature masks diverged during online eval."
+            )
     if delta_signature_key is not None:
         assert prefix_delta_signature_history is not None
-        prefix_delta_signature, prefix_delta_signature_mask = build_padded_prefix_from_history(
-            prefix_delta_signature_history,
-            prefix_train_max_steps=int(cfg.prefix_train_max_steps),
-            prefix_frame_stride=int(cfg.prefix_frame_stride),
-            pad_value=float(cfg.prefix_pad_value),
+        prefix_delta_signature, prefix_delta_signature_mask = (
+            build_padded_prefix_from_history(
+                prefix_delta_signature_history,
+                prefix_train_max_steps=int(cfg.prefix_train_max_steps),
+                prefix_frame_stride=int(cfg.prefix_frame_stride),
+                pad_value=float(cfg.prefix_pad_value),
+            )
         )
         if not torch.equal(prefix_mask, prefix_delta_signature_mask):
             raise RuntimeError(
@@ -479,7 +556,9 @@ def ensure_prefix_sequence_batch_dims(
     else:
         resolved_image_keys = list(image_keys)
     if not resolved_image_keys:
-        raise ValueError("At least one image key is required for prefix-sequence inputs.")
+        raise ValueError(
+            "At least one image key is required for prefix-sequence inputs."
+        )
 
     prefix_image_keys = [
         prefix_image_key_from_camera_key(current_image_key)

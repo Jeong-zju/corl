@@ -33,6 +33,17 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class DebugConfig:
+    enabled: bool
+    publish_hz: float
+    attention_topic: str
+    slot_memory_topic: str
+    signature_topic: str
+    overlay_alpha: float
+    attention_query_step: int
+
+
+@dataclass(frozen=True)
 class ImageConfig:
     width: int
     height: int
@@ -80,6 +91,7 @@ class DeployConfig:
     path: Path
     policy: PolicyConfig
     runtime: RuntimeConfig
+    debug: DebugConfig
     image: ImageConfig
     ros: RosConfig
     command: CommandConfig
@@ -119,6 +131,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     policy_type = str(policy_raw.get("type", "act"))
     use_streaming_signatures = policy_type == "streaming_act"
     runtime_raw = _as_mapping(raw, "runtime")
+    debug_raw = _as_mapping(raw, "debug")
     image_raw = _as_mapping(raw, "image")
     ros_raw = _as_mapping(raw, "ros")
     topics_raw = _as_mapping(ros_raw, "topics")
@@ -181,6 +194,26 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     runtime = RuntimeConfig(
         control_hz=float(runtime_raw.get("control_hz", 20.0)),
     )
+
+    debug = DebugConfig(
+        enabled=bool(debug_raw.get("enabled", False)),
+        publish_hz=float(debug_raw.get("publish_hz", 5.0)),
+        attention_topic=str(debug_raw.get("attention_topic", "/deploy/debug/attention")),
+        slot_memory_topic=str(debug_raw.get("slot_memory_topic", "/deploy/debug/slot_memory")),
+        signature_topic=str(debug_raw.get("signature_topic", "/deploy/debug/signature")),
+        overlay_alpha=float(debug_raw.get("overlay_alpha", 0.45)),
+        attention_query_step=int(debug_raw.get("attention_query_step", 0)),
+    )
+    if debug.publish_hz < 0.0:
+        raise ValueError(f"`debug.publish_hz` must be >= 0, got {debug.publish_hz}.")
+    if not (0.0 <= debug.overlay_alpha <= 1.0):
+        raise ValueError(
+            f"`debug.overlay_alpha` must be in [0, 1], got {debug.overlay_alpha}."
+        )
+    if debug.attention_query_step < 0:
+        raise ValueError(
+            f"`debug.attention_query_step` must be >= 0, got {debug.attention_query_step}."
+        )
 
     image = ImageConfig(
         width=int(image_raw.get("width", 224)),
@@ -249,6 +282,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
         path=path,
         policy=policy,
         runtime=runtime,
+        debug=debug,
         image=image,
         ros=ros,
         command=command,

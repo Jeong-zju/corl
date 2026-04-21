@@ -64,3 +64,28 @@ class SensorCache:
         if not stamps:
             return float("inf")
         return max(stamps) / 1_000_000.0 - min(stamps) / 1_000_000.0
+
+
+def reorder_joint_positions(
+    *,
+    positions: list[float] | tuple[float, ...],
+    names: list[str] | tuple[str, ...] | None,
+    expected_names: list[str] | tuple[str, ...] | None,
+    dof: int,
+) -> np.ndarray:
+    if dof <= 0:
+        raise ValueError(f"`dof` must be positive, got {dof}.")
+
+    raw_positions = list(positions)
+    expected = [str(name) for name in list(expected_names or [])[:dof]]
+    observed_names = [str(name) for name in list(names or [])]
+    if expected and observed_names and len(observed_names) == len(raw_positions):
+        index_by_name = {name: idx for idx, name in enumerate(observed_names)}
+        if all(name in index_by_name for name in expected):
+            reordered = [raw_positions[index_by_name[name]] for name in expected]
+            return np.asarray(reordered, dtype=np.float32)
+
+    truncated = raw_positions[:dof]
+    if len(truncated) < dof:
+        truncated = truncated + [0.0] * (dof - len(truncated))
+    return np.asarray(truncated, dtype=np.float32)
