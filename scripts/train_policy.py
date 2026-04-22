@@ -50,6 +50,9 @@ PRETRAINED_MODEL_DIRNAME = "pretrained_model"
 TRAIN_CONFIG_FILENAME = "train_config.json"
 TRAINING_STATE_DIRNAME = "training_state"
 TRAINING_STEP_FILENAME = "training_step.json"
+FRESH_DISTRIBUTED_RUN_MARKER_FILENAME = ".corl_fresh_distributed_run.json"
+FRESH_DISTRIBUTED_RUN_MARKER_VERSION = 1
+FRESH_DISTRIBUTED_RUN_MARKER_WAIT_SECONDS = 120.0
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -60,6 +63,16 @@ class ResumeRunState:
     pretrained_model_dir: Path
     train_config_path: Path
     split_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class FreshDistributedOutputReservation:
+    output_dir: Path
+    marker_path: Path
+    launch_id: str
+
+
+_FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS: dict[Path, str] = {}
 
 
 def _sanitize_signature_cache_path_part(value: str) -> str:
@@ -581,6 +594,185 @@ def resolve_train_run_stamp(now: dt.datetime | None = None) -> str:
         return str(shared_run_stamp)
     moment = dt.datetime.now() if now is None else now
     return moment.strftime("%Y%m%d_%H%M%S")
+
+
+def resolve_fresh_distributed_launch_id(
+    *,
+    output_dir: Path,
+    run_stamp: str,
+    world_size: int,
+) -> str:
+    explicit_launch_id = os.environ.get("CORL_TRAIN_LAUNCH_ID")
+    if explicit_launch_id:
+        return str(explicit_launch_id)
+
+    shared_env_parts = {
+        "run_stamp": str(run_stamp),
+        "world_size": str(int(world_size)),
+        "output_dir": str(output_dir.resolve(strict=False)),
+        "master_addr": os.environ.get("MASTER_ADDR", ""),
+        "master_port": os.environ.get("MASTER_PORT", ""),
+        "torchelastic_run_id": os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_step_id": os.environ.get("SLURM_STEP_ID", ""),
+    }
+    return "|".join(f"{key}={value}" for key, value in shared_env_parts.items())
+
+
+def _fresh_distributed_output_marker_path(output_dir: Path) -> Path:
+    return output_dir / FRESH_DISTRIBUTED_RUN_MARKER_FILENAME
+
+
+def _read_fresh_distributed_output_marker(
+    marker_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def fresh_distributed_output_marker_matches(
+    output_dir: Path,
+    *,
+    launch_id: str,
+) -> bool:
+    marker = _read_fresh_distributed_output_marker(
+        _fresh_distributed_output_marker_path(output_dir)
+    )
+    return bool(
+        marker is not None
+        and marker.get("version") == FRESH_DISTRIBUTED_RUN_MARKER_VERSION
+        and marker.get("launch_id") == launch_id
+    )
+
+
+def reserve_fresh_distributed_output_dir(
+    *,
+    output_dir: Path,
+    launch_id: str,
+    run_stamp: str,
+    world_size: int,
+    is_main_process: bool,
+    wait_seconds: float = FRESH_DISTRIBUTED_RUN_MARKER_WAIT_SECONDS,
+) -> FreshDistributedOutputReservation | None:
+    if int(world_size) <= 1:
+        return None
+
+    resolved_output_dir = output_dir.resolve(strict=False)
+    marker_path = _fresh_distributed_output_marker_path(resolved_output_dir)
+
+    if is_main_process:
+        try:
+            resolved_output_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "Output directory already exists before this fresh distributed "
+                f"launch: {resolved_output_dir}. Use --resume to continue a "
+                "checkpointed run, or choose a new output root/run stamp for a "
+                "fresh run."
+            ) from exc
+
+        marker_payload = {
+            "version": FRESH_DISTRIBUTED_RUN_MARKER_VERSION,
+            "launch_id": launch_id,
+            "run_stamp": str(run_stamp),
+            "world_size": int(world_size),
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        marker_path.write_text(
+            json.dumps(marker_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    else:
+        deadline = time.monotonic() + float(wait_seconds)
+        while time.monotonic() < deadline:
+            marker = _read_fresh_distributed_output_marker(marker_path)
+            if marker is None:
+                time.sleep(0.2)
+                continue
+            if (
+                marker.get("version") == FRESH_DISTRIBUTED_RUN_MARKER_VERSION
+                and marker.get("launch_id") == launch_id
+            ):
+                break
+            raise FileExistsError(
+                "Output directory was reserved by a different distributed launch: "
+                f"{resolved_output_dir}."
+            )
+        else:
+            raise TimeoutError(
+                "Timed out waiting for the main distributed process to reserve "
+                f"the output directory: {resolved_output_dir}."
+            )
+
+    return FreshDistributedOutputReservation(
+        output_dir=resolved_output_dir,
+        marker_path=marker_path,
+        launch_id=launch_id,
+    )
+
+
+def install_lerobot_fresh_distributed_output_validate_patch(
+    train_pipeline_config_cls: type[object],
+) -> None:
+    if getattr(
+        train_pipeline_config_cls,
+        "_corl_fresh_distributed_output_validate_patch_installed",
+        False,
+    ):
+        return
+
+    original_validate = train_pipeline_config_cls.validate
+
+    def validate_with_fresh_distributed_output_reservation(self) -> object:
+        raw_output_dir = getattr(self, "output_dir", None)
+        if raw_output_dir is not None:
+            output_dir = Path(raw_output_dir).resolve(strict=False)
+            launch_id = _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS.get(output_dir)
+            if (
+                launch_id
+                and not bool(getattr(self, "resume", False))
+                and fresh_distributed_output_marker_matches(
+                    output_dir,
+                    launch_id=launch_id,
+                )
+            ):
+                original_resume = getattr(self, "resume", False)
+                try:
+                    setattr(self, "resume", True)
+                    return original_validate(self)
+                except FileExistsError as exc:
+                    if str(output_dir) in str(exc):
+                        return None
+                    raise
+                finally:
+                    setattr(self, "resume", original_resume)
+
+        return original_validate(self)
+
+    train_pipeline_config_cls._corl_original_validate = original_validate
+    train_pipeline_config_cls.validate = (
+        validate_with_fresh_distributed_output_reservation
+    )
+    train_pipeline_config_cls._corl_fresh_distributed_output_validate_patch_installed = (
+        True
+    )
+
+
+def register_lerobot_fresh_distributed_output_reservation(
+    train_pipeline_config_cls: type[object],
+    reservation: FreshDistributedOutputReservation | None,
+) -> None:
+    if reservation is None:
+        return
+    _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS[
+        reservation.output_dir.resolve(strict=False)
+    ] = reservation.launch_id
+    install_lerobot_fresh_distributed_output_validate_patch(train_pipeline_config_cls)
 
 
 def install_torch_dataloader_patch(
@@ -3901,6 +4093,33 @@ def main(argv: list[str] | None = None) -> None:
             f"per_device_batch_size={int(args.batch_size)}, "
             f"global_batch_size={int(args.batch_size) * accelerator_world_size}"
         )
+
+    fresh_distributed_output_reservation = None
+    if resume_run_state is None and accelerator_world_size > 1:
+        # Rank 0 must create the shared fresh-run directory without making
+        # LeRobot's non-resume overwrite guard reject the other ranks.
+        fresh_distributed_launch_id = resolve_fresh_distributed_launch_id(
+            output_dir=output_dir,
+            run_stamp=run_stamp,
+            world_size=accelerator_world_size,
+        )
+        fresh_distributed_output_reservation = reserve_fresh_distributed_output_dir(
+            output_dir=output_dir,
+            launch_id=fresh_distributed_launch_id,
+            run_stamp=run_stamp,
+            world_size=accelerator_world_size,
+            is_main_process=bool(accelerator.is_main_process),
+        )
+        register_lerobot_fresh_distributed_output_reservation(
+            TrainPipelineConfig,
+            fresh_distributed_output_reservation,
+        )
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            print(
+                "- distributed_output_reservation: "
+                f"{fresh_distributed_output_reservation.marker_path}"
+            )
 
     resume_config_arg = None
     if resume_run_state is not None and not any(
