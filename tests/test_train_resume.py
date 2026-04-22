@@ -219,10 +219,18 @@ def test_lerobot_validate_patch_allows_reserved_fresh_distributed_dir(
             self.output_dir = output_dir
             self.resume = False
             self.validate_resume_values: list[bool] = []
+            self.validate_output_dir_types: list[type] = []
 
         def validate(self) -> str:
             self.validate_resume_values.append(bool(self.resume))
-            if Path(self.output_dir).exists() and not self.resume:
+            self.validate_output_dir_types.append(type(self.output_dir))
+            if self.resume:
+                raise ValueError("A config_path is expected when resuming a run.")
+            if (
+                isinstance(self.output_dir, Path)
+                and self.output_dir.is_dir()
+                and not self.resume
+            ):
                 raise FileExistsError(f"Output directory {self.output_dir} exists")
             return "validated"
 
@@ -233,5 +241,7 @@ def test_lerobot_validate_patch_allows_reserved_fresh_distributed_dir(
     cfg = DummyTrainPipelineConfig(output_dir)
 
     assert cfg.validate() == "validated"
+    assert cfg.output_dir == output_dir
     assert cfg.resume is False
-    assert cfg.validate_resume_values == [True]
+    assert cfg.validate_resume_values == [False]
+    assert cfg.validate_output_dir_types == [str]

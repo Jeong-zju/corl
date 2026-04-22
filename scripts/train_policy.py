@@ -741,16 +741,11 @@ def install_lerobot_fresh_distributed_output_validate_patch(
                     launch_id=launch_id,
                 )
             ):
-                original_resume = getattr(self, "resume", False)
                 try:
-                    setattr(self, "resume", True)
+                    setattr(self, "output_dir", str(output_dir))
                     return original_validate(self)
-                except FileExistsError as exc:
-                    if str(output_dir) in str(exc):
-                        return None
-                    raise
                 finally:
-                    setattr(self, "resume", original_resume)
+                    setattr(self, "output_dir", raw_output_dir)
 
         return original_validate(self)
 
