@@ -2483,6 +2483,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "break slot permutation symmetry."
             ),
         )
+        parser.add_argument(
+            "--slot-memory-routing-temperature",
+            type=float,
+            default=defaults.get("slot_memory_routing_temperature", 1.0),
+            help=(
+                "Temperature applied to SISM routing logits. Lower values make "
+                "slot routing sharper."
+            ),
+        )
         slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
         slot_memory_delta_routing_group.add_argument(
             "--enable-slot-memory-delta-routing",
@@ -2545,6 +2554,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=float,
             default=defaults.get("slot_memory_balance_loss_coef", 0.0),
             help="Optional routing-balance loss coefficient for SISM.",
+        )
+        parser.add_argument(
+            "--slot-memory-entropy-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_entropy_loss_coef", 0.0),
+            help=(
+                "Optional per-step routing entropy loss coefficient for SISM. "
+                "Use with a small balance loss for confident but diverse slots."
+            ),
         )
         parser.add_argument(
             "--slot-memory-consistency-loss-coef",
@@ -3327,10 +3345,14 @@ def main(argv: list[str] | None = None) -> None:
             slot_memory_num_slots=int(args.slot_memory_num_slots),
             slot_memory_routing_hidden_dim=int(args.slot_memory_routing_hidden_dim),
             slot_memory_identity_scale=float(args.slot_memory_identity_scale),
+            slot_memory_routing_temperature=float(
+                args.slot_memory_routing_temperature
+            ),
             slot_memory_use_delta_routing=bool(args.slot_memory_use_delta_routing),
             slot_memory_use_softmax_routing=bool(args.slot_memory_use_softmax_routing),
             slot_memory_use_readout_pooling=bool(args.slot_memory_use_readout_pooling),
             slot_memory_balance_loss_coef=float(args.slot_memory_balance_loss_coef),
+            slot_memory_entropy_loss_coef=float(args.slot_memory_entropy_loss_coef),
             slot_memory_consistency_loss_coef=float(
                 args.slot_memory_consistency_loss_coef
             ),
@@ -3766,6 +3788,8 @@ def main(argv: list[str] | None = None) -> None:
                     f"num_slots={int(args.slot_memory_num_slots)}, "
                     f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
                     f"identity_scale={float(args.slot_memory_identity_scale)}, "
+                    "routing_temperature="
+                    f"{float(args.slot_memory_routing_temperature)}, "
                     "delta_routing="
                     f"{bool(args.slot_memory_use_delta_routing)}, "
                     "softmax_routing="
@@ -3774,6 +3798,8 @@ def main(argv: list[str] | None = None) -> None:
                     f"{bool(args.slot_memory_use_readout_pooling)}, "
                     "balance_loss_coef="
                     f"{float(args.slot_memory_balance_loss_coef)}, "
+                    "entropy_loss_coef="
+                    f"{float(args.slot_memory_entropy_loss_coef)}, "
                     "consistency_loss_coef="
                     f"{float(args.slot_memory_consistency_loss_coef)}"
                 )

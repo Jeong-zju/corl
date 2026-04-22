@@ -237,6 +237,12 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = loss + balance_weighted
             loss_dict["slot_memory_balance_loss"] = balance_raw.item()
             loss_dict["slot_memory_balance_loss_weighted"] = balance_weighted.item()
+        if "slot_memory_entropy_loss" in aux_losses:
+            entropy_raw = aux_losses["slot_memory_entropy_loss"]
+            entropy_weighted = entropy_raw * self.config.slot_memory_entropy_loss_coef
+            loss = loss + entropy_weighted
+            loss_dict["slot_memory_entropy_loss"] = entropy_raw.item()
+            loss_dict["slot_memory_entropy_loss_weighted"] = entropy_weighted.item()
         if "slot_memory_consistency_loss" in aux_losses:
             consistency_raw = aux_losses["slot_memory_consistency_loss"]
             consistency_weighted = (
@@ -1148,6 +1154,10 @@ class StreamingACT(nn.Module):
         routing_logits = torch.matmul(
             routing_query, routing_keys.transpose(1, 2)
         ).squeeze(1) / math.sqrt(self.config.slot_memory_routing_hidden_dim)
+        routing_temperature = float(
+            getattr(self.config, "slot_memory_routing_temperature", 1.0)
+        )
+        routing_logits = routing_logits / max(routing_temperature, 1e-6)
         if self.config.slot_memory_use_softmax_routing:
             routing_weights = torch.softmax(routing_logits, dim=-1)
             routing_distribution = routing_weights
@@ -1370,6 +1380,7 @@ class StreamingACT(nn.Module):
         self,
         *,
         routing_distribution_sum: Tensor | None,
+        routing_entropy_sum: Tensor | None,
         consistency_loss_sum: Tensor | None,
         valid_step_count: Tensor | None,
         device: torch.device,
@@ -1402,13 +1413,34 @@ class StreamingACT(nn.Module):
             )
         if (
             self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_entropy_loss_coef > 0.0
+        ):
+            if routing_entropy_sum is None:
+                raise RuntimeError(
+                    "Missing routing entropy statistics for slot-memory entropy loss."
+            )
+            max_entropy = math.log(float(max(1, self.active_memory_num_slots)))
+            if max_entropy <= 0.0:
+                aux_losses["slot_memory_entropy_loss"] = torch.zeros(
+                    (),
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                aux_losses["slot_memory_entropy_loss"] = (
+                    routing_entropy_sum / valid_step_count
+                ) / max_entropy
+        if (
+            self.use_signature_indexed_slot_memory
             and self.config.slot_memory_consistency_loss_coef > 0.0
         ):
             if consistency_loss_sum is None:
                 raise RuntimeError(
                     "Missing readout/write statistics for slot-memory consistency loss."
                 )
-            aux_losses["slot_memory_consistency_loss"] = consistency_loss_sum / valid_step_count
+            aux_losses["slot_memory_consistency_loss"] = (
+                consistency_loss_sum / valid_step_count
+            )
         return aux_losses
 
     def _scan_visual_prefix_memory(
@@ -1464,11 +1496,16 @@ class StreamingACT(nn.Module):
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_balance_loss_coef > 0.0
         )
+        need_entropy_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_entropy_loss_coef > 0.0
+        )
         need_consistency_loss = (
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_consistency_loss_coef > 0.0
         )
         routing_distribution_sum = None
+        routing_entropy_sum = None
         consistency_loss_sum = None
         valid_step_count = None
         collect_slot_metrics = self.use_signature_indexed_slot_memory
@@ -1535,6 +1572,18 @@ class StreamingACT(nn.Module):
                     routing_distribution_sum = step_distribution_sum
                 else:
                     routing_distribution_sum = routing_distribution_sum + step_distribution_sum
+            if need_entropy_loss:
+                step_distribution = step_stats["routing_distribution"].clamp_min(1e-8)
+                step_entropy = -(
+                    step_distribution * step_distribution.log()
+                ).sum(dim=-1)
+                masked_step_entropy = (
+                    step_entropy * prefix_mask[:, step_idx].to(step_entropy.dtype)
+                ).sum()
+                if routing_entropy_sum is None:
+                    routing_entropy_sum = masked_step_entropy
+                else:
+                    routing_entropy_sum = routing_entropy_sum + masked_step_entropy
             if collect_slot_metrics:
                 metric_mask = prefix_mask[:, step_idx].to(dtype=torch.float32)
                 metric_mask_2d = metric_mask.unsqueeze(-1)
@@ -1601,7 +1650,7 @@ class StreamingACT(nn.Module):
                     consistency_loss_sum = masked_step_consistency
                 else:
                     consistency_loss_sum = consistency_loss_sum + masked_step_consistency
-            if need_balance_loss or need_consistency_loss:
+            if need_balance_loss or need_entropy_loss or need_consistency_loss:
                 step_valid_count = prefix_mask[:, step_idx].to(hidden.dtype).sum()
                 if valid_step_count is None:
                     valid_step_count = step_valid_count
@@ -1609,6 +1658,7 @@ class StreamingACT(nn.Module):
                     valid_step_count = valid_step_count + step_valid_count
         aux_losses = self._build_visual_prefix_memory_aux_losses(
             routing_distribution_sum=routing_distribution_sum,
+            routing_entropy_sum=routing_entropy_sum,
             consistency_loss_sum=consistency_loss_sum,
             valid_step_count=valid_step_count,
             device=hidden.device,

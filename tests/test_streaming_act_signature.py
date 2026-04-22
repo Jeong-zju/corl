@@ -199,7 +199,9 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
         use_memory_conditioned_encoder_film=True,
         slot_memory_num_slots=2,
         slot_memory_use_delta_routing=True,
+        slot_memory_routing_temperature=0.5,
         slot_memory_balance_loss_coef=0.1,
+        slot_memory_entropy_loss_coef=0.1,
         slot_memory_consistency_loss_coef=0.1,
         signature_dim=8,
         signature_hidden_dim=16,
@@ -242,8 +244,10 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
 
     assert actions.shape == (batch_size, 2, 17)
     assert "slot_memory_balance_loss" in aux_losses
+    assert "slot_memory_entropy_loss" in aux_losses
     assert "slot_memory_consistency_loss" in aux_losses
     assert torch.isfinite(aux_losses["slot_memory_balance_loss"])
+    assert torch.isfinite(aux_losses["slot_memory_entropy_loss"])
     assert torch.isfinite(aux_losses["slot_memory_consistency_loss"])
     assert "slot_memory/routing_weight/slot_0" in log_stats
     assert "slot_memory/routing_weight/slot_1" in log_stats

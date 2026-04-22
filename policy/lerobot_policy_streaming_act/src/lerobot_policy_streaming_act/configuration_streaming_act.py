@@ -132,6 +132,9 @@ class StreamingACTConfig(PreTrainedConfig):
         slot_memory_identity_scale: Scale for a fixed deterministic slot identity
             added to SISM slot addressing paths. This breaks permutation symmetry
             between slots; set to 0.0 only for exact legacy behavior.
+        slot_memory_routing_temperature: Temperature applied to SISM routing logits.
+            Lower values sharpen softmax/sigmoid routing and make small slot-logit
+            differences more visible.
         slot_memory_use_delta_routing: Whether delta signatures participate in the
             explicit SISM routing signal in addition to path signatures.
         slot_memory_use_softmax_routing: Whether SISM routing weights are produced
@@ -142,6 +145,9 @@ class StreamingACTConfig(PreTrainedConfig):
             If disabled, FiLM falls back to mean pooling over slots.
         slot_memory_balance_loss_coef: Optional coefficient for a routing-balance
             auxiliary loss. Defaults to 0.0, which disables the term.
+        slot_memory_entropy_loss_coef: Optional coefficient for a per-step
+            routing-entropy auxiliary loss. Combine with a small balance loss to
+            learn confident but globally diverse unsupervised slot assignments.
         slot_memory_consistency_loss_coef: Optional coefficient for a readout/write
             consistency auxiliary loss. Defaults to 0.0, which disables the term.
         temporal_ensemble_coeff: Coefficient for the exponential weighting scheme to apply for temporal
@@ -203,10 +209,12 @@ class StreamingACTConfig(PreTrainedConfig):
     slot_memory_num_slots: int = 4
     slot_memory_routing_hidden_dim: int = 512
     slot_memory_identity_scale: float = 0.1
+    slot_memory_routing_temperature: float = 1.0
     slot_memory_use_delta_routing: bool = False
     slot_memory_use_softmax_routing: bool = True
     slot_memory_use_readout_pooling: bool = True
     slot_memory_balance_loss_coef: float = 0.0
+    slot_memory_entropy_loss_coef: float = 0.0
     slot_memory_consistency_loss_coef: float = 0.0
 
     # Streaming path-signature history module.
@@ -333,6 +341,12 @@ class StreamingACTConfig(PreTrainedConfig):
                     "`use_signature_indexed_slot_memory=True`. "
                     f"Got {self.slot_memory_identity_scale}."
                 )
+            if self.slot_memory_routing_temperature <= 0.0:
+                raise ValueError(
+                    "`slot_memory_routing_temperature` must be > 0.0 when "
+                    "`use_signature_indexed_slot_memory=True`. "
+                    f"Got {self.slot_memory_routing_temperature}."
+                )
             if self.slot_memory_use_delta_routing and not self.use_delta_signature:
                 raise ValueError(
                     "`slot_memory_use_delta_routing=True` requires "
@@ -342,6 +356,11 @@ class StreamingACTConfig(PreTrainedConfig):
                 raise ValueError(
                     "`slot_memory_balance_loss_coef` must be >= 0.0. "
                     f"Got {self.slot_memory_balance_loss_coef}."
+                )
+            if self.slot_memory_entropy_loss_coef < 0.0:
+                raise ValueError(
+                    "`slot_memory_entropy_loss_coef` must be >= 0.0. "
+                    f"Got {self.slot_memory_entropy_loss_coef}."
                 )
             if self.slot_memory_consistency_loss_coef < 0.0:
                 raise ValueError(
