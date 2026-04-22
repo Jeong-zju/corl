@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import load_yaml_mapping, resolve_path
+from gripper_hysteresis import (
+    GripperHysteresisConfig,
+    parse_gripper_hysteresis_config,
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class DeployConfig:
     path: Path
     policy: PolicyConfig
     runtime: RuntimeConfig
+    gripper_hysteresis: GripperHysteresisConfig
     debug: DebugConfig
     image: ImageConfig
     ros: RosConfig
@@ -136,6 +141,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     ros_raw = _as_mapping(raw, "ros")
     topics_raw = _as_mapping(ros_raw, "topics")
     command_raw = _as_mapping(raw, "command")
+    gripper_hysteresis_raw = _as_mapping(raw, "gripper_hysteresis")
 
     policy = PolicyConfig(
         type=policy_type,
@@ -193,6 +199,13 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
 
     runtime = RuntimeConfig(
         control_hz=float(runtime_raw.get("control_hz", 20.0)),
+    )
+
+    gripper_hysteresis = parse_gripper_hysteresis_config(
+        gripper_hysteresis_raw,
+        action_dim=policy.action_dim,
+        base_action_dim=policy.base_action_dim,
+        arm_dof=policy.arm_dof,
     )
 
     debug = DebugConfig(
@@ -282,6 +295,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
         path=path,
         policy=policy,
         runtime=runtime,
+        gripper_hysteresis=gripper_hysteresis,
         debug=debug,
         image=image,
         ros=ros,

@@ -18,6 +18,16 @@ policy:
 runtime:
   control_hz: 30.0
 
+gripper_hysteresis:
+  enabled: true
+  action_indices: [9, 16]
+  closed_values: [-0.023815296590328217, -0.0014613720122724771]
+  open_values: [0.08064205199480057, 0.08006636798381805]
+  close_thresholds: [0.015356209129095078, 0.029111530486261475]
+  open_thresholds: [0.041470546275377274, 0.049493465485284105]
+  hysteresis_ratio: 0.25
+  initial_state: current
+
 debug:
   enabled: true
   publish_hz: 5.0

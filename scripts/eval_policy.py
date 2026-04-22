@@ -63,6 +63,13 @@ from deploy.visual_debug import (  # noqa: E402
     render_signature_panel,
     render_slot_memory_panel,
 )
+from deploy.gripper_hysteresis import (  # noqa: E402
+    GripperHysteresis,
+    complete_gripper_hysteresis_config_from_dataset_stats,
+    parse_float_sequence,
+    parse_gripper_hysteresis_config,
+    parse_int_sequence,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +579,29 @@ def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
         temporal_ensemble_coeff = float(temporal_ensemble_coeff)
         args.temporal_ensemble_coeff = temporal_ensemble_coeff
     args.eval_temporal_ensemble_coeff = temporal_ensemble_coeff
+    args.gripper_hysteresis_enabled = bool(
+        getattr(args, "gripper_hysteresis_enabled", False)
+    )
+    args.gripper_action_indices = parse_int_sequence(
+        getattr(args, "gripper_action_indices", None),
+        key="--gripper-action-indices",
+    )
+    for attr, key in (
+        ("gripper_closed_values", "--gripper-closed-values"),
+        ("gripper_open_values", "--gripper-open-values"),
+        ("gripper_close_thresholds", "--gripper-close-thresholds"),
+        ("gripper_open_thresholds", "--gripper-open-thresholds"),
+    ):
+        setattr(
+            args,
+            attr,
+            parse_float_sequence(getattr(args, attr, None), key=key),
+        )
+    args.gripper_hysteresis_ratio = float(
+        getattr(args, "gripper_hysteresis_ratio", 0.25)
+    )
+    if not (0.0 <= args.gripper_hysteresis_ratio < 1.0):
+        raise ValueError("--gripper-hysteresis-ratio must be in [0, 1).")
     return args
 
 
@@ -841,6 +871,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         except FileNotFoundError:
             env_defaults = {}
         defaults.update(env_defaults)
+    gripper_defaults = defaults.get("gripper_hysteresis", {})
+    if gripper_defaults is None:
+        gripper_defaults = {}
+    if not isinstance(gripper_defaults, dict):
+        raise TypeError(
+            "Expected eval default `gripper_hysteresis` to be a mapping, "
+            f"got {type(gripper_defaults).__name__}."
+        )
 
     parser = argparse.ArgumentParser(
         description=(
@@ -963,6 +1001,77 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=str,
         default=defaults.get("device", "cuda"),
         help="cuda/cpu/mps",
+    )
+    gripper_group = parser.add_mutually_exclusive_group()
+    gripper_group.add_argument(
+        "--enable-gripper-hysteresis",
+        dest="gripper_hysteresis_enabled",
+        action="store_true",
+        help=(
+            "Discretize configured gripper action dimensions with a stateful "
+            "hysteresis curve after action unnormalization."
+        ),
+    )
+    gripper_group.add_argument(
+        "--disable-gripper-hysteresis",
+        dest="gripper_hysteresis_enabled",
+        action="store_false",
+        help="Disable gripper hysteresis even if defaults enable it.",
+    )
+    parser.set_defaults(
+        gripper_hysteresis_enabled=bool(gripper_defaults.get("enabled", False))
+    )
+    parser.add_argument(
+        "--gripper-action-indices",
+        default=gripper_defaults.get("action_indices", gripper_defaults.get("indices")),
+        help=(
+            "Comma-separated action indices for grippers. If omitted while enabled, "
+            "the zeno layout default is inferred from action_dim."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-closed-values",
+        default=gripper_defaults.get("closed_values"),
+        help=(
+            "Comma-separated discrete closed values. If omitted, dataset "
+            "action stats min values are used for the selected gripper indices."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-open-values",
+        default=gripper_defaults.get("open_values"),
+        help=(
+            "Comma-separated discrete open values. If omitted, dataset "
+            "action stats max values are used for the selected gripper indices."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-close-thresholds",
+        default=gripper_defaults.get("close_thresholds"),
+        help="Comma-separated thresholds for switching from open to closed.",
+    )
+    parser.add_argument(
+        "--gripper-open-thresholds",
+        default=gripper_defaults.get("open_thresholds"),
+        help="Comma-separated thresholds for switching from closed to open.",
+    )
+    parser.add_argument(
+        "--gripper-hysteresis-ratio",
+        type=float,
+        default=gripper_defaults.get("hysteresis_ratio", 0.25),
+        help=(
+            "Fraction of the closed/open span reserved as the keep-state band "
+            "when explicit thresholds are omitted."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-initial-state",
+        choices=["current", "prediction", "closed", "open"],
+        default=str(gripper_defaults.get("initial_state", "current")).lower(),
+        help=(
+            "How to initialize each gripper latch at the start of an episode. "
+            "`current` uses observation.state when available."
+        ),
     )
 
     parser.add_argument(
@@ -1267,6 +1376,51 @@ def resolve_action_key(cfg) -> str:
         if len(output_features) == 1:
             return str(next(iter(output_features)))
     return "action"
+
+
+def resolve_action_dim(cfg, action_key: str) -> int | None:
+    output_features = getattr(cfg, "output_features", None)
+    if not isinstance(output_features, dict):
+        return None
+    feature = output_features.get(action_key)
+    shape = getattr(feature, "shape", None)
+    if shape is None and isinstance(feature, dict):
+        shape = feature.get("shape")
+    if not shape:
+        return None
+    return int(tuple(shape)[0])
+
+
+def build_eval_gripper_hysteresis(
+    *,
+    args,
+    cfg,
+    dataset_root: Path,
+    action_key: str,
+) -> GripperHysteresis | None:
+    if not bool(getattr(args, "gripper_hysteresis_enabled", False)):
+        return None
+
+    raw_config = {
+        "enabled": True,
+        "action_indices": getattr(args, "gripper_action_indices", ()),
+        "closed_values": getattr(args, "gripper_closed_values", ()),
+        "open_values": getattr(args, "gripper_open_values", ()),
+        "close_thresholds": getattr(args, "gripper_close_thresholds", ()),
+        "open_thresholds": getattr(args, "gripper_open_thresholds", ()),
+        "hysteresis_ratio": getattr(args, "gripper_hysteresis_ratio", 0.25),
+        "initial_state": getattr(args, "gripper_initial_state", "current"),
+    }
+    gripper_config = parse_gripper_hysteresis_config(
+        raw_config,
+        action_dim=resolve_action_dim(cfg, action_key),
+    )
+    gripper_config = complete_gripper_hysteresis_config_from_dataset_stats(
+        gripper_config,
+        dataset_root=dataset_root,
+        action_key=action_key,
+    )
+    return GripperHysteresis(gripper_config)
 
 
 def as_tensor_copy(value):
@@ -1575,6 +1729,23 @@ def run_dataset_evaluation(
     state_key = resolve_state_key(cfg)
     env_state_key = resolve_env_state_key(cfg)
     action_key = resolve_action_key(cfg)
+    gripper_hysteresis = build_eval_gripper_hysteresis(
+        args=args,
+        cfg=cfg,
+        dataset_root=dataset_root,
+        action_key=action_key,
+    )
+    if gripper_hysteresis is not None:
+        gripper_info = gripper_hysteresis.describe()
+        print(
+            "[info] gripper hysteresis enabled: "
+            f"indices={gripper_info['action_indices']}, "
+            f"closed={gripper_info['closed_values']}, "
+            f"open={gripper_info['open_values']}, "
+            f"close_thresholds={gripper_info['close_thresholds']}, "
+            f"open_thresholds={gripper_info['open_thresholds']}, "
+            f"initial_state={gripper_info['initial_state']}"
+        )
 
     capability_flags = resolve_policy_capability_flags(cfg)
     use_path_signature = capability_flags.use_path_signature
@@ -1692,6 +1863,8 @@ def run_dataset_evaluation(
     ):
         if hasattr(policy, "reset"):
             policy.reset()
+        if gripper_hysteresis is not None:
+            gripper_hysteresis.reset()
 
         state_history = deque() if use_path_signature else None
         prefix_state_history = [] if build_explicit_prefix_eval_inputs else None
@@ -1886,6 +2059,11 @@ def run_dataset_evaluation(
             predicted_action = postprocessor(predicted_action)
             predicted_np = tensor_to_numpy_vector(predicted_action.squeeze(0))
             ground_truth_np = tensor_to_numpy_vector(item[action_key])
+            if gripper_hysteresis is not None:
+                predicted_np = gripper_hysteresis.apply(
+                    predicted_np,
+                    current_state=tensor_to_numpy_vector(item[state_key]),
+                )
 
             if save_episode_debug:
                 slot_memory_history.append(make_slot_memory_history_sample(deploy_debug))
@@ -1914,6 +2092,9 @@ def run_dataset_evaluation(
                     ),
                     "slot_memory": render_slot_memory_panel(
                         debug=deploy_debug,
+                        images=debug_images,
+                        color_order="rgb",
+                        camera_labels=camera_labels,
                         history=slot_memory_history,
                         current_step=len(slot_memory_history) - 1,
                         total_steps=evaluated_steps,
@@ -2128,6 +2309,8 @@ def run_dataset_evaluation(
             ),
         },
     }
+    if gripper_hysteresis is not None:
+        summary["gripper_hysteresis"] = gripper_hysteresis.describe()
     if use_visual_prefix_memory:
         memory_debug_stats = get_visual_memory_debug_stats(policy)
         if memory_debug_stats is not None:

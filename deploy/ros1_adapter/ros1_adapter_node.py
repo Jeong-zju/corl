@@ -361,6 +361,9 @@ class DeployRosNode:
             )
             slot_panel = render_slot_memory_panel(
                 debug=debug if isinstance(debug, dict) else None,
+                images=images,
+                color_order=self.config.image.color_order,
+                camera_labels=self._camera_labels,
             )
             signature_panel = render_signature_panel(
                 signature_debug=self.signature_runtime.debug_snapshot(),

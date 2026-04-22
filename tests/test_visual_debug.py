@@ -103,3 +103,44 @@ def test_slot_memory_panel_history_expands_for_all_slots() -> None:
     assert panel.shape[0] >= 1010
     assert panel.shape[0] % 2 == 0
     assert panel.shape[1] % 2 == 0
+
+
+def test_slot_memory_panel_can_embed_video_stream() -> None:
+    num_slots = 4
+    routing = np.array([[0.05, 0.55, 0.25, 0.15]], dtype=np.float32)
+    baseline = np.ones((1, num_slots), dtype=np.float32) / float(num_slots)
+    debug = {
+        "visual_memory_stats": {
+            "enabled": True,
+            "initialized": True,
+            "num_slots": num_slots,
+            "update_count": 3,
+            "state_norm": 2.0,
+        },
+        "slot_memory": {
+            "routing_weights": routing,
+            "routing_weights_zero_signature": baseline,
+            "routing_delta_from_zero_signature": routing - baseline,
+            "write_strength": routing * 0.25,
+            "readout_weights": routing[:, ::-1],
+            "memory_next_norm": np.array([[1.0, 1.4, 0.9, 1.2]], dtype=np.float32),
+            "memory_delta_norm": routing * 0.1,
+        },
+    }
+    history = [make_slot_memory_history_sample(debug) for _ in range(3)]
+    image = np.zeros((48, 64, 3), dtype=np.uint8)
+    image[:, :] = (10, 120, 240)
+
+    panel = render_slot_memory_panel(
+        debug=debug,
+        images={"observation.images.front": image},
+        color_order="rgb",
+        camera_labels={"observation.images.front": "front"},
+        history=history,
+        current_step=2,
+        total_steps=5,
+    )
+
+    assert panel.shape[1] >= 1280
+    assert panel.shape[0] >= 720
+    assert np.any(panel[250, 280] != 248)

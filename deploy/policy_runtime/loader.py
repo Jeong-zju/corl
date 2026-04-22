@@ -13,6 +13,10 @@ if str(DEPLOY_ROOT) not in sys.path:
 
 from common import ensure_runtime_paths
 from config import DeployConfig
+from gripper_hysteresis import (
+    GripperHysteresis,
+    complete_gripper_hysteresis_config_from_dataset_stats,
+)
 from policy_runtime.preprocess import (
     build_raw_policy_observation,
     finalize_preprocessed_observation,
@@ -28,6 +32,17 @@ from eval_helpers import (  # noqa: E402
     load_streaming_act_config_from_pretrained_dir,
     resolve_policy_dir,
 )
+from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
+
+
+def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
+    split_path = find_dataset_split_file(policy_dir)
+    if split_path is None:
+        return None
+    split_spec = load_dataset_split(split_path)
+    return Path(split_spec.dataset_root).expanduser().resolve()
+
+
 class PolicyRuntime:
     def __init__(self, config: DeployConfig) -> None:
         self.deploy_config = config
@@ -36,6 +51,7 @@ class PolicyRuntime:
         self.cfg = None
         self.preprocessor = None
         self.postprocessor = None
+        self.gripper_hysteresis: GripperHysteresis | None = None
         self.state_key = config.policy.state_key
         self.action_key = config.policy.action_key
         self.visual_keys = list(config.policy.image_keys.values())
@@ -120,9 +136,33 @@ class PolicyRuntime:
         self.action_key = resolve_action_key(cfg)
         self.visual_keys = select_visual_observation_keys(cfg)
 
+        if self.deploy_config.gripper_hysteresis.enabled:
+            gripper_config = self.deploy_config.gripper_hysteresis
+            if (
+                not gripper_config.closed_values
+                or not gripper_config.open_values
+                or not gripper_config.close_thresholds
+                or not gripper_config.open_thresholds
+            ):
+                dataset_root = _resolve_training_dataset_root(self.policy_dir)
+                if dataset_root is None:
+                    raise ValueError(
+                        "`gripper_hysteresis` is enabled, but deploy could not find "
+                        "dataset_split.json near the policy path. Provide explicit "
+                        "closed/open values and thresholds in the deploy YAML."
+                    )
+                gripper_config = complete_gripper_hysteresis_config_from_dataset_stats(
+                    gripper_config,
+                    dataset_root=dataset_root,
+                    action_key=self.action_key,
+                )
+            self.gripper_hysteresis = GripperHysteresis(gripper_config)
+
     def reset(self) -> None:
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
+        if self.gripper_hysteresis is not None:
+            self.gripper_hysteresis.reset()
 
     @staticmethod
     def _debug_to_numpy(value: Any) -> Any:
@@ -161,6 +201,11 @@ class PolicyRuntime:
         runtime_ms = (time.perf_counter() - start_s) * 1000.0
 
         action = predicted_action.detach().cpu().numpy().reshape(-1).astype(np.float32)
+        if self.gripper_hysteresis is not None:
+            action = self.gripper_hysteresis.apply(
+                action,
+                current_state=observation_packet.get("state"),
+            )
         result = {
             "action": action,
             "runtime_ms": float(runtime_ms),

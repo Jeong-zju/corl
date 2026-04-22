@@ -325,6 +325,439 @@ def _draw_multislot_history_plot(
     cv2.putText(canvas, f"{y_max:.3g}", (x + 4, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (95, 95, 95), 1, cv2.LINE_AA)
 
 
+def _slot_vector_or_zeros(
+    value: Any,
+    *,
+    num_slots: int,
+    fallback: np.ndarray | None = None,
+) -> np.ndarray:
+    values = _slot_vector(value, num_slots=num_slots)
+    if values is None or values.size == 0:
+        if fallback is not None:
+            return np.asarray(fallback, dtype=np.float32).reshape(num_slots)
+        return np.zeros((num_slots,), dtype=np.float32)
+    result = np.zeros((num_slots,), dtype=np.float32)
+    count = min(num_slots, int(values.size))
+    result[:count] = values[:count]
+    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _blend_bgr(
+    base: tuple[int, int, int],
+    color: tuple[int, int, int],
+    amount: float,
+) -> tuple[int, int, int]:
+    amount = float(np.clip(amount, 0.0, 1.0))
+    return tuple(
+        int(round(float(base[idx]) * (1.0 - amount) + float(color[idx]) * amount))
+        for idx in range(3)
+    )
+
+
+def _draw_metric_cell(
+    canvas: np.ndarray,
+    *,
+    value: float,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    color: tuple[int, int, int],
+    denom: float,
+    signed: bool = False,
+    text: str | None = None,
+) -> None:
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (226, 226, 226), 1)
+    inner_x = x + 2
+    inner_y = y + 2
+    inner_w = max(1, width - 4)
+    inner_h = max(1, height - 4)
+    if signed:
+        center_x = inner_x + inner_w // 2
+        cv2.line(canvas, (center_x, inner_y), (center_x, inner_y + inner_h), (184, 184, 184), 1)
+        intensity = min(1.0, abs(float(value)) / max(float(denom), 1e-6))
+        bar_w = int(round(intensity * (inner_w // 2)))
+        if value >= 0.0:
+            fill_color = _blend_bgr((242, 242, 242), color, 0.35 + 0.65 * intensity)
+            cv2.rectangle(
+                canvas,
+                (center_x, inner_y),
+                (center_x + bar_w, inner_y + inner_h),
+                fill_color,
+                -1,
+            )
+        else:
+            fill_color = _blend_bgr((242, 242, 242), (95, 80, 205), 0.35 + 0.65 * intensity)
+            cv2.rectangle(
+                canvas,
+                (center_x - bar_w, inner_y),
+                (center_x, inner_y + inner_h),
+                fill_color,
+                -1,
+            )
+    else:
+        intensity = min(1.0, max(0.0, float(value)) / max(float(denom), 1e-6))
+        fill_color = _blend_bgr((242, 242, 242), color, 0.25 + 0.75 * intensity)
+        bar_w = int(round(intensity * inner_w))
+        cv2.rectangle(
+            canvas,
+            (inner_x, inner_y),
+            (inner_x + bar_w, inner_y + inner_h),
+            fill_color,
+            -1,
+        )
+    label = text if text is not None else f"{float(value):.2f}"
+    cv2.putText(
+        canvas,
+        label,
+        (x + 5, y + max(14, height - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.34,
+        (35, 35, 35),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_video_mosaic(
+    canvas: np.ndarray,
+    *,
+    images: dict[str, np.ndarray],
+    color_order: str,
+    camera_labels: dict[str, str],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> None:
+    cv2.putText(canvas, "video stream", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (45, 45, 45), 1, cv2.LINE_AA)
+    keys = list(images.keys())
+    if not keys:
+        cv2.rectangle(canvas, (x, y), (x + width, y + height), (220, 220, 220), 1)
+        cv2.putText(canvas, "no image payload", (x + 18, y + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (110, 110, 110), 1, cv2.LINE_AA)
+        return
+
+    cols = 1 if len(keys) == 1 else 2
+    rows = int(np.ceil(len(keys) / float(cols)))
+    gap = 8
+    tile_w = max(1, (width - gap * (cols - 1)) // cols)
+    tile_h = max(1, (height - gap * (rows - 1)) // rows)
+    for idx, camera_key in enumerate(keys):
+        row = idx // cols
+        col = idx % cols
+        tile_x = x + col * (tile_w + gap)
+        tile_y = y + row * (tile_h + gap)
+        frame, _ = _image_to_bgr(
+            images.get(camera_key),
+            color_order=color_order,
+            width=tile_w,
+            height=tile_h,
+        )
+        label = camera_labels.get(camera_key, camera_key.rsplit(".", 1)[-1])
+        _draw_label(frame, label, 8, 22, scale=0.48)
+        canvas[tile_y : tile_y + tile_h, tile_x : tile_x + tile_w] = frame
+
+
+def _draw_slot_metric_matrix(
+    canvas: np.ndarray,
+    *,
+    slot: dict[str, Any],
+    stats: dict[str, Any],
+    colors: list[tuple[int, int, int]],
+    x: int,
+    y: int,
+    width: int,
+    row_height: int,
+) -> int:
+    num_slots = len(colors)
+    routing = _slot_vector_or_zeros(slot.get("routing_weights"), num_slots=num_slots)
+    zero_routing_values = _slot_vector(slot.get("routing_weights_zero_signature"), num_slots=num_slots)
+    zero_routing = _slot_vector_or_zeros(
+        slot.get("routing_weights_zero_signature"),
+        num_slots=num_slots,
+        fallback=np.zeros((num_slots,), dtype=np.float32),
+    )
+    delta_values = _slot_vector(slot.get("routing_delta_from_zero_signature"), num_slots=num_slots)
+    routing_delta = (
+        routing - zero_routing
+        if delta_values is None and zero_routing_values is not None
+        else _slot_vector_or_zeros(slot.get("routing_delta_from_zero_signature"), num_slots=num_slots)
+    )
+    write_strength = _slot_vector_or_zeros(slot.get("write_strength"), num_slots=num_slots)
+    readout = _slot_vector_or_zeros(slot.get("readout_weights"), num_slots=num_slots)
+    memory_delta = _slot_vector_or_zeros(slot.get("memory_delta_norm"), num_slots=num_slots)
+    memory_next = _slot_vector_or_zeros(slot.get("memory_next_norm"), num_slots=num_slots)
+
+    uniform = 1.0 / float(max(1, num_slots))
+    route_scale = max(float(np.max(routing)), uniform * 2.0, 1e-6)
+    read_scale = max(float(np.max(readout)), uniform * 2.0, 1e-6)
+    write_scale = max(float(np.max(write_strength)), uniform, 1e-6)
+    mem_delta_scale = max(float(np.max(memory_delta)), 1e-6)
+    mem_scale = max(float(np.max(memory_next)), 1e-6)
+    sig_scale = max(float(np.max(np.abs(routing_delta))), uniform * 0.5, 1e-6)
+
+    top_route = int(np.argmax(routing)) if num_slots else -1
+    top_boost = int(np.argmax(routing_delta)) if num_slots else -1
+    top_read = int(np.argmax(readout)) if num_slots else -1
+    top_write = int(np.argmax(write_strength)) if num_slots else -1
+
+    headline = (
+        f"route=s{top_route} {routing[top_route]:.3f}   "
+        f"sig_boost=s{top_boost} {routing_delta[top_boost]:+.3f}   "
+        f"read=s{top_read} {readout[top_read]:.3f}   "
+        f"write=s{top_write} {write_strength[top_write]:.3f}"
+        if num_slots
+        else "slot metrics unavailable"
+    )
+    cv2.putText(canvas, "slot difference dashboard", (x, y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (35, 35, 35), 1, cv2.LINE_AA)
+    cv2.putText(canvas, headline, (x, y + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (70, 70, 70), 1, cv2.LINE_AA)
+
+    header_y = y + 30
+    col_gap = 7
+    slot_w = 52
+    badge_w = 76
+    usable_w = max(1, width - slot_w - badge_w - col_gap * 6)
+    metric_w = max(52, usable_w // 6)
+    columns = [
+        ("route", metric_w),
+        ("sig +/-", metric_w),
+        ("write", metric_w),
+        ("read", metric_w),
+        ("dmem", metric_w),
+        ("mem", metric_w),
+    ]
+    x_positions = []
+    cursor = x + slot_w
+    for _, col_w in columns:
+        x_positions.append(cursor)
+        cursor += col_w + col_gap
+    badge_x = min(x + width - badge_w, cursor)
+
+    cv2.putText(canvas, "slot", (x + 4, header_y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (85, 85, 85), 1, cv2.LINE_AA)
+    for (label, _), col_x in zip(columns, x_positions, strict=False):
+        cv2.putText(canvas, label, (col_x + 4, header_y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (85, 85, 85), 1, cv2.LINE_AA)
+
+    first_row_y = header_y + 10
+    for slot_idx in range(num_slots):
+        row_y = first_row_y + slot_idx * row_height
+        if slot_idx == top_route:
+            cv2.rectangle(canvas, (x, row_y - 3), (x + width, row_y + row_height - 2), (238, 246, 252), -1)
+        cv2.rectangle(canvas, (x, row_y - 3), (x + 8, row_y + row_height - 2), colors[slot_idx], -1)
+        cv2.putText(canvas, f"s{slot_idx}", (x + 14, row_y + row_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (40, 40, 40), 1, cv2.LINE_AA)
+
+        cell_h = max(18, row_height - 9)
+        cell_y = row_y
+        _draw_metric_cell(canvas, value=float(routing[slot_idx]), x=x_positions[0], y=cell_y, width=metric_w, height=cell_h, color=(50, 145, 215), denom=route_scale, text=f"{routing[slot_idx]:.2f}")
+        _draw_metric_cell(canvas, value=float(routing_delta[slot_idx]), x=x_positions[1], y=cell_y, width=metric_w, height=cell_h, color=(45, 170, 90), denom=sig_scale, signed=True, text=f"{routing_delta[slot_idx]:+.2f}")
+        _draw_metric_cell(canvas, value=float(write_strength[slot_idx]), x=x_positions[2], y=cell_y, width=metric_w, height=cell_h, color=(70, 170, 150), denom=write_scale, text=f"{write_strength[slot_idx]:.2f}")
+        _draw_metric_cell(canvas, value=float(readout[slot_idx]), x=x_positions[3], y=cell_y, width=metric_w, height=cell_h, color=(215, 130, 55), denom=read_scale, text=f"{readout[slot_idx]:.2f}")
+        _draw_metric_cell(canvas, value=float(memory_delta[slot_idx]), x=x_positions[4], y=cell_y, width=metric_w, height=cell_h, color=(155, 100, 190), denom=mem_delta_scale, text=f"{memory_delta[slot_idx]:.2f}")
+        _draw_metric_cell(canvas, value=float(memory_next[slot_idx]), x=x_positions[5], y=cell_y, width=metric_w, height=cell_h, color=(110, 110, 110), denom=mem_scale, text=f"{memory_next[slot_idx]:.1f}")
+
+        badges = []
+        if slot_idx == top_route:
+            badges.append("R")
+        if slot_idx == top_boost:
+            badges.append("S+")
+        if slot_idx == top_read:
+            badges.append("O")
+        if slot_idx == top_write:
+            badges.append("W")
+        cv2.putText(canvas, " ".join(badges), (badge_x, row_y + row_height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (35, 35, 35), 1, cv2.LINE_AA)
+
+    footer_y = first_row_y + num_slots * row_height + 18
+    summary = (
+        f"updates={stats.get('update_count', 0)} state_norm={float(stats.get('state_norm', 0.0)):.2f} "
+        f"slot_std={float(slot.get('memory_next_slot_std', 0.0)):.3f} "
+        f"path_sig_norm={float(slot.get('signature_embedding_norm', 0.0)):.2f} "
+        f"delta_sig_norm={float(slot.get('delta_signature_embedding_norm', 0.0)):.2f}"
+    )
+    cv2.putText(canvas, summary, (x, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (75, 75, 75), 1, cv2.LINE_AA)
+    return footer_y + 12
+
+
+def _draw_slot_history_heatmap(
+    canvas: np.ndarray,
+    *,
+    title: str,
+    matrix: np.ndarray | None,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    current_step: int | None,
+    total_steps: int | None,
+    colors: list[tuple[int, int, int]],
+    symmetric: bool = False,
+    fixed_min: float | None = None,
+    fixed_max: float | None = None,
+) -> None:
+    cv2.putText(canvas, title, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (35, 35, 35), 1, cv2.LINE_AA)
+    cv2.rectangle(canvas, (x, y), (x + width, y + height), (205, 205, 205), 1)
+    if matrix is None or matrix.size == 0 or np.all(np.isnan(matrix)):
+        cv2.putText(canvas, "n/a", (x + 12, y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 120), 1, cv2.LINE_AA)
+        return
+
+    values = np.nan_to_num(np.asarray(matrix, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    num_steps, num_slots = values.shape
+    label_w = 44
+    heat_x = x + label_w
+    heat_w = max(1, width - label_w - 6)
+    heat_h = max(1, height - 8)
+    heat_y = y + 4
+
+    image = np.full((num_slots, num_steps, 3), 242, dtype=np.uint8)
+    if symmetric:
+        max_abs = float(np.max(np.abs(values))) if values.size else 0.0
+        denom = max(max_abs, abs(float(fixed_min or 0.0)), abs(float(fixed_max or 0.0)), 1e-6)
+        for row in range(num_slots):
+            for col in range(num_steps):
+                value = float(values[col, row])
+                amount = min(1.0, abs(value) / denom)
+                color = (45, 170, 90) if value >= 0.0 else (95, 80, 205)
+                image[row, col] = _blend_bgr((242, 242, 242), color, 0.2 + 0.8 * amount)
+        min_label = f"-{denom:.2g}"
+        max_label = f"+{denom:.2g}"
+    else:
+        finite_values = values[np.isfinite(values)]
+        vmin = float(finite_values.min()) if fixed_min is None and finite_values.size else float(fixed_min or 0.0)
+        vmax = float(finite_values.max()) if fixed_max is None and finite_values.size else float(fixed_max or 1.0)
+        if vmax <= vmin + 1e-9:
+            vmax = vmin + 1.0
+        for row in range(num_slots):
+            row_color = colors[row % len(colors)] if colors else (50, 145, 215)
+            for col in range(num_steps):
+                amount = np.clip((float(values[col, row]) - vmin) / (vmax - vmin), 0.0, 1.0)
+                image[row, col] = _blend_bgr((242, 242, 242), row_color, 0.2 + 0.8 * amount)
+        min_label = f"{vmin:.2g}"
+        max_label = f"{vmax:.2g}"
+
+    heat = cv2.resize(image, (heat_w, heat_h), interpolation=cv2.INTER_NEAREST)
+    canvas[heat_y : heat_y + heat_h, heat_x : heat_x + heat_w] = heat
+    row_h = heat_h / float(max(1, num_slots))
+    for slot_idx in range(num_slots):
+        label_y = int(round(heat_y + (slot_idx + 0.65) * row_h))
+        if row_h >= 8:
+            cv2.putText(canvas, f"s{slot_idx}", (x + 8, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (65, 65, 65), 1, cv2.LINE_AA)
+    if current_step is not None:
+        total = max(int(total_steps or num_steps), num_steps, 1)
+        denom = max(1, total - 1)
+        current_x = heat_x + int(round(max(0, min(int(current_step), total - 1)) / denom * heat_w))
+        cv2.line(canvas, (current_x, heat_y - 2), (current_x, heat_y + heat_h + 2), (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(canvas, min_label, (heat_x + 4, y + height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+    cv2.putText(canvas, max_label, (heat_x + heat_w - 52, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (70, 70, 70), 1, cv2.LINE_AA)
+
+
+def _render_slot_memory_video_panel(
+    *,
+    images: dict[str, np.ndarray],
+    debug: dict[str, Any],
+    history: list[dict[str, Any]],
+    current_step: int | None,
+    total_steps: int | None,
+    color_order: str,
+    camera_labels: dict[str, str],
+    width: int,
+    height: int,
+) -> np.ndarray:
+    slot = dict(debug.get("slot_memory") or {})
+    stats = dict(debug.get("visual_memory_stats") or {})
+    num_slots = _infer_num_slots(slot=slot, stats=stats, history=history)
+    colors = _slot_colors(num_slots)
+
+    row_height = 38 if num_slots <= 8 else 30 if num_slots <= 16 else 22
+    matrix_height = 56 + max(1, num_slots) * row_height + 36
+    history_height = max(78, min(220, max(1, num_slots) * 10))
+    top_height = max(380, matrix_height)
+    width = _even(max(int(width), 1280))
+    height = _even(max(int(height), 94 + top_height + 44 + history_height * 2 + 42 + 20))
+    canvas = np.full((height, width, 3), 248, dtype=np.uint8)
+
+    cv2.putText(canvas, "slot memory + video debug", (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (25, 25, 25), 1, cv2.LINE_AA)
+    cv2.putText(
+        canvas,
+        f"enabled={stats.get('enabled', False)} initialized={stats.get('initialized', False)} "
+        f"slots={num_slots} updates={stats.get('update_count', 0)} state_norm={float(stats.get('state_norm', 0.0)):.3f}",
+        (18, 62),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (65, 65, 65),
+        1,
+        cv2.LINE_AA,
+    )
+
+    left_x = 18
+    top_y = 94
+    gap = 24
+    left_w = min(560, max(420, width // 2 - 80))
+    right_x = left_x + left_w + gap
+    right_w = width - right_x - 18
+    _draw_video_mosaic(
+        canvas,
+        images=images,
+        color_order=color_order,
+        camera_labels=camera_labels,
+        x=left_x,
+        y=top_y,
+        width=left_w,
+        height=top_height,
+    )
+
+    if not slot or num_slots <= 0:
+        cv2.putText(canvas, "No slot-memory debug payload yet.", (right_x, top_y + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (95, 95, 95), 1, cv2.LINE_AA)
+        return canvas
+
+    _draw_slot_metric_matrix(
+        canvas,
+        slot=slot,
+        stats=stats,
+        colors=colors,
+        x=right_x,
+        y=top_y,
+        width=right_w,
+        row_height=row_height,
+    )
+
+    history_y = top_y + top_height + 44
+    routing_history = _history_matrix(history, key="routing_weights", num_slots=num_slots)
+    routing_delta_history = _history_matrix(history, key="routing_delta_from_zero_signature", num_slots=num_slots)
+    routing_vmax = None
+    if routing_history is not None and not np.all(np.isnan(routing_history)):
+        routing_vmax = max(
+            float(np.nanmax(routing_history)),
+            2.0 / float(max(1, num_slots)),
+            1e-6,
+        )
+    _draw_slot_history_heatmap(
+        canvas,
+        title="routing focus over time",
+        matrix=routing_history,
+        x=left_x,
+        y=history_y,
+        width=width - 36,
+        height=history_height,
+        current_step=current_step,
+        total_steps=total_steps,
+        colors=colors,
+        fixed_min=0.0,
+        fixed_max=routing_vmax,
+    )
+    _draw_slot_history_heatmap(
+        canvas,
+        title="signature boost over time  (green=boost, purple=suppressed)",
+        matrix=routing_delta_history,
+        x=left_x,
+        y=history_y + history_height + 42,
+        width=width - 36,
+        height=history_height,
+        current_step=current_step,
+        total_steps=total_steps,
+        colors=colors,
+        symmetric=True,
+    )
+    return canvas
+
+
 def make_slot_memory_history_sample(debug: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(debug, dict):
         return {}
@@ -478,6 +911,9 @@ def render_attention_panel(
 def render_slot_memory_panel(
     *,
     debug: dict[str, Any] | None,
+    images: dict[str, np.ndarray] | None = None,
+    color_order: str = "rgb",
+    camera_labels: dict[str, str] | None = None,
     history: list[dict[str, Any]] | None = None,
     current_step: int | None = None,
     total_steps: int | None = None,
@@ -488,6 +924,18 @@ def render_slot_memory_panel(
     slot = dict(debug.get("slot_memory") or {})
     stats = dict(debug.get("visual_memory_stats") or {})
     history = list(history or [])
+    if images is not None:
+        return _render_slot_memory_video_panel(
+            images=dict(images),
+            debug=debug,
+            history=history,
+            current_step=current_step,
+            total_steps=total_steps,
+            color_order=color_order,
+            camera_labels=dict(camera_labels or {}),
+            width=width,
+            height=height,
+        )
     num_slots = _infer_num_slots(slot=slot, stats=stats, history=history)
     if num_slots > 0:
         width = max(int(width), 260 + num_slots * 28)
