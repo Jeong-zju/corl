@@ -38,7 +38,11 @@ from lerobot_policy_streaming_act.configuration_streaming_act import (
 )
 from lerobot_policy_streaming_act.prefix_image_cache import _resolve_camera_specs
 from lerobot_policy_streaming_act.signature_cache import _manifests_are_compatible
-from lerobot_policy_streaming_act.modeling_streaming_act import StreamingACTPolicy
+from lerobot_policy_streaming_act.modeling_streaming_act import (
+    StreamingACT,
+    StreamingACTPolicy,
+    _stable_vae_log_variance,
+)
 from lerobot_policy_streaming_act.prefix_sequence import (
     PREFIX_DELTA_SIGNATURE_KEY,
     PREFIX_MASK_KEY,
@@ -252,6 +256,167 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
     assert "slot_memory/routing_weight/slot_0" in log_stats
     assert "slot_memory/routing_weight/slot_1" in log_stats
     assert "slot_memory/routing_entropy_normalized" in log_stats
+
+
+def _make_minimal_slot_memory_model(
+    *,
+    slot_memory_entropy_loss_coef: float = 0.0,
+    slot_memory_consistency_loss_coef: float = 0.0,
+    use_memory_conditioned_encoder_film: bool = False,
+) -> StreamingACT:
+    input_features = build_prefix_sequence_input_features(
+        base_input_features={
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+            "observation.environment_state": PolicyFeature(
+                type=FeatureType.ENV,
+                shape=(1,),
+            ),
+            PATH_SIGNATURE_KEY: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+            DELTA_SIGNATURE_KEY: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+        },
+        prefix_train_max_steps=2,
+        use_path_signature=True,
+        use_delta_signature=True,
+    )
+    cfg = StreamingACTConfig(
+        input_features=input_features,
+        output_features={
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(4,)),
+        },
+        use_path_signature=True,
+        use_delta_signature=True,
+        use_prefix_sequence_training=True,
+        prefix_train_max_steps=2,
+        use_visual_prefix_memory=True,
+        use_signature_indexed_slot_memory=True,
+        slot_memory_num_slots=3,
+        slot_memory_use_delta_routing=True,
+        slot_memory_entropy_loss_coef=slot_memory_entropy_loss_coef,
+        slot_memory_consistency_loss_coef=slot_memory_consistency_loss_coef,
+        use_memory_conditioned_encoder_film=use_memory_conditioned_encoder_film,
+        signature_dim=4,
+        signature_hidden_dim=8,
+        signature_dropout=0.0,
+        history_length=1,
+        chunk_size=2,
+        n_action_steps=1,
+        dim_model=8,
+        dim_feedforward=16,
+        n_heads=2,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        latent_dim=4,
+        n_vae_encoder_layers=1,
+        dropout=0.0,
+        use_vae=False,
+        pretrained_backbone_weights=None,
+    )
+    return StreamingACT(cfg)
+
+
+def test_streaming_act_slot_memory_entropy_loss_handles_fp16_zero_routes() -> None:
+    model = _make_minimal_slot_memory_model(slot_memory_entropy_loss_coef=0.1)
+
+    def _sharp_half_route_update(**kwargs):
+        memory_prev = kwargs["memory_prev"]
+        batch_size, num_slots, hidden_dim = memory_prev.shape
+        routing_distribution = torch.zeros(
+            (batch_size, num_slots),
+            device=memory_prev.device,
+            dtype=torch.float16,
+        )
+        routing_distribution[:, 0] = 1.0
+        return memory_prev, {
+            "routing_weights": routing_distribution,
+            "routing_distribution": routing_distribution,
+            "readout_weights": routing_distribution,
+            "write_strength": routing_distribution,
+            "readout_context": torch.zeros(
+                (batch_size, hidden_dim),
+                device=memory_prev.device,
+                dtype=memory_prev.dtype,
+            ),
+            "write_base": torch.zeros(
+                (batch_size, hidden_dim),
+                device=memory_prev.device,
+                dtype=memory_prev.dtype,
+            ),
+        }
+
+    model._update_visual_prefix_memory_step = _sharp_half_route_update
+    _hidden, aux_losses = model._scan_visual_prefix_memory(
+        visual_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
+        state_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
+        signature_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
+        delta_signature_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
+        prefix_mask=torch.ones(2, 2, dtype=torch.bool),
+    )
+
+    entropy_loss = aux_losses["slot_memory_entropy_loss"]
+    assert entropy_loss.dtype == torch.float32
+    assert torch.isfinite(entropy_loss)
+    assert entropy_loss.item() == pytest.approx(0.0)
+
+
+def test_streaming_act_slot_memory_candidate_update_is_bounded() -> None:
+    model = _make_minimal_slot_memory_model()
+    with torch.no_grad():
+        for param in model.slot_memory_candidate_proj.parameters():
+            param.zero_()
+        model.slot_memory_candidate_proj[-1].bias.fill_(1000.0)
+
+    next_state, step_stats = model._update_signature_indexed_slot_memory_step(
+        memory_prev=torch.zeros(2, 3, 8),
+        visual_t=torch.zeros(2, 8),
+        state_t=torch.zeros(2, 8),
+        signature_t=torch.zeros(2, 8),
+        delta_signature_t=torch.zeros(2, 8),
+        valid_t=None,
+    )
+
+    assert step_stats["candidate"].abs().max().item() <= 1.0
+    assert next_state.abs().max().item() <= 1.0
+
+
+def test_streaming_act_slot_memory_consistency_loss_is_scale_bounded() -> None:
+    readout_context = torch.full((2, 8), 1000.0, dtype=torch.float16)
+    write_base = torch.full((2, 8), -1000.0, dtype=torch.float16)
+
+    consistency = StreamingACT._bounded_slot_memory_consistency_loss(
+        readout_context,
+        write_base,
+    )
+
+    assert consistency.dtype == torch.float32
+    assert torch.isfinite(consistency).all()
+    assert consistency.max().item() <= 4.0
+
+
+def test_streaming_act_memory_film_beta_is_bounded() -> None:
+    model = _make_minimal_slot_memory_model(use_memory_conditioned_encoder_film=True)
+    with torch.no_grad():
+        for param in model.visual_prefix_memory_encoder_film.parameters():
+            param.zero_()
+        model.visual_prefix_memory_encoder_film[-1].bias[8:].fill_(1000.0)
+
+    conditioned = model._apply_visual_prefix_memory_encoder_film(
+        torch.zeros(2, 1, 8),
+        memory_context=torch.zeros(1, 8),
+    )
+
+    assert conditioned.abs().max().item() <= 1.0
+
+
+def test_streaming_act_vae_log_variance_is_stable_in_fp16() -> None:
+    log_variance = torch.tensor([-1000.0, 0.0, 1000.0], dtype=torch.float16)
+
+    stable_log_variance = _stable_vae_log_variance(log_variance)
+    latent_std = stable_log_variance.mul(0.5).exp()
+    variance = stable_log_variance.exp()
+
+    assert stable_log_variance.dtype == torch.float32
+    assert torch.isfinite(latent_std).all()
+    assert torch.isfinite(variance).all()
 
 
 def test_prefix_sequence_cache_applies_current_frame_transform() -> None:

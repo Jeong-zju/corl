@@ -65,13 +65,16 @@ train:
   slot_memory_num_slots: 4
   slot_memory_routing_hidden_dim: 512
   slot_memory_identity_scale: 0.5
-  slot_memory_routing_temperature: 0.5
+  slot_memory_routing_temperature: 1.0
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
-  slot_memory_balance_loss_coef: 0.1
-  slot_memory_entropy_loss_coef: 0.02
-  slot_memory_consistency_loss_coef: 0.005
+  # Keep PRISM routing mostly task-loss driven. A small balance term discourages
+  # total slot collapse; entropy/consistency are disabled because hard routing
+  # and per-step write/read reconstruction destabilize delayed-choice training.
+  slot_memory_balance_loss_coef: 0.01
+  slot_memory_entropy_loss_coef: 0.0
+  slot_memory_consistency_loss_coef: 0.0
   history_length: 0
   signature_dim: 0
   signature_depth: 3

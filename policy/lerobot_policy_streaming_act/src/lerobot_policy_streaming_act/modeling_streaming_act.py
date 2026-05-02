@@ -46,6 +46,17 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
+_VAE_LOG_VAR_MIN = -10.0
+_VAE_LOG_VAR_MAX = 10.0
+
+
+def _stable_vae_log_variance(log_sigma_x2: Tensor) -> Tensor:
+    return log_sigma_x2.float().clamp(
+        min=_VAE_LOG_VAR_MIN,
+        max=_VAE_LOG_VAR_MAX,
+    )
+
+
 class StreamingACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -222,8 +233,20 @@ class StreamingACTPolicy(PreTrainedPolicy):
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
+            mu_hat_f32 = mu_hat.float()
+            log_sigma_x2_hat_f32 = _stable_vae_log_variance(log_sigma_x2_hat)
             mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+                (
+                    -0.5
+                    * (
+                        1
+                        + log_sigma_x2_hat_f32
+                        - mu_hat_f32.pow(2)
+                        - log_sigma_x2_hat_f32.exp()
+                    )
+                )
+                .sum(-1)
+                .mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
@@ -637,6 +660,27 @@ class StreamingACT(nn.Module):
             return 0.0
         slot_std = tensor.detach().float().std(dim=1, unbiased=False)
         return float(slot_std.norm(dim=-1).mean().cpu().item())
+
+    @staticmethod
+    def _categorical_entropy_from_probabilities(probabilities: Tensor) -> Tensor:
+        probabilities_f32 = probabilities.float()
+        log_probabilities = probabilities_f32.clamp_min(
+            torch.finfo(torch.float32).tiny
+        ).log()
+        return -(probabilities_f32 * log_probabilities).sum(dim=-1)
+
+    @staticmethod
+    def _bounded_slot_memory_consistency_loss(
+        readout_context: Tensor,
+        write_base: Tensor,
+    ) -> Tensor:
+        readout_bounded = torch.tanh(readout_context.float())
+        write_bounded = torch.tanh(write_base.float())
+        return F.mse_loss(
+            readout_bounded,
+            write_bounded,
+            reduction="none",
+        ).mean(dim=-1)
 
     def _build_slot_memory_identity(
         self,
@@ -1158,15 +1202,17 @@ class StreamingACT(nn.Module):
             getattr(self.config, "slot_memory_routing_temperature", 1.0)
         )
         routing_logits = routing_logits / max(routing_temperature, 1e-6)
+        routing_logits_f32 = routing_logits.float()
         if self.config.slot_memory_use_softmax_routing:
-            routing_weights = torch.softmax(routing_logits, dim=-1)
-            routing_distribution = routing_weights
+            routing_distribution = torch.softmax(routing_logits_f32, dim=-1)
+            routing_weights = routing_distribution.to(dtype=routing_logits.dtype)
         else:
-            routing_weights = torch.sigmoid(routing_logits)
-            routing_distribution = routing_weights / routing_weights.sum(
+            routing_weights_f32 = torch.sigmoid(routing_logits_f32)
+            routing_weights = routing_weights_f32.to(dtype=routing_logits.dtype)
+            routing_distribution = routing_weights_f32 / routing_weights_f32.sum(
                 dim=-1,
                 keepdim=True,
-            ).clamp_min(1e-6)
+            ).clamp_min(torch.finfo(torch.float32).tiny)
         return route_hidden, routing_logits, routing_weights, routing_distribution
 
     def _record_visual_prefix_memory_step_debug(
@@ -1292,7 +1338,7 @@ class StreamingACT(nn.Module):
             ],
             dim=-1,
         )
-        candidate = self.slot_memory_candidate_proj(slot_state_input)
+        candidate = torch.tanh(self.slot_memory_candidate_proj(slot_state_input))
         gate = torch.sigmoid(self.slot_memory_gate_proj(slot_state_input))
         write_strength = routing_weights.unsqueeze(-1) * gate
         updated_hidden = memory_prev + write_strength * (candidate - memory_prev)
@@ -1384,12 +1430,11 @@ class StreamingACT(nn.Module):
         consistency_loss_sum: Tensor | None,
         valid_step_count: Tensor | None,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> dict[str, Tensor]:
         aux_losses: dict[str, Tensor] = {}
         if valid_step_count is None:
             return aux_losses
-        valid_step_count = valid_step_count.clamp_min(1.0)
+        valid_step_count = valid_step_count.float().clamp_min(1.0)
         if (
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_balance_loss_coef > 0.0
@@ -1399,12 +1444,10 @@ class StreamingACT(nn.Module):
                     "Missing routing distribution statistics for slot-memory "
                     "balance loss."
                 )
-            average_routing = routing_distribution_sum / valid_step_count
-            uniform = torch.full(
-                average_routing.shape,
+            average_routing = routing_distribution_sum.float() / valid_step_count
+            uniform = torch.full_like(
+                average_routing,
                 fill_value=1.0 / float(self.active_memory_num_slots),
-                device=device,
-                dtype=dtype,
             )
             aux_losses["slot_memory_balance_loss"] = F.mse_loss(
                 average_routing,
@@ -1418,17 +1461,17 @@ class StreamingACT(nn.Module):
             if routing_entropy_sum is None:
                 raise RuntimeError(
                     "Missing routing entropy statistics for slot-memory entropy loss."
-            )
+                )
             max_entropy = math.log(float(max(1, self.active_memory_num_slots)))
             if max_entropy <= 0.0:
                 aux_losses["slot_memory_entropy_loss"] = torch.zeros(
                     (),
                     device=device,
-                    dtype=dtype,
+                    dtype=torch.float32,
                 )
             else:
                 aux_losses["slot_memory_entropy_loss"] = (
-                    routing_entropy_sum / valid_step_count
+                    routing_entropy_sum.float() / valid_step_count
                 ) / max_entropy
         if (
             self.use_signature_indexed_slot_memory
@@ -1439,7 +1482,7 @@ class StreamingACT(nn.Module):
                     "Missing readout/write statistics for slot-memory consistency loss."
                 )
             aux_losses["slot_memory_consistency_loss"] = (
-                consistency_loss_sum / valid_step_count
+                consistency_loss_sum.float() / valid_step_count
             )
         return aux_losses
 
@@ -1562,7 +1605,7 @@ class StreamingACT(nn.Module):
                 valid_t=prefix_mask[:, step_idx],
             )
             if need_balance_loss:
-                step_distribution = step_stats["routing_distribution"]
+                step_distribution = step_stats["routing_distribution"].float()
                 masked_distribution = (
                     step_distribution
                     * prefix_mask[:, step_idx].to(step_distribution.dtype).unsqueeze(-1)
@@ -1573,10 +1616,9 @@ class StreamingACT(nn.Module):
                 else:
                     routing_distribution_sum = routing_distribution_sum + step_distribution_sum
             if need_entropy_loss:
-                step_distribution = step_stats["routing_distribution"].clamp_min(1e-8)
-                step_entropy = -(
-                    step_distribution * step_distribution.log()
-                ).sum(dim=-1)
+                step_entropy = self._categorical_entropy_from_probabilities(
+                    step_stats["routing_distribution"]
+                )
                 masked_step_entropy = (
                     step_entropy * prefix_mask[:, step_idx].to(step_entropy.dtype)
                 ).sum()
@@ -1607,14 +1649,12 @@ class StreamingACT(nn.Module):
                     write_strength * metric_mask_2d
                 ).sum(dim=0)
 
-                routing_distribution_safe = routing_distribution.clamp_min(1e-8)
-                routing_entropy = -(
-                    routing_distribution_safe * routing_distribution_safe.log()
-                ).sum(dim=-1)
-                readout_weights_safe = readout_weights.clamp_min(1e-8)
-                readout_entropy = -(
-                    readout_weights_safe * readout_weights_safe.log()
-                ).sum(dim=-1)
+                routing_entropy = self._categorical_entropy_from_probabilities(
+                    routing_distribution
+                )
+                readout_entropy = self._categorical_entropy_from_probabilities(
+                    readout_weights
+                )
                 metric_routing_entropy_sum = metric_routing_entropy_sum + (
                     routing_entropy * metric_mask
                 ).sum()
@@ -1636,13 +1676,10 @@ class StreamingACT(nn.Module):
                         * metric_mask
                     ).sum()
             if need_consistency_loss:
-                readout_context = step_stats["readout_context"]
-                write_base = step_stats["write_base"]
-                step_consistency = F.mse_loss(
-                    readout_context,
-                    write_base,
-                    reduction="none",
-                ).mean(dim=-1)
+                step_consistency = self._bounded_slot_memory_consistency_loss(
+                    step_stats["readout_context"],
+                    step_stats["write_base"],
+                )
                 masked_step_consistency = (
                     step_consistency * prefix_mask[:, step_idx].to(step_consistency.dtype)
                 ).sum()
@@ -1651,7 +1688,7 @@ class StreamingACT(nn.Module):
                 else:
                     consistency_loss_sum = consistency_loss_sum + masked_step_consistency
             if need_balance_loss or need_entropy_loss or need_consistency_loss:
-                step_valid_count = prefix_mask[:, step_idx].to(hidden.dtype).sum()
+                step_valid_count = prefix_mask[:, step_idx].to(torch.float32).sum()
                 if valid_step_count is None:
                     valid_step_count = step_valid_count
                 else:
@@ -1662,7 +1699,6 @@ class StreamingACT(nn.Module):
             consistency_loss_sum=consistency_loss_sum,
             valid_step_count=valid_step_count,
             device=hidden.device,
-            dtype=hidden.dtype,
         )
         if collect_slot_metrics:
             assert metric_valid_count is not None
@@ -1793,6 +1829,7 @@ class StreamingACT(nn.Module):
         )
         gamma, beta = film_params.chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
         target_tokens = encoder_tokens[exclude_prefix_tokens:]
         conditioned = target_tokens * (1.0 + gamma.unsqueeze(0)) + beta.unsqueeze(0)
         if exclude_prefix_tokens == 0:
@@ -2160,7 +2197,8 @@ class StreamingACT(nn.Module):
             log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
 
             # Sample the latent with the reparameterization trick.
-            latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+            latent_std = _stable_vae_log_variance(log_sigma_x2).mul(0.5).exp()
+            latent_sample = mu + latent_std.to(dtype=mu.dtype) * torch.randn_like(mu)
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
