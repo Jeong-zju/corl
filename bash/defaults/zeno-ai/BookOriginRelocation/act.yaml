@@ -1,0 +1,59 @@
+# Single-task ACT defaults for zeno-ai/BookOriginRelocation.
+train:
+  dataset_root: "data/zeno-ai/BookOriginRelocation"
+  dataset_repo_id: "zeno-ai/BookOriginRelocation"
+  output_root: "outputs/train/zeno-ai/BookOriginRelocation/act"
+  resume: false
+  job_name: "act"
+  wandb_project: "BookOriginRelocation"
+  wandb_mode: "online"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
+  # Dataset summary: 150 episodes, 208,816 frames at 30 FPS
+  # (~1,392 frames / ~46s mean, max 2,556 frames), 3 synchronized
+  # 224px cameras, and 17-dim zeno state/action. Use all episodes for
+  # convergence and a longer-than-short-baseline schedule because the
+  # origin cue must be retained until the final placement phase.
+  steps: 180000
+  batch_size: 32
+  num_workers: 16
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  video_backend: "torchcodec"
+  torch_sharing_strategy: "file_system"
+  torchcodec_decoder_cache_size: 32
+  seed: 42
+  log_freq: 1000
+  save_freq: 30000
+  eval_freq: -1
+  test_ratio: 0
+  split_seed: 42
+  split_shuffle: true
+  chunk_size: 100
+  n_action_steps: 100
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/zeno-ai/BookOriginRelocation/act"
+  output_dir: "outputs/eval/zeno-ai/BookOriginRelocation/act/{run_tag}"
+  eval_split: "test"
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  max_episodes: 20
+  max_steps_per_episode: null
+  seed: 42
+  device: "cuda"
+  n_action_steps: 50

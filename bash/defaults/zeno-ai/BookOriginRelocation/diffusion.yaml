@@ -1,0 +1,60 @@
+# Single-task Diffusion defaults for zeno-ai/BookOriginRelocation.
+train:
+  dataset_root: "data/zeno-ai/BookOriginRelocation"
+  dataset_repo_id: "zeno-ai/BookOriginRelocation"
+  output_root: "outputs/train/zeno-ai/BookOriginRelocation/diffusion"
+  resume: false
+  job_name: "diffusion"
+  wandb_project: "BookOriginRelocation"
+  wandb_mode: "online"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
+  # 150 episodes / 208,816 frames is smaller than CleanTableTop but still a
+  # delayed-decision mobile manipulation task. Train diffusion longer than the
+  # short 50k template so the action denoiser sees several effective passes.
+  steps: 100000
+  batch_size: 8
+  num_workers: 16
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  video_backend: "torchcodec"
+  torch_sharing_strategy: "file_system"
+  torchcodec_decoder_cache_size: 32
+  enable_filtered_hf_cache: true
+  seed: 42
+  log_freq: 500
+  save_freq: 10000
+  eval_freq: -1
+  test_ratio: 0
+  split_seed: 42
+  split_shuffle: true
+  n_obs_steps: 2
+  horizon: 104
+  n_action_steps: 100
+  drop_n_last_frames: 3
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/zeno-ai/BookOriginRelocation/diffusion"
+  output_dir: "outputs/eval/zeno-ai/BookOriginRelocation/diffusion/{run_tag}"
+  eval_split: "test"
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  max_episodes: 20
+  max_steps_per_episode: null
+  seed: 42
+  device: "cuda"
+  n_action_steps: 50
