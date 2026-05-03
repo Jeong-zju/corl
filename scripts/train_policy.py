@@ -4490,10 +4490,12 @@ def main(argv: list[str] | None = None) -> None:
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
+    distributed_training_mode = str(args.distributed_training_mode)
+    local_sgd_requested = distributed_training_mode == "local_sgd"
     ddp_kwargs_options = {
         "find_unused_parameters": bool(args.ddp_find_unused_parameters)
     }
-    if not bool(args.ddp_find_unused_parameters):
+    if not bool(args.ddp_find_unused_parameters) and not local_sgd_requested:
         try:
             ddp_signature = inspect.signature(DistributedDataParallelKwargs)
         except (TypeError, ValueError):
@@ -4512,7 +4514,6 @@ def main(argv: list[str] | None = None) -> None:
         int(getattr(accelerator, "num_processes", distributed_world_size)),
         1,
     )
-    distributed_training_mode = str(args.distributed_training_mode)
     local_sgd_enabled = (
         distributed_training_mode == "local_sgd" and accelerator_world_size > 1
     )
