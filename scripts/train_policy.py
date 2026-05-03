@@ -29,7 +29,10 @@ from dataset_utils import (
     validate_dataset_root,
 )
 from policy_capabilities import policy_supports_signature_features
-from policy_defaults import load_policy_mode_defaults_for_cli
+from policy_defaults import (
+    load_policy_mode_defaults_for_cli,
+    load_policy_mode_defaults_from_path,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -2151,6 +2154,7 @@ def resolve_diffusion_drop_n_last_frames(
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--defaults-path", type=Path, default=None)
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
@@ -2162,7 +2166,12 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults, defaults_path = ({}, None)
-    if known_args.dataset or getattr(known_args, "task", None):
+    if known_args.defaults_path is not None:
+        defaults, defaults_path = load_policy_mode_defaults_from_path(
+            mode="train",
+            path=known_args.defaults_path,
+        )
+    elif known_args.dataset or getattr(known_args, "task", None):
         defaults, defaults_path = load_policy_mode_defaults_for_cli(
             mode="train",
             dataset_selector=known_args.dataset,
@@ -2182,10 +2191,20 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default=known_args.policy,
     )
     parser.add_argument(
+        "--defaults-path",
+        type=Path,
+        default=known_args.defaults_path,
+        help=(
+            "Optional YAML defaults file to load instead of resolving "
+            "bash/defaults/<dataset>/<policy>.yaml automatically."
+        ),
+    )
+    dataset_default = known_args.dataset or defaults.get("dataset_root")
+    parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        default=known_args.dataset,
+        required=dataset_default is None,
+        default=dataset_default,
         help=(
             "Dataset ID or path under data. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
@@ -2395,6 +2414,25 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Preferred AMP dtype when --enable-amp is active. "
             "`auto` selects bf16 on supported CUDA GPUs and otherwise falls back to fp16."
         ),
+    )
+    ddp_find_unused_group = parser.add_mutually_exclusive_group()
+    ddp_find_unused_group.add_argument(
+        "--ddp-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_true",
+        help=(
+            "Ask DistributedDataParallel to search the autograd graph for unused "
+            "parameters. This is safer for experimental models but adds overhead."
+        ),
+    )
+    ddp_find_unused_group.add_argument(
+        "--ddp-no-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_false",
+        help="Disable the DDP unused-parameter graph traversal for faster training.",
+    )
+    parser.set_defaults(
+        ddp_find_unused_parameters=defaults.get("ddp_find_unused_parameters", True)
     )
     parser.add_argument(
         "--n-action-steps",
@@ -4069,7 +4107,9 @@ def main(argv: list[str] | None = None) -> None:
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=bool(args.ddp_find_unused_parameters)
+    )
     force_cpu = str(policy_cfg.device).split(":", 1)[0] == "cpu"
     accelerator = Accelerator(
         step_scheduler_with_optimizer=False,
@@ -4086,7 +4126,9 @@ def main(argv: list[str] | None = None) -> None:
             "- distributed: "
             f"world_size={accelerator_world_size}, "
             f"per_device_batch_size={int(args.batch_size)}, "
-            f"global_batch_size={int(args.batch_size) * accelerator_world_size}"
+            f"global_batch_size={int(args.batch_size) * accelerator_world_size}, "
+            "ddp_find_unused_parameters="
+            f"{bool(args.ddp_find_unused_parameters)}"
         )
 
     fresh_distributed_output_reservation = None
