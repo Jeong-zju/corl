@@ -1,7 +1,9 @@
 # Fast 8 x RTX 4090 Streaming ACT defaults for zeno-ai/BookOriginRelocation.
 # The critical path for PRISM-style Streaming ACT is prefix video decode plus
-# prefix CNN work, so this preset prioritizes low per-device batch, memmapped
-# prefix image cache, and a bounded worker count over maximum global batch.
+# prefix CNN work, so this preset prioritizes low per-device batch, shorter
+# prefix sequences, and a bounded worker count over maximum global batch.
+# Do not enable the raw prefix image cache here; building a full decoded-video
+# cache for this dataset is too large for constrained training machines.
 train:
   dataset_root: "data/zeno-ai/BookOriginRelocation"
   dataset_repo_id: "zeno-ai/BookOriginRelocation"
@@ -71,7 +73,7 @@ train:
   signature_dropout: 0.1
   signature_cache_mode: "ram"
   signature_cache_dtype: "float16"
-  prefix_image_cache_mode: "memmap"
+  prefix_image_cache_mode: "off"
   prefix_image_cache_dtype: "uint8"
 
 eval:
