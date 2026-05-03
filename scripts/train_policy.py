@@ -2431,8 +2431,11 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         action="store_false",
         help="Disable the DDP unused-parameter graph traversal for faster training.",
     )
+    default_ddp_find_unused_parameters = defaults.get("ddp_find_unused_parameters")
+    if default_ddp_find_unused_parameters is None:
+        default_ddp_find_unused_parameters = known_args.policy != "streaming_act"
     parser.set_defaults(
-        ddp_find_unused_parameters=defaults.get("ddp_find_unused_parameters", True)
+        ddp_find_unused_parameters=default_ddp_find_unused_parameters
     )
     parser.add_argument(
         "--n-action-steps",
@@ -4107,9 +4110,17 @@ def main(argv: list[str] | None = None) -> None:
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
-    ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=bool(args.ddp_find_unused_parameters)
-    )
+    ddp_kwargs_options = {
+        "find_unused_parameters": bool(args.ddp_find_unused_parameters)
+    }
+    if not bool(args.ddp_find_unused_parameters):
+        try:
+            ddp_signature = inspect.signature(DistributedDataParallelKwargs)
+        except (TypeError, ValueError):
+            ddp_signature = None
+        if ddp_signature is not None and "static_graph" in ddp_signature.parameters:
+            ddp_kwargs_options["static_graph"] = True
+    ddp_kwargs = DistributedDataParallelKwargs(**ddp_kwargs_options)
     force_cpu = str(policy_cfg.device).split(":", 1)[0] == "cpu"
     accelerator = Accelerator(
         step_scheduler_with_optimizer=False,
@@ -4128,7 +4139,8 @@ def main(argv: list[str] | None = None) -> None:
             f"per_device_batch_size={int(args.batch_size)}, "
             f"global_batch_size={int(args.batch_size) * accelerator_world_size}, "
             "ddp_find_unused_parameters="
-            f"{bool(args.ddp_find_unused_parameters)}"
+            f"{bool(args.ddp_find_unused_parameters)}, "
+            f"ddp_static_graph={bool(ddp_kwargs_options.get('static_graph', False))}"
         )
 
     fresh_distributed_output_reservation = None

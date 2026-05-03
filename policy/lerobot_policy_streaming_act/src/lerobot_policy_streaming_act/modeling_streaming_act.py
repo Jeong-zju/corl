@@ -1021,6 +1021,132 @@ class StreamingACT(nn.Module):
             return pooled[0]
         return pooled.mean(dim=0)
 
+    @staticmethod
+    def _current_camera_suffix(camera_key: str) -> str:
+        if camera_key.startswith("observation.images."):
+            return camera_key.removeprefix("observation.images.")
+        if camera_key == "observation.image":
+            return "main"
+        return camera_key
+
+    @staticmethod
+    def _prefix_camera_suffix(prefix_image_key: str) -> str:
+        return prefix_image_key.removeprefix("observation.prefix_images.")
+
+    def _prefix_images_match_observation_camera_order(self) -> bool:
+        current_suffixes = [
+            self._current_camera_suffix(key)
+            for key in self.config.visual_observation_features
+        ]
+        prefix_suffixes = [
+            self._prefix_camera_suffix(key)
+            for key in self.config.prefix_image_features
+        ]
+        return bool(current_suffixes) and current_suffixes == prefix_suffixes
+
+    def _encode_multi_camera_prefix_images_for_visual_prefix_memory(
+        self,
+        camera_images: list[Tensor],
+        *,
+        prefix_mask: Tensor,
+        reuse_current_observation_tokens: bool,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        flat_images, batch_size, time_steps, num_cameras = self._flatten_camera_image_batch(
+            camera_images,
+            context="Visual prefix memory",
+        )
+        if time_steps is None:
+            raise ValueError(
+                "Prefix visual memory expects camera tensors with shape "
+                "(B, T, C, H, W)."
+            )
+
+        features = self.backbone(flat_images)["feature_map"]
+        current_image_pos_seq = None
+        if reuse_current_observation_tokens:
+            current_image_pos_seq = self.encoder_cam_feat_pos_embed(features).to(
+                dtype=features.dtype
+            )
+        features = self.encoder_img_feat_input_proj(features)
+        pooled = self._pool_visual_features_for_memory(features)
+        visual_embeddings = pooled.reshape(
+            num_cameras,
+            batch_size,
+            time_steps,
+            self.config.dim_model,
+        )
+        if num_cameras == 1:
+            visual_embeddings = visual_embeddings[0]
+        else:
+            visual_embeddings = visual_embeddings.mean(dim=0)
+
+        current_observation_tokens = None
+        if reuse_current_observation_tokens:
+            _, dim_model, feat_h, feat_w = features.shape
+            prefix_mask = prefix_mask.to(device=features.device, dtype=torch.bool)
+            valid_lengths = prefix_mask.sum(dim=1).clamp_min(1)
+            current_positions = valid_lengths - 1
+
+            camera_features = features.reshape(
+                num_cameras,
+                batch_size,
+                time_steps,
+                dim_model,
+                feat_h,
+                feat_w,
+            )
+            current_gather_index = current_positions.view(
+                1, batch_size, 1, 1, 1, 1
+            ).expand(num_cameras, batch_size, 1, dim_model, feat_h, feat_w)
+            current_features = camera_features.gather(
+                dim=2,
+                index=current_gather_index,
+            ).squeeze(2)
+            self._latest_observation_image_token_layout = {
+                "camera_keys": list(self.config.visual_observation_features),
+                "num_cameras": int(num_cameras),
+                "feature_h": int(feat_h),
+                "feature_w": int(feat_w),
+            }
+
+            assert current_image_pos_seq is not None
+            if current_image_pos_seq.shape[0] == 1:
+                current_image_pos_seq = current_image_pos_seq.expand(
+                    num_cameras, -1, -1, -1
+                )
+                current_image_pos_seq = einops.rearrange(
+                    current_image_pos_seq,
+                    "cam c h w -> (cam h w) 1 c",
+                )
+            else:
+                current_image_pos_seq = current_image_pos_seq.reshape(
+                    num_cameras,
+                    batch_size,
+                    time_steps,
+                    dim_model,
+                    feat_h,
+                    feat_w,
+                )
+                current_image_pos_seq = current_image_pos_seq.gather(
+                    dim=2,
+                    index=current_gather_index,
+                ).squeeze(2)
+                current_image_pos_seq = einops.rearrange(
+                    current_image_pos_seq,
+                    "cam b c h w -> (cam h w) b c",
+                )
+
+            current_image_token_seq = einops.rearrange(
+                current_features,
+                "cam b c h w -> (cam h w) b c",
+            )
+            current_observation_tokens = (
+                current_image_token_seq,
+                current_image_pos_seq,
+            )
+
+        return visual_embeddings, current_observation_tokens
+
     def _reduce_camera_embeddings_for_visual_prefix_memory(
         self,
         camera_embeddings: list[Tensor],
@@ -1839,7 +1965,7 @@ class StreamingACT(nn.Module):
     def _compute_visual_prefix_memory_token_from_prefix_sequence(
         self,
         batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, Tensor]]:
+    ) -> tuple[Tensor, dict[str, Tensor], tuple[Tensor, Tensor] | None]:
         assert PREFIX_STATE_KEY in batch, (
             f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
         )
@@ -1849,8 +1975,16 @@ class StreamingACT(nn.Module):
         prefix_camera_images = [
             batch[prefix_image_key] for prefix_image_key in self.config.prefix_image_features
         ]
-        visual_embeddings = self._encode_multi_camera_images_for_visual_prefix_memory(
-            prefix_camera_images
+        (
+            visual_embeddings,
+            current_observation_tokens,
+        ) = self._encode_multi_camera_prefix_images_for_visual_prefix_memory(
+            prefix_camera_images,
+            prefix_mask=batch[PREFIX_MASK_KEY],
+            reuse_current_observation_tokens=(
+                bool(self.config.visual_observation_features)
+                and self._prefix_images_match_observation_camera_order()
+            ),
         )
         state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
         signature_embeddings = None
@@ -1891,7 +2025,7 @@ class StreamingACT(nn.Module):
             delta_signature_embeddings=delta_signature_embeddings,
             prefix_mask=batch[PREFIX_MASK_KEY],
         )
-        return memory_state, aux_losses
+        return memory_state, aux_losses, current_observation_tokens
 
     def compute_online_visual_prefix_memory_token(
         self,
@@ -2124,11 +2258,13 @@ class StreamingACT(nn.Module):
             anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
 
         visual_prefix_memory_embed = None
+        cached_observation_image_tokens = None
         if self.use_visual_prefix_memory:
             if visual_prefix_memory_token is None:
                 (
                     visual_prefix_memory_embed,
                     self._last_visual_prefix_memory_aux_losses,
+                    cached_observation_image_tokens,
                 ) = self._compute_visual_prefix_memory_token_from_prefix_sequence(batch)
             else:
                 if visual_prefix_memory_token.ndim != 3:
@@ -2223,9 +2359,12 @@ class StreamingACT(nn.Module):
         image_token_seq = None
         image_pos_seq = None
         if self.config.visual_observation_features:
-            image_token_seq, image_pos_seq = self._encode_multi_camera_observation_tokens(
-                batch[OBS_IMAGES]
-            )
+            if cached_observation_image_tokens is None:
+                image_token_seq, image_pos_seq = self._encode_multi_camera_observation_tokens(
+                    batch[OBS_IMAGES]
+                )
+            else:
+                image_token_seq, image_pos_seq = cached_observation_image_tokens
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
@@ -2511,14 +2650,17 @@ class StreamingACTDecoderLayer(nn.Module):
         else:
             x = self.norm1(x)
             skip = x
+        need_cross_attn_weights = not self.training
         x, cross_attn_weights = self.multihead_attn(
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
             value=encoder_out,
-            need_weights=True,
+            need_weights=need_cross_attn_weights,
             average_attn_weights=True,
         )
-        self.last_cross_attn_weights = cross_attn_weights.detach()
+        self.last_cross_attn_weights = (
+            None if cross_attn_weights is None else cross_attn_weights.detach()
+        )
         x = skip + self.dropout2(x)
         if self.pre_norm:
             skip = x
