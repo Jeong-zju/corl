@@ -6,7 +6,7 @@ train:
   resume: false
   job_name: "streaming-act-prism"
   wandb_project: "BookOriginRelocation"
-  wandb_mode: "online"
+  wandb_mode: "offline"
   device: "cuda"
   use_amp: true
   amp_dtype: "auto"
@@ -26,17 +26,17 @@ train:
   # The task has three possible book origins whose early cue determines the
   # later placement target, so keep full-data training and enough samples for
   # the memory routing to settle.
-  steps: 200000
-  batch_size: 16
-  num_workers: 8
+  steps: 180000
+  batch_size: 32
+  num_workers: 16
   dataloader_persistent_workers: true
-  dataloader_prefetch_factor: 3
+  dataloader_prefetch_factor: 4
   video_backend: "torchcodec"
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
   seed: 42
   log_freq: 1000
-  save_freq: 25000
+  save_freq: 30000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42

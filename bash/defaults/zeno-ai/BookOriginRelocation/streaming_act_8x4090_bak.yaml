@@ -1,6 +1,8 @@
 # 8 x RTX 4090 derived Streaming ACT defaults for zeno-ai/BookOriginRelocation.
-# Keeps effective training samples equal to single GPU:
-# 50000 steps x 64 global batch = 3,200,000 samples.
+# Time-saving DDP setup aligned with the single-GPU ACT/Streaming ACT training
+# schedule: 8 processes x 4 per-device batch = 32 global batch, matching the
+# single-GPU effective batch while using multi-GPU parallelism to reduce
+# wall-clock time.
 train:
   dataset_root: "data/zeno-ai/BookOriginRelocation"
   dataset_repo_id: "zeno-ai/BookOriginRelocation"
@@ -21,17 +23,17 @@ train:
     machine_rank: 0
     main_process_ip: null
     main_process_port: null
-  steps: 50000
-  batch_size: 8
-  num_workers: 4
+  steps: 180000
+  batch_size: 4
+  num_workers: 16
   dataloader_persistent_workers: true
-  dataloader_prefetch_factor: 3
+  dataloader_prefetch_factor: 4
   video_backend: "torchcodec"
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
   seed: 42
-  log_freq: 250
-  save_freq: 6250
+  log_freq: 1000
+  save_freq: 30000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42
@@ -55,13 +57,13 @@ train:
   slot_memory_num_slots: 4
   slot_memory_routing_hidden_dim: 512
   slot_memory_identity_scale: 0.5
-  slot_memory_routing_temperature: 0.5
+  slot_memory_routing_temperature: 1.0
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
-  slot_memory_balance_loss_coef: 0.1
-  slot_memory_entropy_loss_coef: 0.02
-  slot_memory_consistency_loss_coef: 0.005
+  slot_memory_balance_loss_coef: 0.01
+  slot_memory_entropy_loss_coef: 0.0
+  slot_memory_consistency_loss_coef: 0.0
   history_length: 0
   signature_dim: 0
   signature_depth: 3
