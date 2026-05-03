@@ -24,6 +24,7 @@ DOWNLOAD_DATASETS=1
 PROCESS_DATASETS=1
 RUN_TRAINING=1
 UPLOAD_WATCH=1
+SHOW_TRAIN_LOG=1
 DRY_RUN=0
 UPLOAD_START_TIMEOUT=900
 LOG_ROOT=""
@@ -75,6 +76,8 @@ Options:
   --skip-process                Do not process datasets.
   --skip-train                  Do not launch training.
   --skip-upload-watch           Do not upload checkpoints while training.
+  --show-train-log              Stream the train log to the terminal. Default.
+  --hide-train-log              Keep train output only in the log file.
   --install-only                Only install system/Python dependencies.
   --data-only                   Install, download, and process data; skip train/upload.
   --dry-run                     Print commands without running them.
@@ -292,6 +295,14 @@ parse_args() {
         UPLOAD_WATCH=0
         shift
         ;;
+      --show-train-log)
+        SHOW_TRAIN_LOG=1
+        shift
+        ;;
+      --hide-train-log)
+        SHOW_TRAIN_LOG=0
+        shift
+        ;;
       --install-only)
         DOWNLOAD_DATASETS=0
         PROCESS_DATASETS=0
@@ -488,6 +499,20 @@ start_background() {
   STARTED_BG_PID="${pid}"
 }
 
+start_train_log_tail() {
+  local log_file="$1"
+  STARTED_BG_PID=""
+
+  ((SHOW_TRAIN_LOG)) || return 0
+  ((DRY_RUN)) && return 0
+
+  log "Streaming training log. Disable with --hide-train-log."
+  tail -n +1 -F "${log_file}" &
+  local pid=$!
+  CHILD_PIDS+=("${pid}")
+  STARTED_BG_PID="${pid}"
+}
+
 wait_for_run_dir() {
   local run_dir="$1"
   local train_pid="$2"
@@ -558,18 +583,22 @@ train_dataset() {
   fi
 
   mkdir -p "${LOG_ROOT}"
+  : >"${train_log}"
   (
     export CORL_TRAIN_RUN_STAMP="${run_stamp}"
     export HF_TOKEN
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
     [[ -n "${WANDB_TOKEN}" ]] && export WANDB_API_KEY="${WANDB_TOKEN}"
     bash bash/train_policy.sh --dataset "${dataset}" --policy "${POLICY}" \
-      "${TRAIN_EXTRA_ARGS[@]}" >"${train_log}" 2>&1
+      "${TRAIN_EXTRA_ARGS[@]}" >>"${train_log}" 2>&1
   ) &
   local train_pid=$!
   CHILD_PIDS+=("${train_pid}")
   log "Training PID: ${train_pid}"
   log "Training log: ${train_log}"
+  local train_log_tail_pid=""
+  start_train_log_tail "${train_log}"
+  train_log_tail_pid="${STARTED_BG_PID}"
 
   local upload_pid=""
   if ((UPLOAD_WATCH)); then
@@ -600,6 +629,9 @@ train_dataset() {
   if [[ -n "${upload_pid}" ]]; then
     stop_background_process "${upload_pid}"
   fi
+  if [[ -n "${train_log_tail_pid}" ]]; then
+    stop_background_process "${train_log_tail_pid}"
+  fi
 
   if ((train_status != 0)); then
     warn "Training failed for ${dataset}. See ${train_log}."
@@ -624,6 +656,9 @@ main() {
   log "Project root: ${PROJECT_ROOT}"
   log "Datasets: ${DATASETS[*]}"
   log "Policy: ${POLICY}"
+  if ((RUN_TRAINING)); then
+    log "Show train log: ${SHOW_TRAIN_LOG}"
+  fi
 
   if ((INSTALL_SYSTEM_DEPS)); then
     apt_install_system_deps
