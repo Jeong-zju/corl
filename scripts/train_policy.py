@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +74,17 @@ class FreshDistributedOutputReservation:
     output_dir: Path
     marker_path: Path
     launch_id: str
+
+
+@dataclass(slots=True)
+class LocalSGDRuntime:
+    enabled: bool
+    sync_every: int
+    warmup_steps: int
+    sync_optimizer_state: bool
+    total_steps: int
+    save_freq: int
+    step: int = 0
 
 
 _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS: dict[Path, str] = {}
@@ -895,6 +907,290 @@ def install_episode_aware_sampler_patch() -> None:
     sampler_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
     lerobot_train_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
     sampler_module._corl_relative_index_patch_installed = True
+
+
+def _local_sgd_no_sync_context(accelerator, policy):
+    no_sync = getattr(accelerator, "no_sync", None)
+    if callable(no_sync):
+        return no_sync(policy)
+
+    no_sync = getattr(policy, "no_sync", None)
+    if callable(no_sync):
+        return no_sync()
+
+    return nullcontext()
+
+
+def _local_sgd_average_dense_tensors(
+    tensors: list,
+    *,
+    world_size: int,
+    bucket_bytes: int = 64 * 1024 * 1024,
+) -> int:
+    import torch
+    import torch.distributed as dist
+
+    averaged_count = 0
+    bucket: list = []
+    bucket_size = 0
+
+    def flush() -> None:
+        nonlocal averaged_count, bucket, bucket_size
+        if not bucket:
+            return
+
+        flat = torch.cat([tensor.detach().reshape(-1) for tensor in bucket])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+
+        offset = 0
+        for tensor in bucket:
+            numel = tensor.numel()
+            tensor.copy_(flat[offset : offset + numel].view_as(tensor))
+            offset += numel
+            averaged_count += 1
+
+        bucket = []
+        bucket_size = 0
+
+    current_key = None
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.numel() == 0 or not tensor.is_floating_point():
+            continue
+
+        tensor_key = (tensor.device, tensor.dtype)
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        if (
+            bucket
+            and (
+                tensor_key != current_key
+                or bucket_size + tensor_bytes > int(bucket_bytes)
+            )
+        ):
+            flush()
+
+        current_key = tensor_key
+        bucket.append(tensor)
+        bucket_size += tensor_bytes
+
+    flush()
+    return averaged_count
+
+
+def _local_sgd_average_model_parameters(policy, accelerator) -> int:
+    import torch
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    world_size = int(dist.get_world_size())
+    if world_size <= 1:
+        return 0
+
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    with torch.no_grad():
+        return _local_sgd_average_dense_tensors(
+            [parameter.data for parameter in unwrapped_policy.parameters()],
+            world_size=world_size,
+        )
+
+
+def _local_sgd_average_optimizer_state(optimizer, accelerator) -> int:
+    import torch
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    world_size = int(dist.get_world_size())
+    if world_size <= 1:
+        return 0
+
+    state_tensors: list = []
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                state_tensors.append(value.data)
+
+    with torch.no_grad():
+        return _local_sgd_average_dense_tensors(
+            state_tensors,
+            world_size=world_size,
+        )
+
+
+def _local_sgd_should_sync_after_step(runtime: LocalSGDRuntime) -> bool:
+    local_step = int(runtime.step)
+    warmup_steps = max(0, int(runtime.warmup_steps))
+    if local_step <= warmup_steps:
+        return False
+
+    local_sgd_step = local_step - warmup_steps
+    sync_every = max(1, int(runtime.sync_every))
+    if local_sgd_step % sync_every == 0:
+        return True
+
+    save_freq = int(runtime.save_freq)
+    if save_freq > 0 and local_step % save_freq == 0:
+        return True
+
+    total_steps = int(runtime.total_steps)
+    return total_steps > 0 and local_step >= total_steps
+
+
+def install_lerobot_local_sgd_update_policy_patch(lerobot_train_module) -> None:
+    if getattr(lerobot_train_module, "_corl_local_sgd_patch_installed", False):
+        return
+
+    original_update_policy = lerobot_train_module.update_policy
+
+    def update_policy_with_local_sgd(
+        train_metrics,
+        policy,
+        batch,
+        optimizer,
+        grad_clip_norm,
+        accelerator,
+        lr_scheduler=None,
+        lock=None,
+        rabc_weights_provider=None,
+    ):
+        import torch
+
+        runtime = getattr(accelerator, "_corl_local_sgd_runtime", None)
+        if (
+            runtime is None
+            or not bool(runtime.enabled)
+            or int(getattr(accelerator, "num_processes", 1)) <= 1
+        ):
+            return original_update_policy(
+                train_metrics,
+                policy,
+                batch,
+                optimizer,
+                grad_clip_norm,
+                accelerator,
+                lr_scheduler=lr_scheduler,
+                lock=lock,
+                rabc_weights_provider=rabc_weights_provider,
+            )
+
+        if int(runtime.step) < max(0, int(runtime.warmup_steps)):
+            train_metrics, output_dict = original_update_policy(
+                train_metrics,
+                policy,
+                batch,
+                optimizer,
+                grad_clip_norm,
+                accelerator,
+                lr_scheduler=lr_scheduler,
+                lock=lock,
+                rabc_weights_provider=rabc_weights_provider,
+            )
+            runtime.step += 1
+            if output_dict is None:
+                output_dict = {}
+            output_dict["local_sgd/sync"] = 0.0
+            output_dict["local_sgd/warmup"] = 1.0
+            return train_metrics, output_dict
+
+        start_time = time.perf_counter()
+        policy.train()
+
+        rabc_batch_weights = None
+        rabc_batch_stats = None
+        if rabc_weights_provider is not None:
+            rabc_batch_weights, rabc_batch_stats = (
+                rabc_weights_provider.compute_batch_weights(batch)
+            )
+
+        with _local_sgd_no_sync_context(accelerator, policy):
+            with accelerator.autocast():
+                if rabc_batch_weights is not None:
+                    per_sample_loss, output_dict = policy.forward(
+                        batch,
+                        reduction="none",
+                    )
+                    epsilon = 1e-6
+                    loss = (per_sample_loss * rabc_batch_weights).sum() / (
+                        rabc_batch_weights.sum() + epsilon
+                    )
+                    output_dict["rabc_mean_weight"] = rabc_batch_stats[
+                        "raw_mean_weight"
+                    ]
+                    output_dict["rabc_num_zero_weight"] = rabc_batch_stats[
+                        "num_zero_weight"
+                    ]
+                    output_dict["rabc_num_full_weight"] = rabc_batch_stats[
+                        "num_full_weight"
+                    ]
+                else:
+                    loss, output_dict = policy.forward(batch)
+
+            accelerator.backward(loss)
+
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(),
+                float("inf"),
+                error_if_nonfinite=False,
+            )
+
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
+        optimizer.zero_grad()
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+        if lerobot_train_module.has_method(unwrapped_policy, "update"):
+            unwrapped_policy.update()
+
+        runtime.step += 1
+        did_sync = False
+        averaged_parameters = 0
+        averaged_optimizer_tensors = 0
+        if _local_sgd_should_sync_after_step(runtime):
+            averaged_parameters = _local_sgd_average_model_parameters(
+                policy,
+                accelerator,
+            )
+            did_sync = averaged_parameters > 0
+            if did_sync and bool(runtime.sync_optimizer_state):
+                averaged_optimizer_tensors = _local_sgd_average_optimizer_state(
+                    optimizer,
+                    accelerator,
+                )
+
+        train_metrics.loss = loss.item()
+        train_metrics.grad_norm = (
+            grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+        )
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.update_s = time.perf_counter() - start_time
+
+        if output_dict is None:
+            output_dict = {}
+        output_dict["local_sgd/sync"] = 1.0 if did_sync else 0.0
+        output_dict["local_sgd/sync_every"] = float(runtime.sync_every)
+        output_dict["local_sgd/averaged_parameters"] = float(averaged_parameters)
+        if bool(runtime.sync_optimizer_state):
+            output_dict["local_sgd/averaged_optimizer_tensors"] = float(
+                averaged_optimizer_tensors
+            )
+        return train_metrics, output_dict
+
+    lerobot_train_module.update_policy = update_policy_with_local_sgd
+    lerobot_train_module._corl_original_update_policy = original_update_policy
+    lerobot_train_module._corl_local_sgd_patch_installed = True
 
 
 def install_lerobot_dataset_load_patch() -> None:
@@ -2036,6 +2332,28 @@ def is_resumable_checkpoint_dir(checkpoint_dir: Path) -> bool:
     )
 
 
+def read_checkpoint_training_step(checkpoint_dir: Path) -> int:
+    step_path = checkpoint_dir / TRAINING_STATE_DIRNAME / TRAINING_STEP_FILENAME
+    try:
+        with step_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return 0
+
+    if isinstance(payload, int):
+        return max(0, payload)
+    if isinstance(payload, dict):
+        for key in ("step", "training_step", "global_step"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
 def resolve_resume_run_state(train_output_root: Path) -> ResumeRunState:
     run_dirs = iter_training_run_dirs(train_output_root)
     if not run_dirs:
@@ -2436,6 +2754,63 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         default_ddp_find_unused_parameters = known_args.policy != "streaming_act"
     parser.set_defaults(
         ddp_find_unused_parameters=default_ddp_find_unused_parameters
+    )
+    default_distributed_training_mode = defaults.get("distributed_training_mode")
+    if default_distributed_training_mode is None:
+        default_distributed_training_mode = (
+            "local_sgd" if known_args.policy == "streaming_act" else "ddp"
+        )
+    parser.add_argument(
+        "--distributed-training-mode",
+        "--distributed-mode",
+        choices=["ddp", "local_sgd"],
+        default=default_distributed_training_mode,
+        help=(
+            "Distributed optimizer mode. `ddp` synchronizes gradients every step; "
+            "`local_sgd` lets each rank take local optimizer steps and periodically "
+            "averages model parameters."
+        ),
+    )
+    parser.add_argument(
+        "--local-sgd-sync-every",
+        type=int,
+        default=defaults.get("local_sgd_sync_every", 4),
+        help=(
+            "When using --distributed-training-mode=local_sgd, average model "
+            "parameters across ranks every N local optimizer steps."
+        ),
+    )
+    parser.add_argument(
+        "--local-sgd-warmup-steps",
+        type=int,
+        default=defaults.get("local_sgd_warmup_steps", 0),
+        help=(
+            "Run standard synchronized DDP for this many initial steps before "
+            "switching to Local SGD."
+        ),
+    )
+    local_sgd_sync_optimizer_state_group = parser.add_mutually_exclusive_group()
+    local_sgd_sync_optimizer_state_group.add_argument(
+        "--local-sgd-sync-optimizer-state",
+        dest="local_sgd_sync_optimizer_state",
+        action="store_true",
+        help=(
+            "Also average floating optimizer-state tensors at Local SGD sync "
+            "points. This is more stable for Adam-like optimizers but costs extra "
+            "communication."
+        ),
+    )
+    local_sgd_sync_optimizer_state_group.add_argument(
+        "--local-sgd-no-sync-optimizer-state",
+        dest="local_sgd_sync_optimizer_state",
+        action="store_false",
+        help="Only average model parameters at Local SGD sync points.",
+    )
+    parser.set_defaults(
+        local_sgd_sync_optimizer_state=defaults.get(
+            "local_sgd_sync_optimizer_state",
+            False,
+        )
     )
     parser.add_argument(
         "--n-action-steps",
@@ -3243,6 +3618,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.prefix_image_cache_root, Path
     ):
         args.prefix_image_cache_root = Path(args.prefix_image_cache_root)
+    if int(args.local_sgd_sync_every) < 1:
+        parser.error("--local-sgd-sync-every must be >= 1")
+    if int(args.local_sgd_warmup_steps) < 0:
+        parser.error("--local-sgd-warmup-steps must be >= 0")
     return args
 
 
@@ -3262,13 +3641,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from lerobot.configs.default import DatasetConfig, WandBConfig
         from lerobot.configs.train import TrainPipelineConfig
-        from lerobot.scripts.lerobot_train import train
+        from lerobot.scripts import lerobot_train as lerobot_train_module
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Missing LeRobot training dependencies. Install the pip package first, "
             "for example `pip install lerobot`, and ensure torch is installed for "
             "your platform."
         ) from exc
+    train = lerobot_train_module.train
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
     source_dataset_root = resolve_training_dataset_root(
@@ -4132,16 +4512,62 @@ def main(argv: list[str] | None = None) -> None:
         int(getattr(accelerator, "num_processes", distributed_world_size)),
         1,
     )
+    distributed_training_mode = str(args.distributed_training_mode)
+    local_sgd_enabled = (
+        distributed_training_mode == "local_sgd" and accelerator_world_size > 1
+    )
+    local_sgd_initial_step = (
+        read_checkpoint_training_step(resume_run_state.checkpoint_dir)
+        if resume_run_state is not None
+        else 0
+    )
+    setattr(
+        accelerator,
+        "_corl_local_sgd_runtime",
+        LocalSGDRuntime(
+            enabled=local_sgd_enabled,
+            sync_every=max(1, int(args.local_sgd_sync_every)),
+            warmup_steps=max(0, int(args.local_sgd_warmup_steps)),
+            sync_optimizer_state=bool(args.local_sgd_sync_optimizer_state),
+            total_steps=max(0, int(args.steps)),
+            save_freq=int(args.save_freq),
+            step=local_sgd_initial_step,
+        ),
+    )
+    if local_sgd_enabled:
+        install_lerobot_local_sgd_update_policy_patch(lerobot_train_module)
     if accelerator.is_main_process:
+        if local_sgd_enabled:
+            distributed_batch_summary = (
+                f"local_update_batch_size={int(args.batch_size)}, "
+                "parallel_samples_per_local_step="
+                f"{int(args.batch_size) * accelerator_world_size}"
+            )
+        else:
+            distributed_batch_summary = (
+                f"per_device_batch_size={int(args.batch_size)}, "
+                "global_batch_size="
+                f"{int(args.batch_size) * accelerator_world_size}"
+            )
         print(
             "- distributed: "
             f"world_size={accelerator_world_size}, "
-            f"per_device_batch_size={int(args.batch_size)}, "
-            f"global_batch_size={int(args.batch_size) * accelerator_world_size}, "
+            f"mode={distributed_training_mode}, "
+            f"{distributed_batch_summary}, "
             "ddp_find_unused_parameters="
             f"{bool(args.ddp_find_unused_parameters)}, "
             f"ddp_static_graph={bool(ddp_kwargs_options.get('static_graph', False))}"
         )
+        if distributed_training_mode == "local_sgd":
+            print(
+                "- local_sgd: "
+                f"enabled={local_sgd_enabled}, "
+                f"sync_every={max(1, int(args.local_sgd_sync_every))}, "
+                f"warmup_steps={max(0, int(args.local_sgd_warmup_steps))}, "
+                "sync_optimizer_state="
+                f"{bool(args.local_sgd_sync_optimizer_state)}, "
+                f"initial_step={local_sgd_initial_step}"
+            )
 
     fresh_distributed_output_reservation = None
     if resume_run_state is None and accelerator_world_size > 1:
