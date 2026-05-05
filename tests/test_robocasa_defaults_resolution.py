@@ -68,6 +68,11 @@ def test_resolve_dataset_defaults_path_prefers_exact_robocasa_task_defaults() ->
             "main/bash/defaults/robocasa/atomic/CloseFridge/prism_diffusion.yaml",
             "robocasa/atomic/CloseFridge/prism-diffusion",
         ),
+        (
+            "smolvla",
+            "main/bash/defaults/robocasa/atomic/CloseFridge/smolvla.yaml",
+            "robocasa/atomic/CloseFridge/smolvla",
+        ),
     ),
 )
 def test_resolve_dataset_defaults_path_supports_close_fridge_diffusion_variants(
@@ -86,6 +91,28 @@ def test_resolve_dataset_defaults_path_supports_close_fridge_diffusion_variants(
     assert defaults["dataset_root"] == "data/robocasa/atomic/CloseFridge"
     assert defaults["dataset_repo_id"] == "robocasa/atomic/CloseFridge"
     assert defaults["output_root"].endswith(expected_output_suffix)
+
+
+def test_train_parse_args_uses_smolvla_defaults() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "robocasa/atomic/CloseFridge",
+            "--policy",
+            "smolvla",
+        ]
+    )
+
+    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
+    assert args._policy_defaults_dataset_repo_id == "robocasa/atomic/CloseFridge"
+    assert args.output_root.as_posix() == (
+        "outputs/train/robocasa/atomic/CloseFridge/smolvla"
+    )
+    assert args.policy_path == "lerobot/smolvla_base"
+    assert args.n_obs_steps == 1
+    assert args.chunk_size == 50
+    assert args.n_action_steps == 50
+    assert args.smolvla_freeze_vision_encoder is True
 
 
 def test_close_fridge_diffusion_eval_defaults_enable_robocasa_horizon_inference() -> None:
@@ -190,6 +217,7 @@ def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_r
         ("act", "robocasa/composite/OrganizeVegetables/act"),
         ("diffusion", "robocasa/composite/OrganizeVegetables/diffusion"),
         ("streaming_act", "robocasa/composite/OrganizeVegetables/streaming-act-prism"),
+        ("smolvla", "robocasa/composite/OrganizeVegetables/smolvla"),
     ),
 )
 def test_resolve_dataset_defaults_path_supports_organize_vegetables_policy_defaults(

@@ -58,6 +58,8 @@ FRESH_DISTRIBUTED_RUN_MARKER_FILENAME = ".corl_fresh_distributed_run.json"
 FRESH_DISTRIBUTED_RUN_MARKER_VERSION = 1
 FRESH_DISTRIBUTED_RUN_MARKER_WAIT_SECONDS = 120.0
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POLICY_CHOICES = ("act", "diffusion", "prism_diffusion", "streaming_act", "smolvla")
+SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2470,13 +2472,68 @@ def resolve_diffusion_drop_n_last_frames(
     return resolved_drop_n_last_frames
 
 
+def _parse_numeric_pair(value: str, *, option_name: str, item_type: type) -> tuple:
+    parts = [part.strip() for part in str(value).replace("x", ",").split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"{option_name} expects two comma-separated values, got {value!r}."
+        )
+    try:
+        return (item_type(parts[0]), item_type(parts[1]))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"{option_name} contains invalid values: {value!r}."
+        ) from exc
+
+
+def parse_int_pair(value: str) -> tuple[int, int]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--smolvla-resize-imgs-with-padding",
+        item_type=int,
+    )
+
+
+def parse_float_pair(value: str) -> tuple[float, float]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--smolvla-optimizer-betas",
+        item_type=float,
+    )
+
+
+def coerce_numeric_pair(value, *, option_name: str, item_type: type) -> tuple:
+    if isinstance(value, str):
+        return _parse_numeric_pair(
+            value,
+            option_name=option_name,
+            item_type=item_type,
+        )
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{option_name} expects exactly two values. Got {value!r}.")
+    try:
+        return (item_type(value[0]), item_type(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{option_name} contains invalid values: {value!r}.") from exc
+
+
+def optional_pretrained_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--defaults-path", type=Path, default=None)
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default="act",
     )
     bootstrap.add_argument("--task", type=str, default=None)
@@ -2499,13 +2556,13 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "Train LeRobot ACT, Diffusion, PRISM Diffusion, Streaming ACT, or SmolVLA "
             "on a local LeRobot dataset."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default=known_args.policy,
     )
     parser.add_argument(
@@ -2821,16 +2878,20 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning."
         ),
     )
-    if known_args.policy in {"diffusion", "prism_diffusion"}:
+    if known_args.policy in {"diffusion", "prism_diffusion", "smolvla"}:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
-            default=defaults.get("n_obs_steps", 2),
+            default=defaults.get(
+                "n_obs_steps",
+                1 if known_args.policy == "smolvla" else 2,
+            ),
             help=(
-                "Number of observation steps passed to the diffusion policy "
+                "Number of observation steps passed to the policy "
                 "at each decision."
             ),
         )
+    if known_args.policy in {"diffusion", "prism_diffusion"}:
         parser.add_argument(
             "--horizon",
             type=int,
@@ -3283,6 +3344,269 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "hidden cache folder under the dataset root."
             ),
         )
+    elif known_args.policy == "smolvla":
+        parser.add_argument(
+            "--policy-path",
+            type=str,
+            default=defaults.get(
+                "policy_path",
+                defaults.get("pretrained_path", SMOLVLA_DEFAULT_POLICY_PATH),
+            ),
+            help=(
+                "SmolVLA checkpoint to fine-tune. Defaults to the official "
+                "`lerobot/smolvla_base` checkpoint. Pass an empty string to train "
+                "SmolVLA from scratch."
+            ),
+        )
+        parser.add_argument(
+            "--smolvla-max-state-dim",
+            type=int,
+            default=defaults.get("max_state_dim", 32),
+            help="State vectors shorter than this are padded before SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-max-action-dim",
+            type=int,
+            default=defaults.get("max_action_dim", 32),
+            help="Action vectors shorter than this are padded before SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-resize-imgs-with-padding",
+            type=parse_int_pair,
+            default=defaults.get("resize_imgs_with_padding", (512, 512)),
+            help="SmolVLA image resize target as WIDTH,HEIGHT, e.g. 512,512.",
+        )
+        parser.add_argument(
+            "--smolvla-empty-cameras",
+            type=int,
+            default=defaults.get("empty_cameras", 0),
+            help="Number of zero-filled placeholder cameras appended by SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-tokenizer-max-length",
+            type=int,
+            default=defaults.get("tokenizer_max_length", 48),
+            help="Maximum language-token length for SmolVLA instructions.",
+        )
+        parser.add_argument(
+            "--smolvla-num-steps",
+            type=int,
+            default=defaults.get("num_steps", 10),
+            help="Flow-matching denoising steps used by SmolVLA.",
+        )
+        smolvla_cache_group = parser.add_mutually_exclusive_group()
+        smolvla_cache_group.add_argument(
+            "--smolvla-enable-cache",
+            dest="smolvla_use_cache",
+            action="store_true",
+            help="Enable SmolVLA key/value cache during action generation.",
+        )
+        smolvla_cache_group.add_argument(
+            "--smolvla-disable-cache",
+            dest="smolvla_use_cache",
+            action="store_false",
+            help="Disable SmolVLA key/value cache during action generation.",
+        )
+        parser.set_defaults(smolvla_use_cache=defaults.get("use_cache", True))
+        smolvla_vision_group = parser.add_mutually_exclusive_group()
+        smolvla_vision_group.add_argument(
+            "--smolvla-freeze-vision-encoder",
+            dest="smolvla_freeze_vision_encoder",
+            action="store_true",
+            help="Freeze the SmolVLA vision encoder while fine-tuning.",
+        )
+        smolvla_vision_group.add_argument(
+            "--smolvla-unfreeze-vision-encoder",
+            dest="smolvla_freeze_vision_encoder",
+            action="store_false",
+            help="Fine-tune the SmolVLA vision encoder.",
+        )
+        parser.set_defaults(
+            smolvla_freeze_vision_encoder=defaults.get("freeze_vision_encoder", True)
+        )
+        smolvla_expert_group = parser.add_mutually_exclusive_group()
+        smolvla_expert_group.add_argument(
+            "--smolvla-train-expert-only",
+            dest="smolvla_train_expert_only",
+            action="store_true",
+            help="Train only the SmolVLA action expert branch.",
+        )
+        smolvla_expert_group.add_argument(
+            "--smolvla-train-all-layers",
+            dest="smolvla_train_expert_only",
+            action="store_false",
+            help="Allow all unfrozen SmolVLA layers to train.",
+        )
+        parser.set_defaults(
+            smolvla_train_expert_only=defaults.get("train_expert_only", True)
+        )
+        smolvla_state_proj_group = parser.add_mutually_exclusive_group()
+        smolvla_state_proj_group.add_argument(
+            "--smolvla-train-state-proj",
+            dest="smolvla_train_state_proj",
+            action="store_true",
+            help="Train SmolVLA's state projection layers.",
+        )
+        smolvla_state_proj_group.add_argument(
+            "--smolvla-freeze-state-proj",
+            dest="smolvla_train_state_proj",
+            action="store_false",
+            help="Freeze SmolVLA's state projection layers.",
+        )
+        parser.set_defaults(
+            smolvla_train_state_proj=defaults.get("train_state_proj", True)
+        )
+        smolvla_vlm_weights_group = parser.add_mutually_exclusive_group()
+        smolvla_vlm_weights_group.add_argument(
+            "--smolvla-load-vlm-weights",
+            dest="smolvla_load_vlm_weights",
+            action="store_true",
+            help=(
+                "Initialize the VLM backbone from its model name when training "
+                "without a full SmolVLA checkpoint."
+            ),
+        )
+        smolvla_vlm_weights_group.add_argument(
+            "--smolvla-skip-vlm-weights",
+            dest="smolvla_load_vlm_weights",
+            action="store_false",
+            help="Skip separate VLM weight initialization.",
+        )
+        parser.set_defaults(
+            smolvla_load_vlm_weights=defaults.get("load_vlm_weights", False)
+        )
+        parser.add_argument(
+            "--smolvla-vlm-model-name",
+            type=str,
+            default=defaults.get(
+                "vlm_model_name",
+                "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+            ),
+            help="VLM backbone name recorded in SmolVLAConfig.",
+        )
+        parser.add_argument(
+            "--smolvla-attention-mode",
+            type=str,
+            default=defaults.get("attention_mode", "cross_attn"),
+            help="SmolVLA attention mode.",
+        )
+        parser.add_argument(
+            "--smolvla-prefix-length",
+            type=int,
+            default=defaults.get("prefix_length", -1),
+            help="SmolVLA prefix length; -1 keeps the upstream default.",
+        )
+        parser.add_argument(
+            "--smolvla-pad-language-to",
+            type=str,
+            choices=["longest", "max_length"],
+            default=defaults.get("pad_language_to", "longest"),
+            help="Language tokenizer padding mode for SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-num-expert-layers",
+            type=int,
+            default=defaults.get("num_expert_layers", -1),
+            help="Number of SmolVLA expert layers; <=0 keeps upstream default.",
+        )
+        parser.add_argument(
+            "--smolvla-num-vlm-layers",
+            type=int,
+            default=defaults.get("num_vlm_layers", 16),
+            help="Number of VLM layers used by SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-self-attn-every-n-layers",
+            type=int,
+            default=defaults.get("self_attn_every_n_layers", 2),
+            help="Frequency of self-attention layers in SmolVLA expert blocks.",
+        )
+        parser.add_argument(
+            "--smolvla-expert-width-multiplier",
+            type=float,
+            default=defaults.get("expert_width_multiplier", 0.75),
+            help="Width multiplier for the SmolVLA action expert.",
+        )
+        parser.add_argument(
+            "--smolvla-min-period",
+            type=float,
+            default=defaults.get("min_period", 0.004),
+            help="Minimum timestep period for SmolVLA positional encoding.",
+        )
+        parser.add_argument(
+            "--smolvla-max-period",
+            type=float,
+            default=defaults.get("max_period", 4.0),
+            help="Maximum timestep period for SmolVLA positional encoding.",
+        )
+        smolvla_compile_group = parser.add_mutually_exclusive_group()
+        smolvla_compile_group.add_argument(
+            "--smolvla-compile-model",
+            dest="smolvla_compile_model",
+            action="store_true",
+            help="Enable torch.compile for SmolVLA.",
+        )
+        smolvla_compile_group.add_argument(
+            "--smolvla-no-compile-model",
+            dest="smolvla_compile_model",
+            action="store_false",
+            help="Disable torch.compile for SmolVLA.",
+        )
+        parser.set_defaults(smolvla_compile_model=defaults.get("compile_model", False))
+        parser.add_argument(
+            "--smolvla-compile-mode",
+            type=str,
+            default=defaults.get("compile_mode", "max-autotune"),
+            help="torch.compile mode used when SmolVLA compilation is enabled.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-lr",
+            type=float,
+            default=defaults.get("optimizer_lr", 1e-4),
+            help="SmolVLA AdamW learning rate.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-betas",
+            type=parse_float_pair,
+            default=defaults.get("optimizer_betas", (0.9, 0.95)),
+            help="SmolVLA AdamW betas as beta1,beta2.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-eps",
+            type=float,
+            default=defaults.get("optimizer_eps", 1e-8),
+            help="SmolVLA AdamW epsilon.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-weight-decay",
+            type=float,
+            default=defaults.get("optimizer_weight_decay", 1e-10),
+            help="SmolVLA AdamW weight decay.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-grad-clip-norm",
+            type=float,
+            default=defaults.get("optimizer_grad_clip_norm", 10),
+            help="SmolVLA optimizer gradient clipping norm.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-warmup-steps",
+            type=int,
+            default=defaults.get("scheduler_warmup_steps", 1000),
+            help="SmolVLA scheduler warmup steps.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-decay-steps",
+            type=int,
+            default=defaults.get("scheduler_decay_steps", 30000),
+            help="SmolVLA scheduler cosine-decay steps.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-decay-lr",
+            type=float,
+            default=defaults.get("scheduler_decay_lr", 2.5e-6),
+            help="SmolVLA scheduler final decay learning rate.",
+        )
     elif known_args.policy == "prism_diffusion":
         path_signature_group = parser.add_mutually_exclusive_group()
         path_signature_group.add_argument(
@@ -3696,6 +4020,18 @@ def main(argv: list[str] | None = None) -> None:
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
     PrismDiffusionConfig = None
+    SmolVLAConfig = None
+    if args.policy == "smolvla":
+        try:
+            from lerobot.policies.smolvla.configuration_smolvla import (
+                SmolVLAConfig,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "SmolVLA support is missing from this LeRobot installation. "
+                "Install LeRobot with the SmolVLA extras, for example "
+                '`pip install -e ".[smolvla]"` in the LeRobot checkout.'
+            ) from exc
     if policy_supports_signature_features(args.policy):
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
@@ -4025,6 +4361,61 @@ def main(argv: list[str] | None = None) -> None:
                 use_path_signature=bool(use_path_signature),
                 use_delta_signature=bool(use_delta_signature),
             )
+        )
+    elif args.policy == "smolvla":
+        if SmolVLAConfig is None:
+            raise RuntimeError("SmolVLAConfig failed to import.")
+        if configure_signature_cache_runtime is not None:
+            configure_signature_cache_runtime(None)
+        if configure_prefix_image_cache_runtime is not None:
+            configure_prefix_image_cache_runtime(None)
+        policy_cfg = SmolVLAConfig(
+            device=args.device,
+            use_amp=bool(args.use_amp),
+            push_to_hub=False,
+            pretrained_path=optional_pretrained_path(args.policy_path),
+            n_obs_steps=int(args.n_obs_steps),
+            chunk_size=int(args.chunk_size),
+            n_action_steps=int(args.n_action_steps),
+            max_state_dim=int(args.smolvla_max_state_dim),
+            max_action_dim=int(args.smolvla_max_action_dim),
+            resize_imgs_with_padding=coerce_numeric_pair(
+                args.smolvla_resize_imgs_with_padding,
+                option_name="--smolvla-resize-imgs-with-padding",
+                item_type=int,
+            ),
+            empty_cameras=int(args.smolvla_empty_cameras),
+            tokenizer_max_length=int(args.smolvla_tokenizer_max_length),
+            num_steps=int(args.smolvla_num_steps),
+            use_cache=bool(args.smolvla_use_cache),
+            freeze_vision_encoder=bool(args.smolvla_freeze_vision_encoder),
+            train_expert_only=bool(args.smolvla_train_expert_only),
+            train_state_proj=bool(args.smolvla_train_state_proj),
+            optimizer_lr=float(args.smolvla_optimizer_lr),
+            optimizer_betas=coerce_numeric_pair(
+                args.smolvla_optimizer_betas,
+                option_name="--smolvla-optimizer-betas",
+                item_type=float,
+            ),
+            optimizer_eps=float(args.smolvla_optimizer_eps),
+            optimizer_weight_decay=float(args.smolvla_optimizer_weight_decay),
+            optimizer_grad_clip_norm=float(args.smolvla_optimizer_grad_clip_norm),
+            scheduler_warmup_steps=int(args.smolvla_scheduler_warmup_steps),
+            scheduler_decay_steps=int(args.smolvla_scheduler_decay_steps),
+            scheduler_decay_lr=float(args.smolvla_scheduler_decay_lr),
+            vlm_model_name=str(args.smolvla_vlm_model_name),
+            load_vlm_weights=bool(args.smolvla_load_vlm_weights),
+            attention_mode=str(args.smolvla_attention_mode),
+            prefix_length=int(args.smolvla_prefix_length),
+            pad_language_to=str(args.smolvla_pad_language_to),
+            num_expert_layers=int(args.smolvla_num_expert_layers),
+            num_vlm_layers=int(args.smolvla_num_vlm_layers),
+            self_attn_every_n_layers=int(args.smolvla_self_attn_every_n_layers),
+            expert_width_multiplier=float(args.smolvla_expert_width_multiplier),
+            min_period=float(args.smolvla_min_period),
+            max_period=float(args.smolvla_max_period),
+            compile_model=bool(args.smolvla_compile_model),
+            compile_mode=str(args.smolvla_compile_mode),
         )
     elif args.policy in {"diffusion", "prism_diffusion"}:
         diffusion_config_cls = (
@@ -4358,6 +4749,13 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
+    elif args.policy == "smolvla":
+        print(
+            "- action_execution: "
+            f"n_obs_steps={int(args.n_obs_steps)}, "
+            f"chunk_size={int(args.chunk_size)}, "
+            f"n_action_steps={int(args.n_action_steps)}"
+        )
     else:
         print(
             f"- action_execution: chunk_size={args.chunk_size}, "
@@ -4426,6 +4824,32 @@ def main(argv: list[str] | None = None) -> None:
         print(
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
+        )
+    elif args.policy == "smolvla":
+        smolvla_resize = tuple(
+            coerce_numeric_pair(
+                args.smolvla_resize_imgs_with_padding,
+                option_name="--smolvla-resize-imgs-with-padding",
+                item_type=int,
+            )
+        )
+        print(
+            "- smolvla: "
+            f"policy_path={args.policy_path or '<scratch>'}, "
+            f"max_state_dim={int(args.smolvla_max_state_dim)}, "
+            f"max_action_dim={int(args.smolvla_max_action_dim)}, "
+            f"resize_imgs_with_padding={smolvla_resize}, "
+            f"tokenizer_max_length={int(args.smolvla_tokenizer_max_length)}, "
+            f"num_steps={int(args.smolvla_num_steps)}"
+        )
+        print(
+            "- smolvla_finetune: "
+            f"freeze_vision_encoder={bool(args.smolvla_freeze_vision_encoder)}, "
+            f"train_expert_only={bool(args.smolvla_train_expert_only)}, "
+            f"train_state_proj={bool(args.smolvla_train_state_proj)}, "
+            f"optimizer_lr={float(args.smolvla_optimizer_lr)}, "
+            f"scheduler_warmup_steps={int(args.smolvla_scheduler_warmup_steps)}, "
+            f"scheduler_decay_steps={int(args.smolvla_scheduler_decay_steps)}"
         )
     elif args.policy in {"diffusion", "prism_diffusion"}:
         print(

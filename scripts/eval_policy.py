@@ -54,6 +54,7 @@ DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
 DEFAULT_DELTA_SIGNATURE_KEY = "observation.delta_signature"
 ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POLICY_CHOICES = ("act", "diffusion", "prism_diffusion", "streaming_act", "smolvla")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -835,7 +836,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default="act",
     )
     bootstrap.add_argument("--task", type=str, default=None)
@@ -882,14 +883,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
+            "Evaluate a LeRobot ACT, Diffusion, PRISM Diffusion, Streaming ACT, or SmolVLA "
             "checkpoint either with env rollouts (`--env`) or on a held-out "
             "dataset split (`--dataset`)."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default=known_args.policy,
     )
     parser.add_argument(
@@ -2370,6 +2371,10 @@ def main(argv: list[str] | None = None) -> None:
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
         policy_cls = DiffusionPolicy
+    elif args.policy == "smolvla":
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+        policy_cls = SmolVLAPolicy
     else:
         from lerobot.policies.act.configuration_act import ACTConfig
         from lerobot.policies.act.modeling_act import ACTPolicy
