@@ -19,6 +19,7 @@ from train_policy import (
     DELTA_SIGNATURE_FEATURE_KEY,
     GROOT_DEFAULT_ATTN_IMPLEMENTATION,
     PATH_SIGNATURE_FEATURE_KEY,
+    PI05_DEFAULT_POLICY_PATH,
     _ensure_groot_transformers_loading_attrs,
     drop_dataset_features_from_metadata,
     parse_args,
@@ -132,6 +133,11 @@ def test_resolve_dataset_defaults_path_prefers_exact_robocasa_task_defaults() ->
             "robocasa/atomic/CloseFridge/prism-diffusion",
         ),
         (
+            "pi05",
+            "main/bash/defaults/robocasa/atomic/CloseFridge/pi05.yaml",
+            "robocasa/atomic/CloseFridge/pi05",
+        ),
+        (
             "smolvla",
             "main/bash/defaults/robocasa/atomic/CloseFridge/smolvla.yaml",
             "robocasa/atomic/CloseFridge/smolvla",
@@ -181,6 +187,30 @@ def test_train_parse_args_uses_smolvla_defaults() -> None:
     assert args.chunk_size == 50
     assert args.n_action_steps == 50
     assert args.smolvla_freeze_vision_encoder is True
+
+
+def test_train_parse_args_uses_pi05_defaults_and_ignores_signature() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "robocasa/atomic/CloseFridge",
+            "--policy",
+            "pi05",
+        ]
+    )
+
+    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
+    assert args._policy_defaults_dataset_repo_id == "robocasa/atomic/CloseFridge"
+    assert args.output_root.as_posix() == (
+        "outputs/train/robocasa/atomic/CloseFridge/pi05"
+    )
+    assert args.policy_path == PI05_DEFAULT_POLICY_PATH
+    assert args.n_obs_steps == 1
+    assert args.chunk_size == 50
+    assert args.n_action_steps == 50
+    assert args.pi05_ignore_signature_features is True
+    assert args.pi05_freeze_vision_encoder is True
+    assert args.pi05_train_expert_only is True
 
 
 def test_train_parse_args_uses_groot_defaults_and_ignores_signature() -> None:
@@ -310,6 +340,7 @@ def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_r
         ("act", "robocasa/composite/OrganizeVegetables/act"),
         ("diffusion", "robocasa/composite/OrganizeVegetables/diffusion"),
         ("streaming_act", "robocasa/composite/OrganizeVegetables/streaming-act-prism"),
+        ("pi05", "robocasa/composite/OrganizeVegetables/pi05"),
         ("smolvla", "robocasa/composite/OrganizeVegetables/smolvla"),
         ("groot", "robocasa/composite/OrganizeVegetables/groot"),
     ),
