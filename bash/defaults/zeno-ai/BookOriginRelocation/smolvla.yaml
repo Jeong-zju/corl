@@ -19,8 +19,8 @@ train:
     machine_rank: 0
     main_process_ip: null
     main_process_port: null
-  steps: 50000
-  batch_size: 8
+  steps: 180000
+  batch_size: 16
   num_workers: 16
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
@@ -29,7 +29,7 @@ train:
   torchcodec_decoder_cache_size: 32
   seed: 42
   log_freq: 1000
-  save_freq: 10000
+  save_freq: 30000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42
@@ -76,6 +76,7 @@ train:
   max_period: 4.0
   compile_model: false
   compile_mode: max-autotune
+
 eval:
   train_output_root: outputs/train/zeno-ai/BookOriginRelocation/smolvla
   output_dir: outputs/eval/zeno-ai/BookOriginRelocation/smolvla/{run_tag}

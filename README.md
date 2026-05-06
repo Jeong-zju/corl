@@ -113,12 +113,48 @@ hf auth login
 wandb login
 cd data
 ./hfd.sh zeno-ai/CleanTableTopDelayedToolChoice --dataset --local-dir zeno-ai/CleanTableTopDelayedToolChoice --hf_username jeong-zju --hf_token <token>
+./hfd.sh zeno-ai/BookOriginRelocation --dataset --local-dir zeno-ai/BookOriginRelocation --hf_username jeong-zju --hf_token <token>
 cd ..
 python data/process_dataset.py zeno-ai/CleanTableTopDelayedToolChoice
+python data/process_dataset.py zeno-ai/BookOriginRelocation
 bash bash/train_policy.sh --dataset zeno-ai/CleanTableTopDelayedToolChoice --policy streaming_act
+bash bash/train_policy.sh --dataset zeno-ai/BookOriginRelocation --policy streaming_act
 vim bash/defaults/zeno-ai/CleanTableTopDelayedToolChoice/streaming_act.yaml
+vim bash/defaults/zeno-ai/BookOriginRelocation/streaming_act.yaml
 
 (new terminal)
 
-python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism   --repo-id zeno-ai/CleanTableTopDelayedToolChoice-streaming-act --mode full --watch
+python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism --repo-id zeno-ai/CleanTableTopDelayedToolChoice-streaming-act --mode full --watch
+
+python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism --repo-id zeno-ai/BookOriginRelocation-streaming-act --mode full --watch
 ```
+
+# Test
+
+我给你详细描述一下我的最新的任务设置和任务目的，需要你给我这个任务设计一个贴切的名字用于在论文中展示。
+
+
+
+【任务目的】
+
+检验PRISM算法的效果。
+
+【任务描述】
+
+整体环境设置在一个酒店房间中，任务开始阶段，相机看见不同位置的书本然后运动机械臂夹取（三个位置只能同时有一个位置有书本）。根据夹取位置的不同，机器人走过类似的路径分别将书本放在房间中三个不同的位置，目标放置位置由起始夹取位置唯一决定。
+
+【任务难点】
+
+不仅仅是长序列任务，而且需要记忆机制来帮助policy做出后续决定。
+
+【任务数据集路径】
+
+/home/jeong/zeno/corl/main/data/zeno-ai/mem-book
+
+
+
+git clone https://github.com/Jeong-zju/corl.git && cd corl/ && git switch develop/benchmark
+
+vim bash/defaults/zeno-ai/BookOriginRelocation/streaming_act.yaml
+
+bash bash/install_deploy_zeno.sh --dataset zeno-ai/BookOriginRelocation --hf-token <hf-token> --wandb-token <wandb-token>

@@ -429,6 +429,41 @@ def get_signature_cache_only_feature_keys(info: dict | None) -> set[str]:
     return keys
 
 
+def drop_signature_cache_only_features_from_metadata(
+    info: dict,
+    stats: dict,
+    *,
+    keep_keys: tuple[str, ...] = (),
+) -> tuple[dict, dict, tuple[str, ...]]:
+    """Hide cache-only signature features when the active policy does not use them."""
+    cache_only_keys = get_signature_cache_only_feature_keys(info)
+    keep_key_set = set(keep_keys)
+    features = info.get("features", {})
+    if not cache_only_keys or not isinstance(features, dict):
+        return info, stats, ()
+
+    removed_keys = tuple(
+        sorted(
+            key
+            for key in cache_only_keys
+            if key in features and key not in keep_key_set
+        )
+    )
+    if not removed_keys:
+        return info, stats, ()
+
+    for key in removed_keys:
+        features.pop(key, None)
+        stats.pop(key, None)
+
+    for metadata_key in ("path_signature", "delta_signature"):
+        metadata = info.get(metadata_key)
+        if isinstance(metadata, dict) and str(metadata.get("key")) in removed_keys:
+            info.pop(metadata_key, None)
+
+    return info, stats, removed_keys
+
+
 def ensure_streaming_act_importable(project_root: Path) -> None:
     streaming_act_src = (
         project_root / "policy" / "lerobot_policy_streaming_act" / "src"
@@ -1550,11 +1585,15 @@ def install_lerobot_dataset_load_patch() -> None:
         start_s = time.perf_counter()
         original_load_metadata(self)
         runtime = get_signature_cache_runtime()
-        if (
+        runtime_reader = (
+            getattr(runtime, "reader", None) if runtime is not None else None
+        )
+        runtime_enabled_for_dataset = (
             runtime is not None
-            and getattr(runtime, "enabled", False)
+            and runtime_reader is not None
             and Path(self.root).resolve() == Path(runtime.dataset_root).resolve()
-        ):
+        )
+        if runtime_enabled_for_dataset:
             cache_metadata = load_signature_cache_metadata(
                 Path(self.root),
                 dataset_repo_id=str(runtime.dataset_repo_id),
@@ -1564,7 +1603,24 @@ def install_lerobot_dataset_load_patch() -> None:
                 info=self.info,
                 stats=self.stats,
                 cache_metadata=cache_metadata,
-                feature_keys=tuple(str(key) for key in runtime.feature_keys),
+                feature_keys=tuple(str(key) for key in runtime_reader.feature_keys),
+            )
+        self.info, self.stats, removed_signature_keys = (
+            drop_signature_cache_only_features_from_metadata(
+                info=self.info,
+                stats=self.stats,
+                keep_keys=(
+                    tuple(str(key) for key in runtime_reader.feature_keys)
+                    if runtime_enabled_for_dataset
+                    else ()
+                ),
+            )
+        )
+        if removed_signature_keys:
+            print(
+                "[INFO] dataset.load_metadata: ignoring signature-cache-only "
+                "features for this policy: "
+                f"{list(removed_signature_keys)}"
             )
         elapsed_s = time.perf_counter() - start_s
         print(
