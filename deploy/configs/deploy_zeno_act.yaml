@@ -1,10 +1,11 @@
 policy:
   type: act
-  path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/act/20260417_014507/checkpoints/200000
+  # path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/act/20260420_143315/checkpoints/150000
+  path: ../../outputs/train/zeno-ai/BookOriginRelocation/act/20260503_014752/checkpoints/090000
   device: cuda
   load_device: null
   n_action_steps: 50
-  temporal_ensemble_coeff: 0.0
+  temporal_ensemble_coeff: 0.0075
   state_dim: 17
   action_dim: 17
   arm_dof: 7
@@ -59,6 +60,6 @@ ros:
 command:
   publish_base: true
   publish_arms: true
-  max_linear_x: 1.0
-  max_linear_y: 1.0
-  max_angular_z: 3.14
+  max_linear_x: 5.0
+  max_linear_y: 5.0
+  max_angular_z: 6.28
