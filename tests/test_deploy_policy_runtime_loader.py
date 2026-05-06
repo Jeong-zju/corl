@@ -4,12 +4,25 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main"))
 sys.path.insert(0, str(REPO_ROOT / "main" / "deploy"))
 
-from deploy.config import PolicyConfig
-from deploy.policy_runtime.loader import apply_deploy_policy_overrides
+from deploy.config import (
+    CommandConfig,
+    DebugConfig,
+    DeployConfig,
+    ImageConfig,
+    JointNameConfig,
+    PolicyConfig,
+    RosConfig,
+    RuntimeConfig,
+    TopicConfig,
+)
+from deploy.gripper_hysteresis import GripperHysteresisConfig
+from deploy.policy_runtime.loader import PolicyRuntime, apply_deploy_policy_overrides
 
 
 def _make_policy_config(**overrides) -> PolicyConfig:
@@ -18,6 +31,8 @@ def _make_policy_config(**overrides) -> PolicyConfig:
         path=Path("."),
         device="cpu",
         load_device=None,
+        task="",
+        groot_attn_implementation="eager",
         n_action_steps=50,
         temporal_ensemble_coeff=0.0,
         state_dim=17,
@@ -39,6 +54,49 @@ def _make_policy_config(**overrides) -> PolicyConfig:
     )
     base.update(overrides)
     return PolicyConfig(**base)
+
+
+def _make_deploy_config(policy: PolicyConfig) -> DeployConfig:
+    return DeployConfig(
+        path=Path("deploy.yaml"),
+        policy=policy,
+        runtime=RuntimeConfig(control_hz=30.0),
+        gripper_hysteresis=GripperHysteresisConfig(),
+        debug=DebugConfig(
+            enabled=False,
+            publish_hz=0.0,
+            attention_topic="/debug/attention",
+            slot_memory_topic="/debug/slot_memory",
+            signature_topic="/debug/signature",
+            overlay_alpha=0.45,
+            attention_query_step=0,
+        ),
+        image=ImageConfig(width=224, height=224, color_order="rgb"),
+        ros=RosConfig(
+            node_name="deploy_test",
+            queue_size=1,
+            topics=TopicConfig(
+                image_left="/left",
+                image_right="/right",
+                image_top="/top",
+                joint_state_left="/joint_left",
+                joint_state_right="/joint_right",
+                odom="/odom",
+                cmd_vel="/cmd_vel",
+                cmd_joint_left="/cmd_joint_left",
+                cmd_joint_right="/cmd_joint_right",
+            ),
+            joint_names_left=JointNameConfig(name=[]),
+            joint_names_right=JointNameConfig(name=[]),
+        ),
+        command=CommandConfig(
+            publish_base=True,
+            publish_arms=True,
+            max_linear_x=1.0,
+            max_linear_y=1.0,
+            max_angular_z=1.0,
+        ),
+    )
 
 
 def test_apply_deploy_policy_overrides_keeps_open_loop_when_coeff_is_zero() -> None:
@@ -73,3 +131,17 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert enabled is True
     assert cfg.temporal_ensemble_coeff == 0.01
     assert cfg.n_action_steps == 1
+
+
+def test_policy_runtime_requires_vla_task_before_importing_lerobot() -> None:
+    runtime = PolicyRuntime(
+        _make_deploy_config(
+            _make_policy_config(
+                type="smolvla",
+                task="",
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="policy.task"):
+        runtime.load()

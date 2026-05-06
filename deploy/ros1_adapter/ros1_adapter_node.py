@@ -293,6 +293,7 @@ class DeployRosNode:
                 "reset": bool(self.pending_reset),
                 "state": state.astype(np.float32, copy=False),
                 "images": images,
+                "task": self.config.policy.task or None,
                 "path_signature": path_signature,
                 "delta_signature": delta_signature,
             },

@@ -11,6 +11,14 @@ def select_visual_observation_keys(cfg) -> list[str]:
         visual_features = getattr(cfg, "image_features", {})
     keys = list(visual_features)
     if not keys:
+        input_features = getattr(cfg, "input_features", None)
+        if isinstance(input_features, dict):
+            keys = [
+                str(key)
+                for key, feature in input_features.items()
+                if _is_visual_feature(feature)
+            ]
+    if not keys:
         raise RuntimeError("Policy has no visual observation input features.")
     return keys
 
@@ -57,6 +65,16 @@ def _feature_shape(feature: Any) -> tuple[int, ...]:
     return ()
 
 
+def _is_visual_feature(feature: Any) -> bool:
+    feature_type = None
+    if hasattr(feature, "type"):
+        feature_type = getattr(feature, "type")
+    elif isinstance(feature, dict):
+        feature_type = feature.get("type")
+    normalized = str(feature_type).lower()
+    return normalized.endswith("visual") or normalized == "visual"
+
+
 def _zeros_for_feature(cfg, key: str) -> np.ndarray:
     input_features = getattr(cfg, "input_features", None) or {}
     feature = input_features.get(key)
@@ -77,6 +95,8 @@ def build_raw_policy_observation(observation_packet: dict[str, Any], cfg):
     obs: dict[str, object] = {
         state_key: torch.from_numpy(state.astype(np.float32, copy=False)),
     }
+    if observation_packet.get("task") is not None:
+        obs["task"] = str(observation_packet["task"])
 
     if env_state_key is not None and observation_packet.get("env_state") is not None:
         env_state = np.asarray(
@@ -121,7 +141,26 @@ def build_raw_policy_observation(observation_packet: dict[str, Any], cfg):
 
 def finalize_preprocessed_observation(obs: dict[str, Any], cfg) -> dict[str, Any]:
     state_key = resolve_state_key(cfg)
-    state_tensor = obs[state_key]
+    state_tensor = obs.get(state_key)
+    if state_tensor is None:
+        if not any(
+            feature_key in obs
+            for feature_key in (
+                "observation.path_signature",
+                "observation.delta_signature",
+            )
+        ):
+            return obs
+        state_tensor = next(
+            (
+                value
+                for value in obs.values()
+                if hasattr(value, "device") and hasattr(value, "dtype")
+            ),
+            None,
+        )
+        if state_tensor is None:
+            return obs
     state_device = state_tensor.device
     state_dtype = state_tensor.dtype
 

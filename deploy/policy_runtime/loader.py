@@ -36,6 +36,9 @@ from eval_helpers import (  # noqa: E402
 from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
 
+VLA_POLICY_TYPES = {"smolvla", "groot"}
+
+
 def apply_deploy_policy_overrides(
     cfg: Any,
     deploy_policy: PolicyConfig,
@@ -70,6 +73,60 @@ def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
     return Path(split_spec.dataset_root).expanduser().resolve()
 
 
+def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> None:
+    try:
+        from train_policy import (
+            install_groot_attention_implementation_patch,
+            install_groot_meta_tensor_compatibility_patch,
+            install_groot_processor_tensor_compatibility_patch,
+            install_groot_transformers_loading_compatibility_patch,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "GR00T deploy support could not import the local training compatibility "
+            "patches. Run deploy from this repository so `main/scripts` is on the "
+            "runtime path."
+        ) from exc
+
+    install_groot_attention_implementation_patch(attn_implementation)
+    install_groot_meta_tensor_compatibility_patch()
+    install_groot_transformers_loading_compatibility_patch()
+    install_groot_processor_tensor_compatibility_patch()
+
+
+def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
+    if policy_type == "streaming_act":
+        return import_local_streaming_act_policy_class()
+    if policy_type == "smolvla":
+        try:
+            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "SmolVLA deploy support is missing from this LeRobot installation. "
+                "Install LeRobot with SmolVLA extras, for example "
+                '`pip install -e ".[smolvla]"` in the LeRobot checkout.'
+            ) from exc
+        return SmolVLAPolicy
+    if policy_type == "groot":
+        try:
+            _install_groot_deploy_compatibility_patches(
+                deploy_policy.groot_attn_implementation
+            )
+            from lerobot.policies.groot.modeling_groot import GrootPolicy
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "GR00T deploy support is missing from this LeRobot installation. "
+                "Install a LeRobot version that provides `lerobot.policies.groot` "
+                "and the GR00T runtime dependencies."
+            ) from exc
+        return GrootPolicy
+    if policy_type == "act":
+        from lerobot.policies.act.modeling_act import ACTPolicy
+
+        return ACTPolicy
+    raise ValueError(f"Unsupported policy type: {policy_type!r}")
+
+
 class PolicyRuntime:
     def __init__(self, config: DeployConfig) -> None:
         self.deploy_config = config
@@ -88,6 +145,24 @@ class PolicyRuntime:
         self._open_loop_action_queue: deque[tuple[np.ndarray, int]] = deque()
 
     def load(self) -> None:
+        policy_path = self.deploy_config.policy.path
+        if policy_path is None:
+            raise ValueError("`policy.path` is required in the deploy YAML.")
+
+        policy_type = self.deploy_config.policy.type
+        if policy_type == "prism_diffusion":
+            raise ValueError(
+                "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
+                "The current deploy runtime supports 'act', 'streaming_act', "
+                "'smolvla', and 'groot'. "
+                "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
+                "until deploy support is added."
+            )
+        if policy_type in VLA_POLICY_TYPES and not self.deploy_config.policy.task:
+            raise ValueError(
+                f"`policy.task` is required when deploying {policy_type!r} policies."
+            )
+
         try:
             from lerobot.configs.policies import PreTrainedConfig
             from lerobot.policies.factory import make_pre_post_processors
@@ -97,26 +172,7 @@ class PolicyRuntime:
                 "Please install the repository `environment.yml` environment first."
             ) from exc
 
-        policy_path = self.deploy_config.policy.path
-        if policy_path is None:
-            raise ValueError("`policy.path` is required in the deploy YAML.")
-
-        policy_type = self.deploy_config.policy.type
-        if policy_type == "streaming_act":
-            policy_cls = import_local_streaming_act_policy_class()
-        elif policy_type == "prism_diffusion":
-            raise ValueError(
-                "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
-                "The current deploy runtime supports only 'act' and 'streaming_act'. "
-                "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
-                "until deploy support is added."
-            )
-        elif policy_type == "act":
-            from lerobot.policies.act.modeling_act import ACTPolicy
-
-            policy_cls = ACTPolicy
-        else:
-            raise ValueError(f"Unsupported policy type: {policy_type!r}")
+        policy_cls = resolve_deploy_policy_class(policy_type, self.deploy_config.policy)
 
         self.policy_dir = resolve_policy_dir(policy_path)
         local_files_only = self.policy_dir.is_dir()

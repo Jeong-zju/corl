@@ -16,6 +16,8 @@ class PolicyConfig:
     path: Path | None
     device: str
     load_device: str | None
+    task: str
+    groot_attn_implementation: str
     n_action_steps: int | None
     temporal_ensemble_coeff: float
     state_dim: int
@@ -152,6 +154,10 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
             None
             if policy_raw.get("load_device") in {None, "", "null"}
             else str(policy_raw.get("load_device"))
+        ),
+        task=str(policy_raw.get("task", policy_raw.get("instruction", ""))).strip(),
+        groot_attn_implementation=str(
+            policy_raw.get("groot_attn_implementation", "eager")
         ),
         n_action_steps=(
             None if policy_raw.get("n_action_steps") is None else int(policy_raw["n_action_steps"])
