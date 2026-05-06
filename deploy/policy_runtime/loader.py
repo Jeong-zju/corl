@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from collections import deque
+import importlib
+import importlib.machinery
+import importlib.util
+from types import ModuleType
 import time
 from pathlib import Path
 from typing import Any
@@ -37,6 +41,187 @@ from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E
 
 
 VLA_POLICY_TYPES = {"smolvla", "groot"}
+
+_LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
+    "act": "act",
+    "diffusion": "diffusion",
+    "groot": "groot",
+    "smolvla": "smolvla",
+}
+
+_LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
+    "smolvla": ("rtc",),
+}
+
+_LEROBOT_CONFIG_MODULES_BY_TYPE = {
+    "act": "lerobot.policies.act.configuration_act",
+    "groot": "lerobot.policies.groot.configuration_groot",
+    "smolvla": "lerobot.policies.smolvla.configuration_smolvla",
+}
+
+_LEROBOT_PROCESSOR_MODULES_BY_TYPE = {
+    "act": "lerobot.policies.act.processor_act",
+    "groot": "lerobot.policies.groot.processor_groot",
+    "smolvla": "lerobot.policies.smolvla.processor_smolvla",
+}
+
+
+def _make_namespace_package(name: str, package_path: Path) -> ModuleType:
+    module = ModuleType(name)
+    module.__file__ = str(package_path / "__init__.py")
+    module.__package__ = name
+    module.__path__ = [str(package_path)]  # type: ignore[attr-defined]
+    spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+    spec.submodule_search_locations = [str(package_path)]
+    module.__spec__ = spec
+    return module
+
+
+def _install_lerobot_policies_namespace_shim() -> Path | None:
+    """Avoid LeRobot 0.5.0's eager `lerobot.policies` imports during deploy.
+
+    LeRobot's policy package imports every policy config at package import time.
+    In Python 3.12, the GR00T dataclass currently raises before SmolVLA deploy
+    can even import its own modules.  Treating `lerobot.policies` as a namespace
+    package lets us import only the concrete policy submodules we need.
+    """
+    existing = sys.modules.get("lerobot.policies")
+    if existing is not None and getattr(existing, "__path__", None):
+        paths = list(getattr(existing, "__path__"))
+        return Path(paths[0]) if paths else None
+
+    lerobot_spec = importlib.util.find_spec("lerobot")
+    search_locations = getattr(lerobot_spec, "submodule_search_locations", None)
+    if not search_locations:
+        return None
+
+    for root in search_locations:
+        policies_path = Path(root) / "policies"
+        if policies_path.is_dir():
+            module = _make_namespace_package("lerobot.policies", policies_path)
+            sys.modules["lerobot.policies"] = module
+            parent = sys.modules.get("lerobot")
+            if parent is not None:
+                setattr(parent, "policies", module)
+            return policies_path
+    return None
+
+
+def _install_lerobot_policy_subpackage_shim_by_name(package_name: str) -> None:
+    policies_path = _install_lerobot_policies_namespace_shim()
+    if policies_path is None:
+        return
+
+    full_name = f"lerobot.policies.{package_name}"
+    existing = sys.modules.get(full_name)
+    if existing is not None and getattr(existing, "__path__", None):
+        return
+
+    package_path = policies_path / package_name
+    if not package_path.is_dir():
+        return
+
+    module = _make_namespace_package(full_name, package_path)
+    sys.modules[full_name] = module
+    parent = sys.modules.get("lerobot.policies")
+    if parent is not None:
+        setattr(parent, package_name, module)
+
+
+def _install_lerobot_policy_subpackage_shim(policy_type: str) -> None:
+    package_names = []
+    package_name = _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE.get(policy_type)
+    if package_name is not None:
+        package_names.append(package_name)
+    package_names.extend(_LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES.get(policy_type, ()))
+
+    for name in package_names:
+        _install_lerobot_policy_subpackage_shim_by_name(name)
+
+
+def _import_lerobot_policy_submodule(policy_type: str, module_name: str):
+    _install_lerobot_policy_subpackage_shim(policy_type)
+    return importlib.import_module(module_name)
+
+
+def _load_lerobot_pretrained_config_class(policy_type: str):
+    _install_lerobot_policies_namespace_shim()
+    try:
+        from lerobot.configs.policies import PreTrainedConfig
+    except ModuleNotFoundError:
+        raise
+
+    config_module_name = _LEROBOT_CONFIG_MODULES_BY_TYPE.get(policy_type)
+    if config_module_name is not None:
+        _import_lerobot_policy_submodule(policy_type, config_module_name)
+    return PreTrainedConfig
+
+
+def _register_deploy_processor_steps(policy_type: str) -> None:
+    if policy_type == "streaming_act":
+        importlib.import_module("lerobot_policy_streaming_act.processor_streaming_act")
+        return
+
+    processor_module_name = _LEROBOT_PROCESSOR_MODULES_BY_TYPE.get(policy_type)
+    if processor_module_name is not None:
+        _import_lerobot_policy_submodule(policy_type, processor_module_name)
+
+
+def _make_deploy_pre_post_processors(
+    *,
+    policy_type: str,
+    policy_cfg: Any,
+    pretrained_path: Path,
+    preprocessor_overrides: dict[str, Any] | None = None,
+    postprocessor_overrides: dict[str, Any] | None = None,
+):
+    _register_deploy_processor_steps(policy_type)
+
+    from lerobot.processor import PolicyProcessorPipeline
+    from lerobot.processor.converters import (
+        batch_to_transition,
+        policy_action_to_transition,
+        transition_to_batch,
+        transition_to_policy_action,
+    )
+    from lerobot.utils.constants import (
+        ACTION,
+        POLICY_POSTPROCESSOR_DEFAULT_NAME,
+        POLICY_PREPROCESSOR_DEFAULT_NAME,
+    )
+
+    if policy_type == "groot":
+        preprocessor_overrides = {
+            "groot_pack_inputs_v3": {
+                "stats": None,
+                "normalize_min_max": True,
+            }
+        }
+        env_action_dim = policy_cfg.output_features[ACTION].shape[0]
+        postprocessor_overrides = {
+            "groot_action_unpack_unnormalize_v1": {
+                "stats": None,
+                "normalize_min_max": True,
+                "env_action_dim": env_action_dim,
+            }
+        }
+
+    return (
+        PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+            overrides=preprocessor_overrides or {},
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
+        ),
+        PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+            overrides=postprocessor_overrides or {},
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        ),
+    )
 
 
 def apply_deploy_policy_overrides(
@@ -116,35 +301,45 @@ def _missing_dependency_error(
 
 
 def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
+    _install_lerobot_policies_namespace_shim()
     if policy_type == "streaming_act":
         return import_local_streaming_act_policy_class()
     if policy_type == "smolvla":
         try:
-            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+            module = _import_lerobot_policy_submodule(
+                policy_type,
+                "lerobot.policies.smolvla.modeling_smolvla",
+            )
         except ModuleNotFoundError as exc:
             raise _missing_dependency_error(
                 policy_name="SmolVLA",
                 extra_name="smolvla",
                 exc=exc,
             ) from exc
-        return SmolVLAPolicy
+        return module.SmolVLAPolicy
     if policy_type == "groot":
         try:
             _install_groot_deploy_compatibility_patches(
                 deploy_policy.groot_attn_implementation
             )
-            from lerobot.policies.groot.modeling_groot import GrootPolicy
+            module = _import_lerobot_policy_submodule(
+                policy_type,
+                "lerobot.policies.groot.modeling_groot",
+            )
         except ModuleNotFoundError as exc:
             raise _missing_dependency_error(
                 policy_name="GR00T",
                 extra_name="groot",
                 exc=exc,
             ) from exc
-        return GrootPolicy
+        return module.GrootPolicy
     if policy_type == "act":
-        from lerobot.policies.act.modeling_act import ACTPolicy
+        module = _import_lerobot_policy_submodule(
+            policy_type,
+            "lerobot.policies.act.modeling_act",
+        )
 
-        return ACTPolicy
+        return module.ACTPolicy
     raise ValueError(f"Unsupported policy type: {policy_type!r}")
 
 
@@ -185,8 +380,7 @@ class PolicyRuntime:
             )
 
         try:
-            from lerobot.configs.policies import PreTrainedConfig
-            from lerobot.policies.factory import make_pre_post_processors
+            PreTrainedConfig = _load_lerobot_pretrained_config_class(policy_type)
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Missing LeRobot deployment dependencies. "
@@ -236,7 +430,8 @@ class PolicyRuntime:
             "device_processor": {"device": self.deploy_config.policy.device},
             "rename_observations_processor": {"rename_map": {}},
         }
-        preprocessor, postprocessor = make_pre_post_processors(
+        preprocessor, postprocessor = _make_deploy_pre_post_processors(
+            policy_type=policy_type,
             policy_cfg=cfg,
             pretrained_path=self.policy_dir,
             preprocessor_overrides=preprocessor_overrides,

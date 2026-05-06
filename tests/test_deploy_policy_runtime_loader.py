@@ -24,6 +24,7 @@ from deploy.config import (
 from deploy.gripper_hysteresis import GripperHysteresisConfig
 from deploy.policy_runtime.loader import (
     PolicyRuntime,
+    _import_lerobot_policy_submodule,
     _missing_dependency_error,
     apply_deploy_policy_overrides,
 )
@@ -162,3 +163,46 @@ def test_missing_vla_dependency_error_names_nested_module() -> None:
     assert "`transformers`" in message
     assert "pip install -r requirements.txt" in message
     assert "lerobot[smolvla]==0.5.0" in message
+
+
+def test_lerobot_policy_import_shim_skips_eager_policy_inits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "lerobot"
+    smolvla_root = package_root / "policies" / "smolvla"
+    smolvla_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "policies" / "__init__.py").write_text(
+        "raise RuntimeError('eager policies init ran')\n",
+        encoding="utf-8",
+    )
+    (smolvla_root / "__init__.py").write_text(
+        "raise RuntimeError('eager smolvla init ran')\n",
+        encoding="utf-8",
+    )
+    (smolvla_root / "configuration_smolvla.py").write_text(
+        "SENTINEL = 'loaded directly'\n",
+        encoding="utf-8",
+    )
+
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "lerobot" or name.startswith("lerobot.")
+    }
+    for name in original_modules:
+        sys.modules.pop(name, None)
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        module = _import_lerobot_policy_submodule(
+            "smolvla",
+            "lerobot.policies.smolvla.configuration_smolvla",
+        )
+        assert module.SENTINEL == "loaded directly"
+    finally:
+        for name in list(sys.modules):
+            if name == "lerobot" or name.startswith("lerobot."):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_modules)
