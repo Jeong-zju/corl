@@ -19,6 +19,7 @@ from dataset_utils import (
     build_dataset_split,
     find_dataset_split_file,
     infer_dataset_repo_id,
+    is_supported_lerobot_dataset_root,
     load_dataset_split,
     resolve_dataset_root,
     resolve_episode_indices_from_dataset_info,
@@ -416,7 +417,105 @@ def normalize_eval_args(args: argparse.Namespace) -> argparse.Namespace:
     args.robocasa_conda_env = args.eval_robocasa_conda_env
     args.eval_robocasa_split = str(getattr(args, "robocasa_split", "target"))
     args.robocasa_split = args.eval_robocasa_split
+    temporal_ensemble_coeff = getattr(args, "temporal_ensemble_coeff", None)
+    if temporal_ensemble_coeff is not None:
+        temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+        args.temporal_ensemble_coeff = temporal_ensemble_coeff
+    args.eval_temporal_ensemble_coeff = temporal_ensemble_coeff
     return args
+
+
+def validate_policy_n_action_steps(cfg) -> None:
+    n_action_steps = getattr(cfg, "n_action_steps", None)
+    if n_action_steps is None:
+        return
+
+    cfg.n_action_steps = int(n_action_steps)
+    if cfg.n_action_steps <= 0:
+        raise ValueError(
+            f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
+        )
+    if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
+        raise ValueError(
+            "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
+            f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
+        )
+    if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
+        max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
+        if cfg.n_action_steps > max_n_action_steps:
+            raise ValueError(
+                "`--n-action-steps` cannot exceed the checkpoint diffusion "
+                "execution window (`horizon - n_obs_steps + 1`). "
+                f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
+                f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
+            )
+
+
+def configure_streaming_act_eval_runtime(
+    *,
+    policy,
+    cfg,
+    requested_n_action_steps: int | None,
+    requested_temporal_ensemble_coeff: float | None,
+    temporal_ensembler_factory=None,
+) -> bool:
+    runtime_reconfigured = False
+
+    if requested_n_action_steps is not None:
+        cfg.n_action_steps = int(requested_n_action_steps)
+        runtime_reconfigured = True
+
+    if requested_temporal_ensemble_coeff is not None:
+        coeff = float(requested_temporal_ensemble_coeff)
+        if coeff < 0.0:
+            raise ValueError(
+                "`--temporal-ensemble-coeff` must be >= 0. "
+                f"Got {coeff}."
+            )
+
+        runtime_reconfigured = True
+        if coeff == 0.0:
+            if getattr(cfg, "temporal_ensemble_coeff", None) is not None:
+                print(
+                    "[eval] temporal_ensemble_coeff=0 -> disabling temporal "
+                    "ensembling and using the current rollout action queue."
+                )
+            cfg.temporal_ensemble_coeff = None
+        else:
+            if int(getattr(cfg, "n_action_steps", 1)) != 1:
+                print(
+                    "[eval] temporal ensembling enabled -> forcing "
+                    "`n_action_steps=1` for per-step replanning."
+                )
+            cfg.temporal_ensemble_coeff = coeff
+            cfg.n_action_steps = 1
+
+    effective_temporal_ensemble_coeff = getattr(cfg, "temporal_ensemble_coeff", None)
+    if effective_temporal_ensemble_coeff is not None:
+        if int(getattr(cfg, "n_action_steps", 1)) != 1:
+            print(
+                "[eval] `streaming_act` temporal ensembling requires "
+                "`n_action_steps=1`; overriding the rollout setting."
+            )
+            cfg.n_action_steps = 1
+            runtime_reconfigured = True
+
+        if temporal_ensembler_factory is None:
+            ensure_streaming_act_importable(PROJECT_ROOT)
+            from lerobot_policy_streaming_act.modeling_streaming_act import (
+                StreamingACTTemporalEnsembler,
+            )
+
+            temporal_ensembler_factory = StreamingACTTemporalEnsembler
+
+        policy.temporal_ensembler = temporal_ensembler_factory(
+            float(effective_temporal_ensemble_coeff),
+            int(cfg.chunk_size),
+        )
+        runtime_reconfigured = True
+
+    validate_policy_n_action_steps(cfg)
+    return runtime_reconfigured
 
 
 def ensure_writable_hf_cache_env(project_root: Path) -> None:
@@ -488,6 +587,64 @@ def default_eval_output_dir(
     return str(base / default_policy_series_name(policy_name) / "{run_tag}")
 
 
+def infer_eval_defaults_dataset_selector(
+    *,
+    env_name: str | None,
+    dataset_selector: str | None,
+    task_selector: str | None,
+) -> str | None:
+    normalized_dataset = normalize_cli_text(dataset_selector)
+    task_items = normalize_csv_items(task_selector)
+    single_task = task_items[0] if len(task_items) == 1 else None
+
+    if normalized_dataset is not None:
+        if (
+            single_task is not None
+            and (
+                env_name == "robocasa"
+                or normalized_dataset == "robocasa"
+                or normalized_dataset.startswith("robocasa/")
+            )
+            and infer_robocasa_task_from_selector(normalized_dataset) is None
+        ):
+            return single_task
+        return normalized_dataset
+
+    if env_name == "robocasa" and single_task is not None:
+        return single_task
+    return None
+
+
+def resolve_direct_dataset_root(
+    dataset: str | Path,
+    *,
+    local_data_root: Path,
+) -> Path | None:
+    dataset_text = str(dataset).strip()
+    normalized_dataset_text = dataset_text.replace("\\", "/")
+    raw_path = Path(dataset_text).expanduser()
+    candidates: list[Path] = []
+
+    if raw_path.is_absolute() or raw_path.exists() or dataset_text.startswith("."):
+        candidates.append(raw_path)
+
+    if not raw_path.is_absolute():
+        if normalized_dataset_text.startswith("data/"):
+            candidates.append(local_data_root / normalized_dataset_text[len("data/") :])
+        candidates.append(local_data_root / dataset_text)
+        candidates.append(local_data_root / dataset_text.replace("/", "_"))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if is_supported_lerobot_dataset_root(candidate):
+            return candidate.resolve()
+    return None
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--dataset", type=str, default=None)
@@ -501,19 +658,27 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
+    bootstrap.add_argument("--task", type=str, default=None)
+    bootstrap.add_argument("--tasks", dest="task", type=str)
+    bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults = {}
     dataset_train_defaults = {}
     defaults_path = None
-    if known_args.dataset:
+    defaults_dataset_selector = infer_eval_defaults_dataset_selector(
+        env_name=known_args.env,
+        dataset_selector=known_args.dataset,
+        task_selector=getattr(known_args, "task", None),
+    )
+    if defaults_dataset_selector:
         defaults, defaults_path = load_policy_mode_defaults_for_dataset(
             mode="eval",
-            dataset_selector=known_args.dataset,
+            dataset_selector=defaults_dataset_selector,
             policy_name=known_args.policy,
         )
         dataset_train_defaults, _ = load_policy_mode_defaults_for_dataset(
             mode="train",
-            dataset_selector=known_args.dataset,
+            dataset_selector=defaults_dataset_selector,
             policy_name=known_args.policy,
         )
     if known_args.env:
@@ -631,6 +796,18 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning. Defaults to the checkpoint config."
         ),
     )
+    if known_args.policy == "streaming_act":
+        parser.add_argument(
+            "--temporal-ensemble-coeff",
+            type=float,
+            default=defaults.get("temporal_ensemble_coeff"),
+            help=(
+                "Streaming ACT rollout override for temporal action ensembling. "
+                "Set to 0 to disable and keep the current rollout behavior. "
+                "Set to a non-zero value to enable temporal ensembling, force "
+                "`n_action_steps=1`, and execute ensembled actions."
+            ),
+        )
     parser.add_argument(
         "--device",
         type=str,
@@ -1018,24 +1195,27 @@ def resolve_dataset_selection(
 
     if args.dataset is not None:
         defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
-        try:
-            dataset_root = resolve_dataset_root(
-                args.dataset,
-                local_data_root=args.local_data_root.resolve(),
-            )
-        except FileNotFoundError:
-            if not defaults_dataset_root:
-                raise
+        resolved_local_data_root = args.local_data_root.resolve()
+        dataset_root = resolve_direct_dataset_root(
+            args.dataset,
+            local_data_root=resolved_local_data_root,
+        )
+        if dataset_root is None and defaults_dataset_root:
             dataset_root = resolve_dataset_root(
                 defaults_dataset_root,
-                local_data_root=args.local_data_root.resolve(),
+                local_data_root=resolved_local_data_root,
+            )
+        if dataset_root is None:
+            dataset_root = resolve_dataset_root(
+                args.dataset,
+                local_data_root=resolved_local_data_root,
             )
         dataset_repo_id = (
             str(args.dataset_repo_id)
             if args.dataset_repo_id
             else infer_dataset_repo_id(
                 dataset_root,
-                local_data_root=args.local_data_root.resolve(),
+                local_data_root=resolved_local_data_root,
             )
         )
     elif saved_split is not None:
@@ -1737,26 +1917,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     cfg = policy.config
     cfg.device = args.device
-    if args.n_action_steps is not None:
-        cfg.n_action_steps = int(args.n_action_steps)
-        if cfg.n_action_steps <= 0:
-            raise ValueError(
-                f"`--n-action-steps` must be positive, got {cfg.n_action_steps}."
-            )
-        if hasattr(cfg, "chunk_size") and cfg.n_action_steps > int(cfg.chunk_size):
-            raise ValueError(
-                "`--n-action-steps` cannot exceed the checkpoint chunk_size. "
-                f"Got n_action_steps={cfg.n_action_steps}, chunk_size={cfg.chunk_size}."
-            )
-        if hasattr(cfg, "horizon") and hasattr(cfg, "n_obs_steps"):
-            max_n_action_steps = int(cfg.horizon) - int(cfg.n_obs_steps) + 1
-            if cfg.n_action_steps > max_n_action_steps:
-                raise ValueError(
-                    "`--n-action-steps` cannot exceed the checkpoint diffusion "
-                    "execution window (`horizon - n_obs_steps + 1`). "
-                    f"Got n_action_steps={cfg.n_action_steps}, horizon={cfg.horizon}, "
-                    f"n_obs_steps={cfg.n_obs_steps}, max={max_n_action_steps}."
-                )
+    runtime_reconfigured = False
+    if args.policy == "streaming_act":
+        runtime_reconfigured = configure_streaming_act_eval_runtime(
+            policy=policy,
+            cfg=cfg,
+            requested_n_action_steps=args.n_action_steps,
+            requested_temporal_ensemble_coeff=getattr(
+                args,
+                "eval_temporal_ensemble_coeff",
+                None,
+            ),
+        )
+    else:
+        if args.n_action_steps is not None:
+            cfg.n_action_steps = int(args.n_action_steps)
+            runtime_reconfigured = True
+        validate_policy_n_action_steps(cfg)
     if (
         hasattr(policy, "get_visual_prefix_memory_debug_stats")
         and getattr(cfg, "use_visual_prefix_memory", False)
@@ -1769,7 +1946,7 @@ def main(argv: list[str] | None = None) -> None:
             "For the most responsive streaming evaluation, prefer `--n-action-steps 1`."
         )
     policy.eval()
-    if args.n_action_steps is not None and hasattr(policy, "reset"):
+    if runtime_reconfigured and hasattr(policy, "reset"):
         policy.reset()
 
     preprocessor_overrides = {

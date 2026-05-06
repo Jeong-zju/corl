@@ -389,15 +389,41 @@ python data/upload_dataset_to_hf.py \
   --num-workers 16
 ```
 
+上传 RoboCasa 数据集时，脚本会默认把本地层级路径映射到 `zeno-ai` 组织下的合法 dataset repo id：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  robocasa/composite/PackFoodByTemp \
+  --dry-run
+```
+
+上面的例子会解析成：
+
+```json
+{
+  "repo_id": "zeno-ai/robocasa-composite-PackFoodByTemp"
+}
+```
+
+如果你想改到别的 namespace，也可以显式指定：
+
+```bash
+python data/upload_dataset_to_hf.py \
+  robocasa/composite/PackFoodByTemp \
+  --repo-namespace my-team
+```
+
 ### repo id 推断规则
 
 - 如果本地路径形如 `data/<name>`，默认 repo id 会取 `<name>`。
 - 如果本地路径形如 `data/<namespace>/<name>`，默认 repo id 会取 `<namespace>/<name>`。
-- 如果本地路径比这更深，例如 `data/robocasa/composite/ArrangeBreadBasket`，请显式传 `--repo-id`，避免远端命名和本地层级不一致。
+- 如果本地路径更深，例如 `data/foo/bar/baz`，默认 repo id 会压平成合法的 Hugging Face 名称：`foo/bar-baz`。
+- 对 `data/robocasa/...`，脚本默认会把 namespace 映射成 `zeno-ai`，并保留完整本地层级到 repo name 中，例如 `data/robocasa/composite/ArrangeBreadBasket` 会映射成 `zeno-ai/robocasa-composite-ArrangeBreadBasket`。
 
 ### 常用参数
 
 - `--repo-id`：显式指定 Hugging Face dataset repo id。
+- `--repo-namespace`：显式指定推断 repo id 时使用的 Hugging Face namespace / organization。
 - `--private` / `--public`：设置新建仓库的可见性；仓库已存在时不会改动原设置。
 - `--revision`：上传到指定分支、tag 或 revision，默认 `main`。
 - `--path-in-repo`：把本地目录上传到远端仓库的某个子目录。

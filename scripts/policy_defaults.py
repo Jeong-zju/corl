@@ -9,6 +9,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS_ROOT = PROJECT_ROOT / "bash" / "defaults"
 DATA_ROOT = PROJECT_ROOT / "data"
+ROBOCASA_TASK_COLLECTION_NAMES = frozenset({"atomic", "composite"})
 
 
 def defaults_file_path(env_name: str, policy_name: str) -> Path:
@@ -84,6 +85,58 @@ def _normalize_defaults_match_text(value: str | Path | None) -> str:
     return text.rstrip("/")
 
 
+def _normalize_cli_selector(value: str | Path | None) -> str | None:
+    normalized = _normalize_defaults_match_text(value)
+    return normalized or None
+
+
+def _normalize_cli_task_items(
+    value: str | list[str] | tuple[str, ...] | set[str] | None,
+) -> tuple[str, ...]:
+    if value is None:
+        return ()
+
+    raw_items = (
+        value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    )
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        items.append(item)
+    return tuple(items)
+
+
+def _infer_robocasa_task_from_selector(
+    selector: str | Path | None,
+) -> str | None:
+    normalized = _normalize_cli_selector(selector)
+    if normalized is None:
+        return None
+
+    parts = [
+        part
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if parts[:2] == ["main", "data"]:
+        parts = parts[2:]
+    elif parts[:1] == ["data"]:
+        parts = parts[1:]
+    if len(parts) < 3 or parts[0] != "robocasa":
+        return None
+    if parts[1] not in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+
+    task_name = str(parts[2]).strip()
+    if not task_name or task_name in ROBOCASA_TASK_COLLECTION_NAMES:
+        return None
+    return task_name
+
+
 def _defaults_match_specificity(value: str | Path | None) -> tuple[int, int]:
     normalized = _normalize_defaults_match_text(value)
     if not normalized:
@@ -113,6 +166,21 @@ def _score_defaults_candidate_match(
     return None
 
 
+def _iter_defaults_yaml_match_candidates(
+    value: str | Path | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    if value is None:
+        return []
+
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    candidates: list[str] = []
+    for raw_value in raw_values:
+        candidates.extend(
+            _normalize_dataset_selector_candidates(str(raw_value))
+        )
+    return candidates
+
+
 def resolve_dataset_defaults_path(
     dataset_selector: str,
     policy_name: str,
@@ -133,7 +201,7 @@ def resolve_dataset_defaults_path(
         return None
 
     best_match_path: Path | None = None
-    best_match_score: tuple[int, int, int] | None = None
+    best_match_score: tuple[int, int, int, int] | None = None
     for yaml_path in sorted(DEFAULTS_ROOT.rglob(f"{policy_name}.yaml")):
         try:
             data = _load_yaml_mapping(yaml_path)
@@ -143,27 +211,50 @@ def resolve_dataset_defaults_path(
         if not isinstance(train_cfg, dict):
             continue
 
-        yaml_candidates: list[str] = []
+        eval_cfg = data.get("eval", {})
+        if not isinstance(eval_cfg, dict):
+            eval_cfg = {}
+
+        yaml_candidates: list[tuple[str, int]] = []
         dataset_root = train_cfg.get("dataset_root")
         dataset_repo_id = train_cfg.get("dataset_repo_id")
         if dataset_root:
             yaml_candidates.extend(
-                _normalize_dataset_selector_candidates(str(dataset_root))
+                (candidate, 2)
+                for candidate in _iter_defaults_yaml_match_candidates(dataset_root)
             )
         if dataset_repo_id:
             yaml_candidates.extend(
-                _normalize_dataset_selector_candidates(str(dataset_repo_id))
+                (candidate, 2)
+                for candidate in _iter_defaults_yaml_match_candidates(dataset_repo_id)
+            )
+        for task_value in (
+            train_cfg.get("dataset_tasks"),
+            train_cfg.get("task"),
+            train_cfg.get("cil"),
+            eval_cfg.get("task"),
+            eval_cfg.get("cil"),
+        ):
+            yaml_candidates.extend(
+                (candidate, 1)
+                for candidate in _iter_defaults_yaml_match_candidates(task_value)
             )
 
-        yaml_match_score: tuple[int, int, int] | None = None
+        yaml_match_score: tuple[int, int, int, int] | None = None
         for selector_candidate in selector_candidate_set:
-            for yaml_candidate in set(yaml_candidates):
-                score = _score_defaults_candidate_match(
+            for yaml_candidate, source_priority in set(yaml_candidates):
+                base_score = _score_defaults_candidate_match(
                     selector_candidate=selector_candidate,
                     yaml_candidate=yaml_candidate,
                 )
-                if score is None:
+                if base_score is None:
                     continue
+                score = (
+                    base_score[0],
+                    source_priority,
+                    base_score[1],
+                    base_score[2],
+                )
                 if yaml_match_score is None or score > yaml_match_score:
                     yaml_match_score = score
 
@@ -175,12 +266,75 @@ def resolve_dataset_defaults_path(
     return best_match_path
 
 
+def resolve_cli_dataset_defaults_path(
+    *,
+    dataset_selector: str | Path | None,
+    task_selector: str | list[str] | tuple[str, ...] | set[str] | None,
+    policy_name: str,
+) -> Path | None:
+    normalized_dataset = _normalize_cli_selector(dataset_selector)
+    task_items = _normalize_cli_task_items(task_selector)
+    single_task = task_items[0] if len(task_items) == 1 else None
+
+    if normalized_dataset is not None:
+        if (
+            single_task is not None
+            and (
+                normalized_dataset == "robocasa"
+                or normalized_dataset.startswith("robocasa/")
+            )
+            and _infer_robocasa_task_from_selector(normalized_dataset) is None
+        ):
+            task_path = resolve_dataset_defaults_path(
+                dataset_selector=single_task,
+                policy_name=policy_name,
+            )
+            if task_path is not None:
+                return task_path
+        return resolve_dataset_defaults_path(
+            dataset_selector=normalized_dataset,
+            policy_name=policy_name,
+        )
+
+    if single_task is not None:
+        return resolve_dataset_defaults_path(
+            dataset_selector=single_task,
+            policy_name=policy_name,
+        )
+    return None
+
+
 def load_policy_mode_defaults_for_dataset(
     mode: str,
     dataset_selector: str,
     policy_name: str,
 ) -> tuple[dict[str, Any], Path | None]:
     path = resolve_dataset_defaults_path(dataset_selector, policy_name)
+    if path is None:
+        return {}, None
+    data = _load_yaml_mapping(path)
+    mode_defaults = data.get(mode, {})
+    if mode_defaults is None:
+        mode_defaults = {}
+    if not isinstance(mode_defaults, dict):
+        raise TypeError(
+            f"Expected mapping for '{mode}' section in defaults file: {path}"
+        )
+    return mode_defaults, path
+
+
+def load_policy_mode_defaults_for_cli(
+    mode: str,
+    *,
+    dataset_selector: str | Path | None,
+    task_selector: str | list[str] | tuple[str, ...] | set[str] | None,
+    policy_name: str,
+) -> tuple[dict[str, Any], Path | None]:
+    path = resolve_cli_dataset_defaults_path(
+        dataset_selector=dataset_selector,
+        task_selector=task_selector,
+        policy_name=policy_name,
+    )
     if path is None:
         return {}, None
     data = _load_yaml_mapping(path)

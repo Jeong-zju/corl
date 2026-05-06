@@ -1,0 +1,65 @@
+# Single-task Diffusion Policy defaults for RoboCasa composite/OrganizeVegetables.
+train:
+  dataset_root: "data/robocasa/composite/OrganizeVegetables"
+  dataset_repo_id: "robocasa/composite/OrganizeVegetables"
+  output_root: "outputs/train/robocasa/composite/OrganizeVegetables/diffusion"
+  resume: false
+  job_name: "diffusion"
+  wandb_project: "robocasa-composite-organizevegetables"
+  wandb_mode: "online"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "auto"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
+  # Diffusion is heavier per step than ACT, so use a smaller batch and sample
+  # budget while preserving the same 100-action execution chunk.
+  steps: 80000
+  batch_size: 16
+  num_workers: 16
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  video_backend: "torchcodec"
+  torch_sharing_strategy: "file_system"
+  torchcodec_decoder_cache_size: 32
+  seed: 42
+  log_freq: 1000
+  save_freq: 20000
+  eval_freq: -1
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  n_obs_steps: 2
+  horizon: 104
+  n_action_steps: 100
+  drop_n_last_frames: 3
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+eval:
+  train_output_root: "outputs/train/robocasa/composite/OrganizeVegetables/diffusion"
+  output_dir: "outputs/eval/robocasa/composite/OrganizeVegetables/diffusion/{run_tag}"
+  task: "OrganizeVegetables"
+  eval_split: "test"
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  max_episodes: 20
+  max_steps_per_episode: null
+  seed: 42
+  device: "cuda"
+  n_action_steps: 50
+  robocasa_conda_env: "robocasa"
+  robocasa_split: "pretrain"
+  num_rollouts: 20
+  max_steps: null
+  fps: 20
+  max_episodes_rendered: 4

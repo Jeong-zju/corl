@@ -29,7 +29,7 @@ from dataset_utils import (
     validate_dataset_root,
 )
 from policy_capabilities import policy_supports_signature_features
-from policy_defaults import load_policy_mode_defaults_for_dataset
+from policy_defaults import load_policy_mode_defaults_for_cli
 
 warnings.filterwarnings(
     "ignore",
@@ -1970,12 +1970,16 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
         default="act",
     )
+    bootstrap.add_argument("--task", type=str, default=None)
+    bootstrap.add_argument("--tasks", dest="task", type=str)
+    bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults, defaults_path = ({}, None)
-    if known_args.dataset:
-        defaults, defaults_path = load_policy_mode_defaults_for_dataset(
+    if known_args.dataset or getattr(known_args, "task", None):
+        defaults, defaults_path = load_policy_mode_defaults_for_cli(
             mode="train",
             dataset_selector=known_args.dataset,
+            task_selector=getattr(known_args, "task", None),
             policy_name=known_args.policy,
         )
 
