@@ -94,6 +94,27 @@ def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> Non
     install_groot_processor_tensor_compatibility_patch()
 
 
+def _missing_dependency_error(
+    *,
+    policy_name: str,
+    extra_name: str,
+    exc: ModuleNotFoundError,
+) -> RuntimeError:
+    missing_module = getattr(exc, "name", None)
+    if missing_module and not str(missing_module).startswith("lerobot"):
+        return RuntimeError(
+            f"Missing Python dependency for {policy_name} deploy: "
+            f"`{missing_module}`. Install this project's deployment requirements "
+            "with `python -m pip install -r requirements.txt`, or install the "
+            f"LeRobot extra directly with `python -m pip install \"lerobot[{extra_name}]==0.5.0\"`."
+        )
+    return RuntimeError(
+        f"{policy_name} deploy support is missing from this LeRobot installation. "
+        f"Install LeRobot with the {policy_name} extra, for example "
+        f'`python -m pip install "lerobot[{extra_name}]==0.5.0"`.'
+    )
+
+
 def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
     if policy_type == "streaming_act":
         return import_local_streaming_act_policy_class()
@@ -101,10 +122,10 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
         try:
             from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "SmolVLA deploy support is missing from this LeRobot installation. "
-                "Install LeRobot with SmolVLA extras, for example "
-                '`pip install -e ".[smolvla]"` in the LeRobot checkout.'
+            raise _missing_dependency_error(
+                policy_name="SmolVLA",
+                extra_name="smolvla",
+                exc=exc,
             ) from exc
         return SmolVLAPolicy
     if policy_type == "groot":
@@ -114,10 +135,10 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
             )
             from lerobot.policies.groot.modeling_groot import GrootPolicy
         except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "GR00T deploy support is missing from this LeRobot installation. "
-                "Install a LeRobot version that provides `lerobot.policies.groot` "
-                "and the GR00T runtime dependencies."
+            raise _missing_dependency_error(
+                policy_name="GR00T",
+                extra_name="groot",
+                exc=exc,
             ) from exc
         return GrootPolicy
     if policy_type == "act":

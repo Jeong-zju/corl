@@ -22,7 +22,11 @@ from deploy.config import (
     TopicConfig,
 )
 from deploy.gripper_hysteresis import GripperHysteresisConfig
-from deploy.policy_runtime.loader import PolicyRuntime, apply_deploy_policy_overrides
+from deploy.policy_runtime.loader import (
+    PolicyRuntime,
+    _missing_dependency_error,
+    apply_deploy_policy_overrides,
+)
 
 
 def _make_policy_config(**overrides) -> PolicyConfig:
@@ -145,3 +149,16 @@ def test_policy_runtime_requires_vla_task_before_importing_lerobot() -> None:
 
     with pytest.raises(ValueError, match="policy.task"):
         runtime.load()
+
+
+def test_missing_vla_dependency_error_names_nested_module() -> None:
+    error = _missing_dependency_error(
+        policy_name="SmolVLA",
+        extra_name="smolvla",
+        exc=ModuleNotFoundError("No module named 'transformers'", name="transformers"),
+    )
+
+    message = str(error)
+    assert "`transformers`" in message
+    assert "pip install -r requirements.txt" in message
+    assert "lerobot[smolvla]==0.5.0" in message
