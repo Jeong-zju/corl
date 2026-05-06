@@ -11,7 +11,10 @@ cd "${REPO_ROOT}"
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1 --policy act
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy diffusion
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --steps 20000
+#   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy smolvla
+#   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy groot
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --resume --steps 40000
+#   ./bash/train_policy.sh --defaults-path bash/defaults/zeno-ai/BookOriginRelocation/streaming_act_8x4090_bak.yaml --policy streaming_act
 #   ./bash/train_policy.sh --dataset metaworld_mt50 --policy act
 #   ./bash/train_policy.sh --dataset metaworld_mt50 --policy streaming_act
 #   ./bash/train_policy.sh --dataset robocasa/composite/ArrangeBreadBasket --policy act
@@ -23,6 +26,7 @@ env_name=""
 dataset_name=""
 task_name=""
 defaults_path=""
+explicit_defaults_path="false"
 forward_args=()
 
 resolved_defaults_dataset_root=""
@@ -118,6 +122,22 @@ while [[ $# -gt 0 ]]; do
       forward_args+=("$1")
       shift
       ;;
+    --defaults-path)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] --defaults-path requires a value." >&2
+        exit 2
+      fi
+      defaults_path="$2"
+      explicit_defaults_path="true"
+      forward_args+=("$1" "$2")
+      shift 2
+      ;;
+    --defaults-path=*)
+      defaults_path="${1#*=}"
+      explicit_defaults_path="true"
+      forward_args+=("$1")
+      shift
+      ;;
     --env)
       if [[ $# -lt 2 ]]; then
         echo "[ERROR] --env requires a value." >&2
@@ -165,7 +185,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "${dataset_name}" ]]; then
+if [[ "${explicit_defaults_path}" == "true" ]]; then
+  if [[ ! -f "${defaults_path}" ]]; then
+    echo "[ERROR] Explicit defaults file not found: ${defaults_path}" >&2
+    exit 2
+  fi
+elif [[ -n "${dataset_name}" ]]; then
   defaults_path="$(resolve_defaults_path_from_dataset_and_task "${dataset_name}" "${task_name}")"
 elif [[ -n "${env_name}" ]]; then
   defaults_path="bash/defaults/${env_name}/${policy_name}.yaml"

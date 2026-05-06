@@ -46,6 +46,17 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
+_VAE_LOG_VAR_MIN = -10.0
+_VAE_LOG_VAR_MAX = 10.0
+
+
+def _stable_vae_log_variance(log_sigma_x2: Tensor) -> Tensor:
+    return log_sigma_x2.float().clamp(
+        min=_VAE_LOG_VAR_MIN,
+        max=_VAE_LOG_VAR_MAX,
+    )
+
+
 class StreamingACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -106,6 +117,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
         self._visual_prefix_memory_state = None
         self._visual_prefix_memory_update_count = 0
         self._visual_prefix_memory_last_state_norm = 0.0
+        self.model.reset_deploy_debug()
 
     def _prepare_observation_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if not self.config.visual_observation_features:
@@ -198,6 +210,11 @@ class StreamingACTPolicy(PreTrainedPolicy):
             "state_norm": float(self._visual_prefix_memory_last_state_norm),
         }
 
+    def get_deploy_debug_snapshot(self) -> dict:
+        snapshot = self.model.get_deploy_debug_snapshot()
+        snapshot["visual_memory_stats"] = self.get_visual_prefix_memory_debug_stats()
+        return snapshot
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.visual_observation_features:
@@ -216,8 +233,20 @@ class StreamingACTPolicy(PreTrainedPolicy):
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
+            mu_hat_f32 = mu_hat.float()
+            log_sigma_x2_hat_f32 = _stable_vae_log_variance(log_sigma_x2_hat)
             mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+                (
+                    -0.5
+                    * (
+                        1
+                        + log_sigma_x2_hat_f32
+                        - mu_hat_f32.pow(2)
+                        - log_sigma_x2_hat_f32.exp()
+                    )
+                )
+                .sum(-1)
+                .mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
@@ -231,6 +260,12 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = loss + balance_weighted
             loss_dict["slot_memory_balance_loss"] = balance_raw.item()
             loss_dict["slot_memory_balance_loss_weighted"] = balance_weighted.item()
+        if "slot_memory_entropy_loss" in aux_losses:
+            entropy_raw = aux_losses["slot_memory_entropy_loss"]
+            entropy_weighted = entropy_raw * self.config.slot_memory_entropy_loss_coef
+            loss = loss + entropy_weighted
+            loss_dict["slot_memory_entropy_loss"] = entropy_raw.item()
+            loss_dict["slot_memory_entropy_loss_weighted"] = entropy_weighted.item()
         if "slot_memory_consistency_loss" in aux_losses:
             consistency_raw = aux_losses["slot_memory_consistency_loss"]
             consistency_weighted = (
@@ -239,6 +274,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
             loss = loss + consistency_weighted
             loss_dict["slot_memory_consistency_loss"] = consistency_raw.item()
             loss_dict["slot_memory_consistency_loss_weighted"] = consistency_weighted.item()
+        loss_dict.update(self.model.get_visual_prefix_memory_log_stats())
 
         return loss, loss_dict
 
@@ -385,6 +421,8 @@ class StreamingACT(nn.Module):
         self.use_memory_conditioned_encoder_film = config.use_memory_conditioned_encoder_film
         self.active_memory_num_slots = config.active_visual_prefix_memory_num_slots
         self._last_visual_prefix_memory_aux_losses: dict[str, Tensor] = {}
+        self._last_visual_prefix_memory_log_stats: dict[str, float] = {}
+        self.reset_deploy_debug()
 
         if self.use_path_signature:
             assert config.signature_dim > 0, (
@@ -594,6 +632,114 @@ class StreamingACT(nn.Module):
 
     def get_visual_prefix_memory_aux_losses(self) -> dict[str, Tensor]:
         return dict(self._last_visual_prefix_memory_aux_losses)
+
+    def get_visual_prefix_memory_log_stats(self) -> dict[str, float]:
+        return dict(self._last_visual_prefix_memory_log_stats)
+
+    def reset_deploy_debug(self) -> None:
+        self._latest_deploy_debug: dict[str, object] = {}
+        self._latest_decoder_token_layout: dict[str, object] = {}
+        self._latest_visual_prefix_memory_step_stats: dict[str, Tensor | float | int | bool] = {}
+        self._latest_observation_image_token_layout: dict[str, object] = {}
+
+    @staticmethod
+    def _debug_tensor(tensor: Tensor | None) -> Tensor | None:
+        if tensor is None:
+            return None
+        return tensor.detach().float().cpu()
+
+    @staticmethod
+    def _debug_norm(tensor: Tensor | None) -> float:
+        if tensor is None:
+            return 0.0
+        return float(tensor.detach().float().norm(dim=-1).mean().cpu().item())
+
+    @staticmethod
+    def _debug_slot_std(tensor: Tensor | None) -> float:
+        if tensor is None or tensor.ndim != 3 or tensor.shape[1] <= 1:
+            return 0.0
+        slot_std = tensor.detach().float().std(dim=1, unbiased=False)
+        return float(slot_std.norm(dim=-1).mean().cpu().item())
+
+    @staticmethod
+    def _categorical_entropy_from_probabilities(probabilities: Tensor) -> Tensor:
+        probabilities_f32 = probabilities.float()
+        log_probabilities = probabilities_f32.clamp_min(
+            torch.finfo(torch.float32).tiny
+        ).log()
+        return -(probabilities_f32 * log_probabilities).sum(dim=-1)
+
+    @staticmethod
+    def _bounded_slot_memory_consistency_loss(
+        readout_context: Tensor,
+        write_base: Tensor,
+    ) -> Tensor:
+        readout_bounded = torch.tanh(readout_context.float())
+        write_bounded = torch.tanh(write_base.float())
+        return F.mse_loss(
+            readout_bounded,
+            write_bounded,
+            reduction="none",
+        ).mean(dim=-1)
+
+    def _build_slot_memory_identity(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        if not self.use_signature_indexed_slot_memory:
+            return torch.zeros(
+                (batch_size, self.active_memory_num_slots, self.config.dim_model),
+                device=device,
+                dtype=dtype,
+            )
+        scale = float(getattr(self.config, "slot_memory_identity_scale", 0.0))
+        if scale <= 0.0:
+            return torch.zeros(
+                (batch_size, self.active_memory_num_slots, self.config.dim_model),
+                device=device,
+                dtype=dtype,
+            )
+        slot_idx = torch.arange(
+            self.active_memory_num_slots,
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        dim_idx = torch.arange(
+            self.config.dim_model,
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        inv_freq = torch.exp(
+            -math.log(10000.0)
+            * (
+                2.0
+                * torch.floor(dim_idx / 2.0)
+                / float(max(1, self.config.dim_model))
+            )
+        )
+        angles = (slot_idx + 1.0) * inv_freq
+        even_dims = (dim_idx.to(torch.long) % 2 == 0)
+        identity = torch.where(even_dims, torch.sin(angles), torch.cos(angles))
+        if self.active_memory_num_slots > 1:
+            identity = identity - identity.mean(dim=0, keepdim=True)
+        identity = F.normalize(identity, dim=-1) * math.sqrt(float(self.config.dim_model))
+        identity = identity.to(dtype=dtype) * scale
+        return identity.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _memory_with_slot_identity(self, memory_state: Tensor) -> Tensor:
+        if not self.use_signature_indexed_slot_memory:
+            return memory_state
+        # SISM slots otherwise remain permutation-symmetric when they start from zeros.
+        # The fixed identity is an address signal, not recurrent content.
+        identity = self._build_slot_memory_identity(
+            batch_size=memory_state.shape[0],
+            device=memory_state.device,
+            dtype=memory_state.dtype,
+        )
+        return memory_state + identity
 
     def _validate_prefix_sequence_inputs(self, batch: dict[str, Tensor], batch_size: int) -> None:
         if not self.config.use_prefix_sequence_training:
@@ -875,6 +1021,132 @@ class StreamingACT(nn.Module):
             return pooled[0]
         return pooled.mean(dim=0)
 
+    @staticmethod
+    def _current_camera_suffix(camera_key: str) -> str:
+        if camera_key.startswith("observation.images."):
+            return camera_key.removeprefix("observation.images.")
+        if camera_key == "observation.image":
+            return "main"
+        return camera_key
+
+    @staticmethod
+    def _prefix_camera_suffix(prefix_image_key: str) -> str:
+        return prefix_image_key.removeprefix("observation.prefix_images.")
+
+    def _prefix_images_match_observation_camera_order(self) -> bool:
+        current_suffixes = [
+            self._current_camera_suffix(key)
+            for key in self.config.visual_observation_features
+        ]
+        prefix_suffixes = [
+            self._prefix_camera_suffix(key)
+            for key in self.config.prefix_image_features
+        ]
+        return bool(current_suffixes) and current_suffixes == prefix_suffixes
+
+    def _encode_multi_camera_prefix_images_for_visual_prefix_memory(
+        self,
+        camera_images: list[Tensor],
+        *,
+        prefix_mask: Tensor,
+        reuse_current_observation_tokens: bool,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        flat_images, batch_size, time_steps, num_cameras = self._flatten_camera_image_batch(
+            camera_images,
+            context="Visual prefix memory",
+        )
+        if time_steps is None:
+            raise ValueError(
+                "Prefix visual memory expects camera tensors with shape "
+                "(B, T, C, H, W)."
+            )
+
+        features = self.backbone(flat_images)["feature_map"]
+        current_image_pos_seq = None
+        if reuse_current_observation_tokens:
+            current_image_pos_seq = self.encoder_cam_feat_pos_embed(features).to(
+                dtype=features.dtype
+            )
+        features = self.encoder_img_feat_input_proj(features)
+        pooled = self._pool_visual_features_for_memory(features)
+        visual_embeddings = pooled.reshape(
+            num_cameras,
+            batch_size,
+            time_steps,
+            self.config.dim_model,
+        )
+        if num_cameras == 1:
+            visual_embeddings = visual_embeddings[0]
+        else:
+            visual_embeddings = visual_embeddings.mean(dim=0)
+
+        current_observation_tokens = None
+        if reuse_current_observation_tokens:
+            _, dim_model, feat_h, feat_w = features.shape
+            prefix_mask = prefix_mask.to(device=features.device, dtype=torch.bool)
+            valid_lengths = prefix_mask.sum(dim=1).clamp_min(1)
+            current_positions = valid_lengths - 1
+
+            camera_features = features.reshape(
+                num_cameras,
+                batch_size,
+                time_steps,
+                dim_model,
+                feat_h,
+                feat_w,
+            )
+            current_gather_index = current_positions.view(
+                1, batch_size, 1, 1, 1, 1
+            ).expand(num_cameras, batch_size, 1, dim_model, feat_h, feat_w)
+            current_features = camera_features.gather(
+                dim=2,
+                index=current_gather_index,
+            ).squeeze(2)
+            self._latest_observation_image_token_layout = {
+                "camera_keys": list(self.config.visual_observation_features),
+                "num_cameras": int(num_cameras),
+                "feature_h": int(feat_h),
+                "feature_w": int(feat_w),
+            }
+
+            assert current_image_pos_seq is not None
+            if current_image_pos_seq.shape[0] == 1:
+                current_image_pos_seq = current_image_pos_seq.expand(
+                    num_cameras, -1, -1, -1
+                )
+                current_image_pos_seq = einops.rearrange(
+                    current_image_pos_seq,
+                    "cam c h w -> (cam h w) 1 c",
+                )
+            else:
+                current_image_pos_seq = current_image_pos_seq.reshape(
+                    num_cameras,
+                    batch_size,
+                    time_steps,
+                    dim_model,
+                    feat_h,
+                    feat_w,
+                )
+                current_image_pos_seq = current_image_pos_seq.gather(
+                    dim=2,
+                    index=current_gather_index,
+                ).squeeze(2)
+                current_image_pos_seq = einops.rearrange(
+                    current_image_pos_seq,
+                    "cam b c h w -> (cam h w) b c",
+                )
+
+            current_image_token_seq = einops.rearrange(
+                current_features,
+                "cam b c h w -> (cam h w) b c",
+            )
+            current_observation_tokens = (
+                current_image_token_seq,
+                current_image_pos_seq,
+            )
+
+        return visual_embeddings, current_observation_tokens
+
     def _reduce_camera_embeddings_for_visual_prefix_memory(
         self,
         camera_embeddings: list[Tensor],
@@ -904,6 +1176,12 @@ class StreamingACT(nn.Module):
         cam_features = self.encoder_img_feat_input_proj(cam_features)
 
         _, dim_model, feat_h, feat_w = cam_features.shape
+        self._latest_observation_image_token_layout = {
+            "camera_keys": list(self.config.visual_observation_features),
+            "num_cameras": int(num_cameras),
+            "feature_h": int(feat_h),
+            "feature_w": int(feat_w),
+        }
         cam_features = cam_features.reshape(num_cameras, batch_size, dim_model, feat_h, feat_w)
         if cam_pos_embed.shape[0] == 1:
             cam_pos_embed = cam_pos_embed.expand(num_cameras, -1, -1, -1)
@@ -1040,20 +1318,80 @@ class StreamingACT(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         route_hidden = self.slot_memory_route_proj(route_features)
         routing_query = self.slot_memory_route_query_proj(route_hidden).unsqueeze(1)
-        routing_keys = self.slot_memory_route_key_proj(memory_prev)
+        routing_keys = self.slot_memory_route_key_proj(
+            self._memory_with_slot_identity(memory_prev)
+        )
         routing_logits = torch.matmul(
             routing_query, routing_keys.transpose(1, 2)
         ).squeeze(1) / math.sqrt(self.config.slot_memory_routing_hidden_dim)
+        routing_temperature = float(
+            getattr(self.config, "slot_memory_routing_temperature", 1.0)
+        )
+        routing_logits = routing_logits / max(routing_temperature, 1e-6)
+        routing_logits_f32 = routing_logits.float()
         if self.config.slot_memory_use_softmax_routing:
-            routing_weights = torch.softmax(routing_logits, dim=-1)
-            routing_distribution = routing_weights
+            routing_distribution = torch.softmax(routing_logits_f32, dim=-1)
+            routing_weights = routing_distribution.to(dtype=routing_logits.dtype)
         else:
-            routing_weights = torch.sigmoid(routing_logits)
-            routing_distribution = routing_weights / routing_weights.sum(
+            routing_weights_f32 = torch.sigmoid(routing_logits_f32)
+            routing_weights = routing_weights_f32.to(dtype=routing_logits.dtype)
+            routing_distribution = routing_weights_f32 / routing_weights_f32.sum(
                 dim=-1,
                 keepdim=True,
-            ).clamp_min(1e-6)
+            ).clamp_min(torch.finfo(torch.float32).tiny)
         return route_hidden, routing_logits, routing_weights, routing_distribution
+
+    def _record_visual_prefix_memory_step_debug(
+        self,
+        *,
+        memory_prev: Tensor,
+        memory_next: Tensor,
+        visual_t: Tensor,
+        state_t: Tensor,
+        signature_t: Tensor | None,
+        delta_signature_t: Tensor | None,
+        step_stats: dict[str, Tensor],
+    ) -> None:
+        memory_prev_norm = memory_prev.detach().float().norm(dim=-1)
+        memory_next_norm = memory_next.detach().float().norm(dim=-1)
+        memory_delta_norm = (memory_next - memory_prev).detach().float().norm(dim=-1)
+        slot_identity = self._build_slot_memory_identity(
+            batch_size=memory_prev.shape[0],
+            device=memory_prev.device,
+            dtype=memory_prev.dtype,
+        )
+        debug: dict[str, Tensor | float | int | bool] = {
+            "enabled": bool(self.use_visual_prefix_memory),
+            "signature_indexed_slot_memory": bool(self.use_signature_indexed_slot_memory),
+            "num_slots": int(self.active_memory_num_slots),
+            "slot_identity_scale": float(
+                getattr(self.config, "slot_memory_identity_scale", 0.0)
+            ),
+            "slot_identity_norm": self._debug_norm(slot_identity),
+            "memory_prev_slot_std": self._debug_slot_std(memory_prev),
+            "memory_next_slot_std": self._debug_slot_std(memory_next),
+            "visual_embedding_norm": self._debug_norm(visual_t),
+            "state_embedding_norm": self._debug_norm(state_t),
+            "signature_embedding_norm": self._debug_norm(signature_t),
+            "delta_signature_embedding_norm": self._debug_norm(delta_signature_t),
+            "memory_prev_norm": self._debug_tensor(memory_prev_norm),
+            "memory_next_norm": self._debug_tensor(memory_next_norm),
+            "memory_delta_norm": self._debug_tensor(memory_delta_norm),
+        }
+        for key in (
+            "routing_logits",
+            "routing_weights",
+            "routing_distribution",
+            "routing_weights_zero_signature",
+            "routing_delta_from_zero_signature",
+            "gate",
+            "write_strength",
+            "readout_logits",
+            "readout_weights",
+        ):
+            if key in step_stats:
+                debug[key] = self._debug_tensor(step_stats[key])
+        self._latest_visual_prefix_memory_step_stats = debug
 
     def _read_signature_indexed_slot_memory_context(
         self,
@@ -1074,7 +1412,9 @@ class StreamingACT(nn.Module):
             route_hidden = self.slot_memory_route_proj(route_features)
         read_query_input = torch.cat([visual_t, state_t, route_hidden], dim=-1)
         read_query = self.slot_memory_read_query_proj(read_query_input).unsqueeze(1)
-        read_keys = self.slot_memory_read_key_proj(memory_state)
+        read_keys = self.slot_memory_read_key_proj(
+            self._memory_with_slot_identity(memory_state)
+        )
         read_values = self.slot_memory_read_value_proj(memory_state)
         read_logits = torch.matmul(
             read_query, read_keys.transpose(1, 2)
@@ -1105,11 +1445,16 @@ class StreamingACT(nn.Module):
                 route_features=route_features,
             )
         )
+        _, _, zero_signature_routing_weights, _ = self._compute_signature_indexed_slot_memory_route(
+            memory_prev=memory_prev,
+            route_features=torch.zeros_like(route_features),
+        )
         write_input = torch.cat([visual_t, state_t, route_features], dim=-1)
         write_base = self.slot_memory_write_proj(write_input)
+        memory_prev_with_identity = self._memory_with_slot_identity(memory_prev)
         slot_state_input = torch.cat(
             [
-                memory_prev,
+                memory_prev_with_identity,
                 write_base.unsqueeze(1).expand(batch_size, num_slots, hidden_dim),
                 route_hidden.unsqueeze(1).expand(
                     batch_size,
@@ -1119,7 +1464,7 @@ class StreamingACT(nn.Module):
             ],
             dim=-1,
         )
-        candidate = self.slot_memory_candidate_proj(slot_state_input)
+        candidate = torch.tanh(self.slot_memory_candidate_proj(slot_state_input))
         gate = torch.sigmoid(self.slot_memory_gate_proj(slot_state_input))
         write_strength = routing_weights.unsqueeze(-1) * gate
         updated_hidden = memory_prev + write_strength * (candidate - memory_prev)
@@ -1149,9 +1494,12 @@ class StreamingACT(nn.Module):
             "routing_logits": routing_logits,
             "routing_weights": routing_weights,
             "routing_distribution": routing_distribution,
+            "routing_weights_zero_signature": zero_signature_routing_weights,
+            "routing_delta_from_zero_signature": routing_weights - zero_signature_routing_weights,
             "write_base": write_base,
             "candidate": candidate,
             "gate": gate,
+            "write_strength": write_strength.squeeze(-1),
             "readout_context": readout_context,
             "readout_logits": readout_logits,
             "readout_weights": readout_weights,
@@ -1204,15 +1552,15 @@ class StreamingACT(nn.Module):
         self,
         *,
         routing_distribution_sum: Tensor | None,
+        routing_entropy_sum: Tensor | None,
         consistency_loss_sum: Tensor | None,
         valid_step_count: Tensor | None,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> dict[str, Tensor]:
         aux_losses: dict[str, Tensor] = {}
         if valid_step_count is None:
             return aux_losses
-        valid_step_count = valid_step_count.clamp_min(1.0)
+        valid_step_count = valid_step_count.float().clamp_min(1.0)
         if (
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_balance_loss_coef > 0.0
@@ -1222,12 +1570,10 @@ class StreamingACT(nn.Module):
                     "Missing routing distribution statistics for slot-memory "
                     "balance loss."
                 )
-            average_routing = routing_distribution_sum / valid_step_count
-            uniform = torch.full(
-                average_routing.shape,
+            average_routing = routing_distribution_sum.float() / valid_step_count
+            uniform = torch.full_like(
+                average_routing,
                 fill_value=1.0 / float(self.active_memory_num_slots),
-                device=device,
-                dtype=dtype,
             )
             aux_losses["slot_memory_balance_loss"] = F.mse_loss(
                 average_routing,
@@ -1236,13 +1582,34 @@ class StreamingACT(nn.Module):
             )
         if (
             self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_entropy_loss_coef > 0.0
+        ):
+            if routing_entropy_sum is None:
+                raise RuntimeError(
+                    "Missing routing entropy statistics for slot-memory entropy loss."
+                )
+            max_entropy = math.log(float(max(1, self.active_memory_num_slots)))
+            if max_entropy <= 0.0:
+                aux_losses["slot_memory_entropy_loss"] = torch.zeros(
+                    (),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            else:
+                aux_losses["slot_memory_entropy_loss"] = (
+                    routing_entropy_sum.float() / valid_step_count
+                ) / max_entropy
+        if (
+            self.use_signature_indexed_slot_memory
             and self.config.slot_memory_consistency_loss_coef > 0.0
         ):
             if consistency_loss_sum is None:
                 raise RuntimeError(
                     "Missing readout/write statistics for slot-memory consistency loss."
                 )
-            aux_losses["slot_memory_consistency_loss"] = consistency_loss_sum / valid_step_count
+            aux_losses["slot_memory_consistency_loss"] = (
+                consistency_loss_sum.float() / valid_step_count
+            )
         return aux_losses
 
     def _scan_visual_prefix_memory(
@@ -1298,13 +1665,56 @@ class StreamingACT(nn.Module):
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_balance_loss_coef > 0.0
         )
+        need_entropy_loss = (
+            self.use_signature_indexed_slot_memory
+            and self.config.slot_memory_entropy_loss_coef > 0.0
+        )
         need_consistency_loss = (
             self.use_signature_indexed_slot_memory
             and self.config.slot_memory_consistency_loss_coef > 0.0
         )
         routing_distribution_sum = None
+        routing_entropy_sum = None
         consistency_loss_sum = None
         valid_step_count = None
+        collect_slot_metrics = self.use_signature_indexed_slot_memory
+        metric_valid_count = None
+        metric_routing_weight_sum = None
+        metric_routing_distribution_sum = None
+        metric_readout_weight_sum = None
+        metric_write_strength_sum = None
+        metric_routing_entropy_sum = None
+        metric_routing_max_sum = None
+        metric_routing_std_sum = None
+        metric_readout_entropy_sum = None
+        metric_routing_delta_abs_sum = None
+        if collect_slot_metrics:
+            metric_device = hidden.device
+            metric_slot_shape = (self.active_memory_num_slots,)
+            metric_valid_count = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_routing_weight_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_routing_distribution_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_readout_weight_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_write_strength_sum = torch.zeros(
+                metric_slot_shape, device=metric_device, dtype=torch.float32
+            )
+            metric_routing_entropy_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
+            metric_routing_max_sum = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_routing_std_sum = torch.zeros((), device=metric_device, dtype=torch.float32)
+            metric_readout_entropy_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
+            metric_routing_delta_abs_sum = torch.zeros(
+                (), device=metric_device, dtype=torch.float32
+            )
         for step_idx in range(time_steps):
             hidden, step_stats = self._update_visual_prefix_memory_step(
                 memory_prev=hidden,
@@ -1321,7 +1731,7 @@ class StreamingACT(nn.Module):
                 valid_t=prefix_mask[:, step_idx],
             )
             if need_balance_loss:
-                step_distribution = step_stats["routing_distribution"]
+                step_distribution = step_stats["routing_distribution"].float()
                 masked_distribution = (
                     step_distribution
                     * prefix_mask[:, step_idx].to(step_distribution.dtype).unsqueeze(-1)
@@ -1331,14 +1741,71 @@ class StreamingACT(nn.Module):
                     routing_distribution_sum = step_distribution_sum
                 else:
                     routing_distribution_sum = routing_distribution_sum + step_distribution_sum
+            if need_entropy_loss:
+                step_entropy = self._categorical_entropy_from_probabilities(
+                    step_stats["routing_distribution"]
+                )
+                masked_step_entropy = (
+                    step_entropy * prefix_mask[:, step_idx].to(step_entropy.dtype)
+                ).sum()
+                if routing_entropy_sum is None:
+                    routing_entropy_sum = masked_step_entropy
+                else:
+                    routing_entropy_sum = routing_entropy_sum + masked_step_entropy
+            if collect_slot_metrics:
+                metric_mask = prefix_mask[:, step_idx].to(dtype=torch.float32)
+                metric_mask_2d = metric_mask.unsqueeze(-1)
+                metric_valid_count = metric_valid_count + metric_mask.sum()
+
+                routing_weights = step_stats["routing_weights"].detach().float()
+                routing_distribution = step_stats["routing_distribution"].detach().float()
+                readout_weights = step_stats["readout_weights"].detach().float()
+                write_strength = step_stats["write_strength"].detach().float()
+
+                metric_routing_weight_sum = metric_routing_weight_sum + (
+                    routing_weights * metric_mask_2d
+                ).sum(dim=0)
+                metric_routing_distribution_sum = metric_routing_distribution_sum + (
+                    routing_distribution * metric_mask_2d
+                ).sum(dim=0)
+                metric_readout_weight_sum = metric_readout_weight_sum + (
+                    readout_weights * metric_mask_2d
+                ).sum(dim=0)
+                metric_write_strength_sum = metric_write_strength_sum + (
+                    write_strength * metric_mask_2d
+                ).sum(dim=0)
+
+                routing_entropy = self._categorical_entropy_from_probabilities(
+                    routing_distribution
+                )
+                readout_entropy = self._categorical_entropy_from_probabilities(
+                    readout_weights
+                )
+                metric_routing_entropy_sum = metric_routing_entropy_sum + (
+                    routing_entropy * metric_mask
+                ).sum()
+                metric_routing_max_sum = metric_routing_max_sum + (
+                    routing_weights.max(dim=-1).values * metric_mask
+                ).sum()
+                metric_routing_std_sum = metric_routing_std_sum + (
+                    routing_weights.std(dim=-1, unbiased=False) * metric_mask
+                ).sum()
+                metric_readout_entropy_sum = metric_readout_entropy_sum + (
+                    readout_entropy * metric_mask
+                ).sum()
+                if "routing_weights_zero_signature" in step_stats:
+                    zero_routing_weights = (
+                        step_stats["routing_weights_zero_signature"].detach().float()
+                    )
+                    metric_routing_delta_abs_sum = metric_routing_delta_abs_sum + (
+                        (routing_weights - zero_routing_weights).abs().mean(dim=-1)
+                        * metric_mask
+                    ).sum()
             if need_consistency_loss:
-                readout_context = step_stats["readout_context"]
-                write_base = step_stats["write_base"]
-                step_consistency = F.mse_loss(
-                    readout_context,
-                    write_base,
-                    reduction="none",
-                ).mean(dim=-1)
+                step_consistency = self._bounded_slot_memory_consistency_loss(
+                    step_stats["readout_context"],
+                    step_stats["write_base"],
+                )
                 masked_step_consistency = (
                     step_consistency * prefix_mask[:, step_idx].to(step_consistency.dtype)
                 ).sum()
@@ -1346,19 +1813,78 @@ class StreamingACT(nn.Module):
                     consistency_loss_sum = masked_step_consistency
                 else:
                     consistency_loss_sum = consistency_loss_sum + masked_step_consistency
-            if need_balance_loss or need_consistency_loss:
-                step_valid_count = prefix_mask[:, step_idx].to(hidden.dtype).sum()
+            if need_balance_loss or need_entropy_loss or need_consistency_loss:
+                step_valid_count = prefix_mask[:, step_idx].to(torch.float32).sum()
                 if valid_step_count is None:
                     valid_step_count = step_valid_count
                 else:
                     valid_step_count = valid_step_count + step_valid_count
         aux_losses = self._build_visual_prefix_memory_aux_losses(
             routing_distribution_sum=routing_distribution_sum,
+            routing_entropy_sum=routing_entropy_sum,
             consistency_loss_sum=consistency_loss_sum,
             valid_step_count=valid_step_count,
             device=hidden.device,
-            dtype=hidden.dtype,
         )
+        if collect_slot_metrics:
+            assert metric_valid_count is not None
+            metric_denom = metric_valid_count.clamp_min(1.0)
+            max_entropy = math.log(float(max(1, self.active_memory_num_slots)))
+            routing_entropy = metric_routing_entropy_sum / metric_denom
+            readout_entropy = metric_readout_entropy_sum / metric_denom
+            log_stats: dict[str, float] = {
+                "slot_memory/valid_prefix_steps": float(
+                    metric_valid_count.detach().cpu().item()
+                ),
+                "slot_memory/routing_entropy": float(
+                    routing_entropy.detach().cpu().item()
+                ),
+                "slot_memory/routing_max": float(
+                    (metric_routing_max_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/routing_std": float(
+                    (metric_routing_std_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/routing_delta_from_zero_abs_mean": float(
+                    (metric_routing_delta_abs_sum / metric_denom).detach().cpu().item()
+                ),
+                "slot_memory/readout_entropy": float(
+                    readout_entropy.detach().cpu().item()
+                ),
+                "slot_memory/write_strength_mean": float(
+                    (metric_write_strength_sum.sum() / metric_denom)
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                "slot_memory/memory_final_slot_std": self._debug_slot_std(hidden),
+            }
+            if max_entropy > 0.0:
+                log_stats["slot_memory/routing_entropy_normalized"] = float(
+                    (routing_entropy / max_entropy).detach().cpu().item()
+                )
+                log_stats["slot_memory/readout_entropy_normalized"] = float(
+                    (readout_entropy / max_entropy).detach().cpu().item()
+                )
+
+            routing_weight_mean = metric_routing_weight_sum / metric_denom
+            routing_distribution_mean = metric_routing_distribution_sum / metric_denom
+            readout_weight_mean = metric_readout_weight_sum / metric_denom
+            write_strength_mean = metric_write_strength_sum / metric_denom
+            for slot_idx in range(int(self.active_memory_num_slots)):
+                log_stats[f"slot_memory/routing_weight/slot_{slot_idx}"] = float(
+                    routing_weight_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/routing_distribution/slot_{slot_idx}"] = float(
+                    routing_distribution_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/readout_weight/slot_{slot_idx}"] = float(
+                    readout_weight_mean[slot_idx].detach().cpu().item()
+                )
+                log_stats[f"slot_memory/write_strength/slot_{slot_idx}"] = float(
+                    write_strength_mean[slot_idx].detach().cpu().item()
+                )
+            self._last_visual_prefix_memory_log_stats = log_stats
         return hidden, aux_losses
 
     def _compute_visual_prefix_memory_context(
@@ -1429,6 +1955,7 @@ class StreamingACT(nn.Module):
         )
         gamma, beta = film_params.chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
         target_tokens = encoder_tokens[exclude_prefix_tokens:]
         conditioned = target_tokens * (1.0 + gamma.unsqueeze(0)) + beta.unsqueeze(0)
         if exclude_prefix_tokens == 0:
@@ -1438,7 +1965,7 @@ class StreamingACT(nn.Module):
     def _compute_visual_prefix_memory_token_from_prefix_sequence(
         self,
         batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, Tensor]]:
+    ) -> tuple[Tensor, dict[str, Tensor], tuple[Tensor, Tensor] | None]:
         assert PREFIX_STATE_KEY in batch, (
             f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
         )
@@ -1448,8 +1975,16 @@ class StreamingACT(nn.Module):
         prefix_camera_images = [
             batch[prefix_image_key] for prefix_image_key in self.config.prefix_image_features
         ]
-        visual_embeddings = self._encode_multi_camera_images_for_visual_prefix_memory(
-            prefix_camera_images
+        (
+            visual_embeddings,
+            current_observation_tokens,
+        ) = self._encode_multi_camera_prefix_images_for_visual_prefix_memory(
+            prefix_camera_images,
+            prefix_mask=batch[PREFIX_MASK_KEY],
+            reuse_current_observation_tokens=(
+                bool(self.config.visual_observation_features)
+                and self._prefix_images_match_observation_camera_order()
+            ),
         )
         state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
         signature_embeddings = None
@@ -1490,7 +2025,7 @@ class StreamingACT(nn.Module):
             delta_signature_embeddings=delta_signature_embeddings,
             prefix_mask=batch[PREFIX_MASK_KEY],
         )
-        return memory_state, aux_losses
+        return memory_state, aux_losses, current_observation_tokens
 
     def compute_online_visual_prefix_memory_token(
         self,
@@ -1559,7 +2094,7 @@ class StreamingACT(nn.Module):
                     batch[DELTA_SIGNATURE_KEY],
                     context="Current delta signature",
                 )
-        next_state, _ = self._update_visual_prefix_memory_step(
+        next_state, step_stats = self._update_visual_prefix_memory_step(
             memory_prev=hidden,
             visual_t=visual_embedding,
             state_t=state_embedding,
@@ -1571,7 +2106,32 @@ class StreamingACT(nn.Module):
                 device=visual_embedding.device,
             ),
         )
+        self._record_visual_prefix_memory_step_debug(
+            memory_prev=hidden,
+            memory_next=next_state,
+            visual_t=visual_embedding,
+            state_t=state_embedding,
+            signature_t=signature_embedding,
+            delta_signature_t=delta_signature_embedding,
+            step_stats=step_stats,
+        )
         return next_state, next_state
+
+    def get_deploy_debug_snapshot(self) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "decoder_token_layout": dict(self._latest_decoder_token_layout),
+            "slot_memory": dict(self._latest_visual_prefix_memory_step_stats),
+        }
+        if self.decoder.layers:
+            attn_weights = self.decoder.layers[-1].last_cross_attn_weights
+            if attn_weights is not None:
+                attn = attn_weights
+                if attn.ndim == 4:
+                    # (B, heads, decoder_queries, encoder_source_tokens)
+                    attn = attn.mean(dim=1)
+                if attn.ndim == 3 and attn.shape[0] > 0:
+                    snapshot["decoder_cross_attention"] = self._debug_tensor(attn[0])
+        return snapshot
 
     def forward(
         self,
@@ -1612,6 +2172,7 @@ class StreamingACT(nn.Module):
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
         self._last_visual_prefix_memory_aux_losses = {}
+        self._last_visual_prefix_memory_log_stats = {}
         if not skip_prefix_sequence_validation:
             self._validate_prefix_sequence_inputs(batch, batch_size)
 
@@ -1697,11 +2258,13 @@ class StreamingACT(nn.Module):
             anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
 
         visual_prefix_memory_embed = None
+        cached_observation_image_tokens = None
         if self.use_visual_prefix_memory:
             if visual_prefix_memory_token is None:
                 (
                     visual_prefix_memory_embed,
                     self._last_visual_prefix_memory_aux_losses,
+                    cached_observation_image_tokens,
                 ) = self._compute_visual_prefix_memory_token_from_prefix_sequence(batch)
             else:
                 if visual_prefix_memory_token.ndim != 3:
@@ -1770,7 +2333,8 @@ class StreamingACT(nn.Module):
             log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
 
             # Sample the latent with the reparameterization trick.
-            latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+            latent_std = _stable_vae_log_variance(log_sigma_x2).mul(0.5).exp()
+            latent_sample = mu + latent_std.to(dtype=mu.dtype) * torch.randn_like(mu)
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
@@ -1790,13 +2354,17 @@ class StreamingACT(nn.Module):
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        encoder_1d_token_count = len(encoder_in_tokens)
 
         image_token_seq = None
         image_pos_seq = None
         if self.config.visual_observation_features:
-            image_token_seq, image_pos_seq = self._encode_multi_camera_observation_tokens(
-                batch[OBS_IMAGES]
-            )
+            if cached_observation_image_tokens is None:
+                image_token_seq, image_pos_seq = self._encode_multi_camera_observation_tokens(
+                    batch[OBS_IMAGES]
+                )
+            else:
+                image_token_seq, image_pos_seq = cached_observation_image_tokens
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
@@ -1835,6 +2403,7 @@ class StreamingACT(nn.Module):
 
         extra_memory_tokens = []
         extra_memory_pos_embed = []
+        extra_memory_token_labels: list[str] = []
         # Decoder cross-attention memory order:
         # [anchor?, signature?, delta_signature?, prefix_memory_slots?, encoder_tokens...].
         # These extra 1D tokens intentionally use zero positional embeddings; token type
@@ -1850,6 +2419,7 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(anchor_token)
             extra_memory_pos_embed.append(anchor_pos_embed)
+            extra_memory_token_labels.append("anchor")
         if self.use_path_signature:
             signature_token = signature_embed.transpose(0, 1).to(
                 device=encoder_out.device, dtype=encoder_out.dtype
@@ -1861,6 +2431,7 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(signature_token)
             extra_memory_pos_embed.append(signature_pos_embed)
+            extra_memory_token_labels.append("path_signature")
         if self.use_delta_signature:
             assert delta_signature_embed is not None
             delta_signature_token = delta_signature_embed.transpose(0, 1).to(
@@ -1874,9 +2445,13 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(delta_signature_token)
             extra_memory_pos_embed.append(delta_signature_pos_embed)
+            extra_memory_token_labels.append("delta_signature")
         if self.use_visual_prefix_memory:
             assert visual_prefix_memory_embed is not None
-            visual_prefix_memory_token = visual_prefix_memory_embed.transpose(0, 1).to(
+            visual_prefix_memory_for_decoder = self._memory_with_slot_identity(
+                visual_prefix_memory_embed
+            )
+            visual_prefix_memory_token = visual_prefix_memory_for_decoder.transpose(0, 1).to(
                 device=encoder_out.device,
                 dtype=encoder_out.dtype,
             )
@@ -1887,6 +2462,10 @@ class StreamingACT(nn.Module):
             )
             extra_memory_tokens.append(visual_prefix_memory_token)
             extra_memory_pos_embed.append(visual_prefix_memory_pos_embed)
+            extra_memory_token_labels.extend(
+                f"memory_slot_{slot_idx}"
+                for slot_idx in range(int(self.active_memory_num_slots))
+            )
 
         if extra_memory_tokens:
             # Extra non-image context tokens are injected into encoder memory before decoder cross-attention.
@@ -1896,6 +2475,24 @@ class StreamingACT(nn.Module):
                 "Encoder token length and positional embedding length must match after "
                 "extra memory token injection."
             )
+
+        image_layout = dict(self._latest_observation_image_token_layout)
+        num_cameras = int(image_layout.get("num_cameras", 0) or 0)
+        feature_h = int(image_layout.get("feature_h", 0) or 0)
+        feature_w = int(image_layout.get("feature_w", 0) or 0)
+        image_token_count = num_cameras * feature_h * feature_w
+        self._latest_decoder_token_layout = {
+            "extra_memory_token_labels": list(extra_memory_token_labels),
+            "extra_memory_token_count": int(len(extra_memory_token_labels)),
+            "encoder_1d_token_count": int(encoder_1d_token_count),
+            "image_token_start": int(len(extra_memory_token_labels) + encoder_1d_token_count),
+            "image_token_count": int(image_token_count),
+            "camera_keys": list(image_layout.get("camera_keys", [])),
+            "num_cameras": int(num_cameras),
+            "feature_h": int(feature_h),
+            "feature_w": int(feature_w),
+            "source_token_count": int(encoder_out.shape[0]),
+        }
 
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
@@ -2019,6 +2616,7 @@ class StreamingACTDecoderLayer(nn.Module):
 
         self.activation = get_activation_fn(config.feedforward_activation)
         self.pre_norm = config.pre_norm
+        self.last_cross_attn_weights: Tensor | None = None
 
     def maybe_add_pos_embed(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
         return tensor if pos_embed is None else tensor + pos_embed
@@ -2052,11 +2650,17 @@ class StreamingACTDecoderLayer(nn.Module):
         else:
             x = self.norm1(x)
             skip = x
-        x = self.multihead_attn(
+        need_cross_attn_weights = not self.training
+        x, cross_attn_weights = self.multihead_attn(
             query=self.maybe_add_pos_embed(x, decoder_pos_embed),
             key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
             value=encoder_out,
-        )[0]  # select just the output, not the attention weights
+            need_weights=need_cross_attn_weights,
+            average_attn_weights=True,
+        )
+        self.last_cross_attn_weights = (
+            None if cross_attn_weights is None else cross_attn_weights.detach()
+        )
         x = skip + self.dropout2(x)
         if self.pre_norm:
             skip = x

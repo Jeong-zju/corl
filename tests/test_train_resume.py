@@ -6,11 +6,20 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
 from policy_defaults import load_policy_mode_defaults_for_dataset
-from train_policy import parse_args, resolve_resume_run_state, resolve_train_run_stamp
+from train_policy import (
+    fresh_distributed_output_marker_matches,
+    parse_args,
+    register_lerobot_fresh_distributed_output_reservation,
+    reserve_fresh_distributed_output_dir,
+    resolve_resume_run_state,
+    resolve_train_run_stamp,
+)
 
 
 def _make_resumable_checkpoint(checkpoint_dir: Path, *, step: int) -> Path:
@@ -131,3 +140,108 @@ def test_resolve_train_run_stamp_falls_back_to_now(monkeypatch) -> None:
         resolve_train_run_stamp(now=dt.datetime(2026, 4, 17, 12, 34, 56))
         == "20260417_123456"
     )
+
+
+def test_reserve_fresh_distributed_output_dir_main_creates_marker(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "outputs" / "train" / "demo" / "20260417_123456"
+
+    reservation = reserve_fresh_distributed_output_dir(
+        output_dir=output_dir,
+        launch_id="launch-1",
+        run_stamp="20260417_123456",
+        world_size=4,
+        is_main_process=True,
+    )
+
+    assert reservation is not None
+    assert reservation.output_dir == output_dir.resolve()
+    assert reservation.marker_path.is_file()
+    assert fresh_distributed_output_marker_matches(
+        output_dir,
+        launch_id="launch-1",
+    )
+
+
+def test_reserve_fresh_distributed_output_dir_rejects_preexisting_run(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "outputs" / "train" / "demo" / "20260417_123456"
+    output_dir.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="already exists before"):
+        reserve_fresh_distributed_output_dir(
+            output_dir=output_dir,
+            launch_id="launch-1",
+            run_stamp="20260417_123456",
+            world_size=4,
+            is_main_process=True,
+        )
+
+
+def test_reserve_fresh_distributed_output_dir_rejects_stale_marker(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "outputs" / "train" / "demo" / "20260417_123456"
+    reserve_fresh_distributed_output_dir(
+        output_dir=output_dir,
+        launch_id="launch-1",
+        run_stamp="20260417_123456",
+        world_size=4,
+        is_main_process=True,
+    )
+
+    with pytest.raises(FileExistsError, match="already exists before"):
+        reserve_fresh_distributed_output_dir(
+            output_dir=output_dir,
+            launch_id="launch-1",
+            run_stamp="20260417_123456",
+            world_size=4,
+            is_main_process=True,
+        )
+
+
+def test_lerobot_validate_patch_allows_reserved_fresh_distributed_dir(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "outputs" / "train" / "demo" / "20260417_123456"
+    reservation = reserve_fresh_distributed_output_dir(
+        output_dir=output_dir,
+        launch_id="launch-1",
+        run_stamp="20260417_123456",
+        world_size=4,
+        is_main_process=True,
+    )
+
+    class DummyTrainPipelineConfig:
+        def __init__(self, output_dir: Path) -> None:
+            self.output_dir = output_dir
+            self.resume = False
+            self.validate_resume_values: list[bool] = []
+            self.validate_output_dir_types: list[type] = []
+
+        def validate(self) -> str:
+            self.validate_resume_values.append(bool(self.resume))
+            self.validate_output_dir_types.append(type(self.output_dir))
+            if self.resume:
+                raise ValueError("A config_path is expected when resuming a run.")
+            if (
+                isinstance(self.output_dir, Path)
+                and self.output_dir.is_dir()
+                and not self.resume
+            ):
+                raise FileExistsError(f"Output directory {self.output_dir} exists")
+            return "validated"
+
+    register_lerobot_fresh_distributed_output_reservation(
+        DummyTrainPipelineConfig,
+        reservation,
+    )
+    cfg = DummyTrainPipelineConfig(output_dir)
+
+    assert cfg.validate() == "validated"
+    assert cfg.output_dir == output_dir
+    assert cfg.resume is False
+    assert cfg.validate_resume_values == [False]
+    assert cfg.validate_output_dir_types == [str]

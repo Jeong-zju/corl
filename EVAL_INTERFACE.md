@@ -35,6 +35,36 @@
 - `--split-seed`
 - `--shuffle-split-episodes` / `--preserve-split-order`
 
+可选视觉 debug 导出：
+
+- `--save-debug-videos`: 在离线数据集评估时额外保存 deploy 风格 debug 视频。
+- `--debug-video-fps`: debug 视频帧率。
+- `--debug-video-max-episodes`: 只为前 N 个被评估 episode 导出 debug 视频，指标仍会覆盖全部 episode。
+- `--debug-attention-query-step`: attention overlay 使用的 decoder query step。
+- `--debug-overlay-alpha`: attention 热力图叠加透明度。
+
+开启后，每个 episode 会输出三段 mp4：
+
+- `attention`: 三路视觉画面上叠加 decoder cross-attention heatmap。
+- `slot_memory`: signature-indexed slot memory 的 routing / baseline routing / signature-caused delta / write/read weights。
+- `signature`: 当前 path signature 与数据集分布统计对比。
+
+示例：
+
+```bash
+./bash/eval_policy.sh \
+  --policy streaming_act \
+  --dataset zeno-ai/CleanTableTopDelayedToolChoice \
+  --policy-path <ckpt_dir> \
+  --eval-split train \
+  --max-episodes 2 \
+  --n-action-steps 1 \
+  --save-debug-videos
+```
+
+视频会写到 `--output-dir/debug_videos/`，索引写到 `--output-dir/debug_videos.json`。
+如果数据集的 `meta/stats.json` 里没有 `observation.path_signature` 统计，signature 视频仍会显示当前 signature，但不会显示分布带。
+
 ### 1.2 在线环境 rollout 评估
 
 适用于 simulator rollout / success-rate eval：

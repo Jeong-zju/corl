@@ -1,8 +1,8 @@
 dataset:
-  data_root: data/zeno-ai/mem-21
+  data_root: data/zeno-ai/mem-book-merge
   output_dir: data/zeno-ai
-  output_name: CleanTableTopDelayedToolChoice
-  task_label: pick
+  output_name: BookOriginRelocation
+  task_label: "pick and place"
   robot_type: zeno
   bag_glob: "*.bag"
   overwrite_output: true

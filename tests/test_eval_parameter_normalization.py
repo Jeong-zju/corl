@@ -246,3 +246,27 @@ def test_configure_streaming_act_eval_runtime_rejects_negative_temporal_ensemble
             requested_n_action_steps=100,
             requested_temporal_ensemble_coeff=-0.01,
         )
+
+
+def test_parse_args_accepts_dataset_debug_video_options() -> None:
+    args = parse_args(
+        [
+            "--policy",
+            "streaming_act",
+            "--save-debug-videos",
+            "--debug-video-fps",
+            "12",
+            "--debug-video-max-episodes",
+            "3",
+            "--debug-attention-query-step",
+            "2",
+            "--debug-overlay-alpha",
+            "0.3",
+        ]
+    )
+
+    assert args.save_debug_videos is True
+    assert args.debug_video_fps == 12
+    assert args.debug_video_max_episodes == 3
+    assert args.debug_attention_query_step == 2
+    assert args.debug_overlay_alpha == 0.3

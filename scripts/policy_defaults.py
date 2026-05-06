@@ -348,6 +348,27 @@ def load_policy_mode_defaults_for_cli(
     return mode_defaults, path
 
 
+def load_policy_mode_defaults_from_path(
+    mode: str,
+    path: str | Path,
+) -> tuple[dict[str, Any], Path]:
+    resolved_path = Path(path).expanduser()
+    if not resolved_path.is_absolute():
+        resolved_path = (PROJECT_ROOT / resolved_path).resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Policy defaults file not found: {resolved_path}")
+
+    data = _load_yaml_mapping(resolved_path)
+    mode_defaults = data.get(mode, {})
+    if mode_defaults is None:
+        mode_defaults = {}
+    if not isinstance(mode_defaults, dict):
+        raise TypeError(
+            f"Expected mapping for '{mode}' section in defaults file: {resolved_path}"
+        )
+    return mode_defaults, resolved_path
+
+
 def load_policy_mode_defaults(
     mode: str,
     env_name: str,

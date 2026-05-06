@@ -804,7 +804,7 @@ class DiffusionModel(nn.Module):
             ],
             dim=-1,
         )
-        candidate = self.slot_memory_candidate_proj(slot_state_input)
+        candidate = torch.tanh(self.slot_memory_candidate_proj(slot_state_input))
         gate = torch.sigmoid(self.slot_memory_gate_proj(slot_state_input))
         updated_hidden = memory_prev + routing_weights.unsqueeze(-1) * gate * (candidate - memory_prev)
 

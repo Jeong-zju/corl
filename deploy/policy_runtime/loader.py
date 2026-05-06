@@ -14,6 +14,10 @@ if str(DEPLOY_ROOT) not in sys.path:
 
 from common import ensure_runtime_paths
 from config import DeployConfig, PolicyConfig
+from gripper_hysteresis import (
+    GripperHysteresis,
+    complete_gripper_hysteresis_config_from_dataset_stats,
+)
 from policy_runtime.preprocess import (
     build_raw_policy_observation,
     finalize_preprocessed_observation,
@@ -29,6 +33,7 @@ from eval_helpers import (  # noqa: E402
     load_streaming_act_config_from_pretrained_dir,
     resolve_policy_dir,
 )
+from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
 
 def apply_deploy_policy_overrides(
@@ -57,6 +62,14 @@ def apply_deploy_policy_overrides(
     return temporal_ensemble_coeff, temporal_ensemble_enabled
 
 
+def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
+    split_path = find_dataset_split_file(policy_dir)
+    if split_path is None:
+        return None
+    split_spec = load_dataset_split(split_path)
+    return Path(split_spec.dataset_root).expanduser().resolve()
+
+
 class PolicyRuntime:
     def __init__(self, config: DeployConfig) -> None:
         self.deploy_config = config
@@ -65,6 +78,7 @@ class PolicyRuntime:
         self.cfg = None
         self.preprocessor = None
         self.postprocessor = None
+        self.gripper_hysteresis: GripperHysteresis | None = None
         self.state_key = config.policy.state_key
         self.action_key = config.policy.action_key
         self.visual_keys = list(config.policy.image_keys.values())
@@ -161,10 +175,34 @@ class PolicyRuntime:
         self._supports_action_chunk_prediction = hasattr(policy, "predict_action_chunk")
         self._open_loop_action_queue.clear()
 
+        if self.deploy_config.gripper_hysteresis.enabled:
+            gripper_config = self.deploy_config.gripper_hysteresis
+            if (
+                not gripper_config.closed_values
+                or not gripper_config.open_values
+                or not gripper_config.close_thresholds
+                or not gripper_config.open_thresholds
+            ):
+                dataset_root = _resolve_training_dataset_root(self.policy_dir)
+                if dataset_root is None:
+                    raise ValueError(
+                        "`gripper_hysteresis` is enabled, but deploy could not find "
+                        "dataset_split.json near the policy path. Provide explicit "
+                        "closed/open values and thresholds in the deploy YAML."
+                    )
+                gripper_config = complete_gripper_hysteresis_config_from_dataset_stats(
+                    gripper_config,
+                    dataset_root=dataset_root,
+                    action_key=self.action_key,
+                )
+            self.gripper_hysteresis = GripperHysteresis(gripper_config)
+
     def reset(self) -> None:
         self._open_loop_action_queue.clear()
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
+        if self.gripper_hysteresis is not None:
+            self.gripper_hysteresis.reset()
 
     @property
     def execution_summary(self) -> str:
@@ -176,6 +214,39 @@ class PolicyRuntime:
             else int(getattr(self.cfg, "n_action_steps", 1))
         )
         return f"open_loop(n_action_steps={n_action_steps})"
+
+    @staticmethod
+    def _debug_to_numpy(value: Any) -> Any:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        if isinstance(value, dict):
+            return {
+                str(key): PolicyRuntime._debug_to_numpy(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [PolicyRuntime._debug_to_numpy(item) for item in value]
+        return value
+
+    def _collect_debug_snapshot(self) -> dict[str, Any]:
+        getter = getattr(self.policy, "get_deploy_debug_snapshot", None)
+        if not callable(getter):
+            return {}
+        return {"debug": self._debug_to_numpy(getter())}
+
+    def _apply_action_filters(
+        self,
+        action: np.ndarray,
+        observation_packet: dict[str, Any],
+    ) -> np.ndarray:
+        if self.gripper_hysteresis is not None:
+            action = self.gripper_hysteresis.apply(
+                action,
+                current_state=observation_packet.get("state"),
+            )
+        return np.asarray(action, dtype=np.float32).reshape(-1)
 
     def _preprocess_observation(self, observation_packet: dict[str, Any]) -> dict[str, Any]:
         raw_obs = build_raw_policy_observation(observation_packet, self.cfg)
@@ -233,7 +304,32 @@ class PolicyRuntime:
         )
         return scheduled_actions[0], float(runtime_ms)
 
-    def infer(self, observation_packet: dict[str, Any]) -> dict[str, Any]:
+    def _build_inference_result(
+        self,
+        *,
+        action: np.ndarray,
+        observation_packet: dict[str, Any],
+        runtime_ms: float | None,
+        obs_seq: int,
+        message: str,
+        include_debug: bool,
+    ) -> dict[str, Any]:
+        result = {
+            "action": self._apply_action_filters(action, observation_packet),
+            "runtime_ms": None if runtime_ms is None else float(runtime_ms),
+            "obs_seq": int(obs_seq),
+            "message": message,
+        }
+        if include_debug:
+            result.update(self._collect_debug_snapshot())
+        return result
+
+    def infer(
+        self,
+        observation_packet: dict[str, Any],
+        *,
+        collect_debug: bool = False,
+    ) -> dict[str, Any]:
         if self.policy is None or self.cfg is None:
             raise RuntimeError("Policy has not been loaded.")
 
@@ -243,31 +339,37 @@ class PolicyRuntime:
         obs_seq = int(observation_packet.get("seq", 0))
         if not self.temporal_ensemble_enabled and self._open_loop_action_queue:
             action, source_obs_seq = self._open_loop_action_queue.popleft()
-            return {
-                "action": action,
-                "runtime_ms": None,
-                "obs_seq": int(source_obs_seq),
-                "message": "open_loop_cached",
-            }
+            return self._build_inference_result(
+                action=action,
+                observation_packet=observation_packet,
+                runtime_ms=None,
+                obs_seq=source_obs_seq,
+                message="open_loop_cached",
+                include_debug=False,
+            )
 
         obs = self._preprocess_observation(observation_packet)
         if not self.temporal_ensemble_enabled and self._supports_action_chunk_prediction:
             action, runtime_ms = self._run_open_loop_chunk(obs, obs_seq=obs_seq)
-            return {
-                "action": action,
-                "runtime_ms": runtime_ms,
-                "obs_seq": obs_seq,
-                "message": "open_loop_predict",
-            }
+            return self._build_inference_result(
+                action=action,
+                observation_packet=observation_packet,
+                runtime_ms=runtime_ms,
+                obs_seq=obs_seq,
+                message="open_loop_predict",
+                include_debug=collect_debug,
+            )
 
         action, runtime_ms = self._run_select_action(obs)
-        return {
-            "action": action,
-            "runtime_ms": float(runtime_ms),
-            "obs_seq": obs_seq,
-            "message": (
+        return self._build_inference_result(
+            action=action,
+            observation_packet=observation_packet,
+            runtime_ms=runtime_ms,
+            obs_seq=obs_seq,
+            message=(
                 "temporal_ensemble"
                 if self.temporal_ensemble_enabled
                 else "policy_eval"
             ),
-        }
+            include_debug=collect_debug,
+        )

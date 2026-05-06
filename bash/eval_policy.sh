@@ -10,6 +10,7 @@ cd "${REPO_ROOT}"
 #   ./bash/eval_policy.sh --env braidedhub --policy diffusion --policy-path <ckpt_dir>
 #   ./bash/eval_policy.sh --policy act --policy-path <ckpt_dir> --dataset zeno-ai/day3_5_Exp1
 #   ./bash/eval_policy.sh --policy diffusion --policy-path <ckpt_dir> --dataset zeno-ai/day3_5_Exp1_processed
+#   ./bash/eval_policy.sh --policy smolvla --policy-path <ckpt_dir> --dataset zeno-ai/day3_5_Exp1_processed
 #   ./bash/eval_policy.sh --env metaworld --policy act
 #   ./bash/eval_policy.sh --env metaworld --policy streaming_act
 #   ./bash/eval_policy.sh --env robocasa --policy act --dataset robocasa/composite/ArrangeBreadBasket

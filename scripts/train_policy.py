@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,7 +30,10 @@ from dataset_utils import (
     validate_dataset_root,
 )
 from policy_capabilities import policy_supports_signature_features
-from policy_defaults import load_policy_mode_defaults_for_cli
+from policy_defaults import (
+    load_policy_mode_defaults_for_cli,
+    load_policy_mode_defaults_from_path,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -50,7 +54,29 @@ PRETRAINED_MODEL_DIRNAME = "pretrained_model"
 TRAIN_CONFIG_FILENAME = "train_config.json"
 TRAINING_STATE_DIRNAME = "training_state"
 TRAINING_STEP_FILENAME = "training_step.json"
+FRESH_DISTRIBUTED_RUN_MARKER_FILENAME = ".corl_fresh_distributed_run.json"
+FRESH_DISTRIBUTED_RUN_MARKER_VERSION = 1
+FRESH_DISTRIBUTED_RUN_MARKER_WAIT_SECONDS = 120.0
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+POLICY_CHOICES = (
+    "act",
+    "diffusion",
+    "prism_diffusion",
+    "streaming_act",
+    "smolvla",
+    "groot",
+)
+SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
+GROOT_DEFAULT_BASE_MODEL_PATH = "nvidia/GR00T-N1.5-3B"
+GROOT_DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
+GROOT_DEFAULT_ATTN_IMPLEMENTATION = "eager"
+SIGNATURE_FEATURE_KEYS = (
+    PATH_SIGNATURE_FEATURE_KEY,
+    DELTA_SIGNATURE_FEATURE_KEY,
+    PREFIX_PATH_SIGNATURE_FEATURE_KEY,
+    PREFIX_DELTA_SIGNATURE_FEATURE_KEY,
+)
+_IGNORED_DATASET_FEATURE_KEYS: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +86,38 @@ class ResumeRunState:
     pretrained_model_dir: Path
     train_config_path: Path
     split_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class FreshDistributedOutputReservation:
+    output_dir: Path
+    marker_path: Path
+    launch_id: str
+
+
+@dataclass(slots=True)
+class LocalSGDRuntime:
+    enabled: bool
+    sync_every: int
+    warmup_steps: int
+    sync_optimizer_state: bool
+    total_steps: int
+    save_freq: int
+    step: int = 0
+
+
+_FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS: dict[Path, str] = {}
+
+
+def configure_ignored_dataset_feature_keys(feature_keys: tuple[str, ...]) -> None:
+    global _IGNORED_DATASET_FEATURE_KEYS
+    _IGNORED_DATASET_FEATURE_KEYS = tuple(
+        dict.fromkeys(str(key) for key in feature_keys)
+    )
+
+
+def get_ignored_dataset_feature_keys() -> tuple[str, ...]:
+    return _IGNORED_DATASET_FEATURE_KEYS
 
 
 def _sanitize_signature_cache_path_part(value: str) -> str:
@@ -399,6 +457,69 @@ def get_signature_cache_only_feature_keys(info: dict | None) -> set[str]:
     return keys
 
 
+def drop_signature_cache_only_features_from_metadata(
+    info: dict,
+    stats: dict,
+    *,
+    keep_keys: tuple[str, ...] = (),
+) -> tuple[dict, dict, tuple[str, ...]]:
+    """Hide cache-only signature features when the active policy does not use them."""
+    cache_only_keys = get_signature_cache_only_feature_keys(info)
+    keep_key_set = set(keep_keys)
+    features = info.get("features", {})
+    if not cache_only_keys or not isinstance(features, dict):
+        return info, stats, ()
+
+    removed_keys = tuple(
+        sorted(
+            key
+            for key in cache_only_keys
+            if key in features and key not in keep_key_set
+        )
+    )
+    if not removed_keys:
+        return info, stats, ()
+
+    for key in removed_keys:
+        features.pop(key, None)
+        stats.pop(key, None)
+
+    for metadata_key in ("path_signature", "delta_signature"):
+        metadata = info.get(metadata_key)
+        if isinstance(metadata, dict) and str(metadata.get("key")) in removed_keys:
+            info.pop(metadata_key, None)
+
+    return info, stats, removed_keys
+
+
+def drop_dataset_features_from_metadata(
+    info: dict,
+    stats: dict,
+    *,
+    feature_keys: tuple[str, ...],
+) -> tuple[dict, dict, tuple[str, ...]]:
+    """Hide feature keys that an active policy should not see."""
+    feature_key_set = set(str(key) for key in feature_keys)
+    features = info.get("features", {})
+    if not feature_key_set or not isinstance(features, dict):
+        return info, stats, ()
+
+    removed_keys = tuple(sorted(key for key in feature_key_set if key in features))
+    if not removed_keys:
+        return info, stats, ()
+
+    for key in removed_keys:
+        features.pop(key, None)
+        stats.pop(key, None)
+
+    for metadata_key in ("path_signature", "delta_signature"):
+        metadata = info.get(metadata_key)
+        if isinstance(metadata, dict) and str(metadata.get("key")) in removed_keys:
+            info.pop(metadata_key, None)
+
+    return info, stats, removed_keys
+
+
 def ensure_streaming_act_importable(project_root: Path) -> None:
     streaming_act_src = (
         project_root / "policy" / "lerobot_policy_streaming_act" / "src"
@@ -419,6 +540,269 @@ def ensure_prism_diffusion_importable(project_root: Path) -> None:
             f"PRISM Diffusion package source not found: {prism_diffusion_src}"
         )
     sys.path.insert(0, str(prism_diffusion_src))
+
+
+def _set_transformers_attention_implementation(config: object, value: str) -> None:
+    """Force attention implementation on a Transformers config and its sub-configs."""
+    for attr_name in (
+        "_attn_implementation",
+        "_attn_implementation_internal",
+        "attn_implementation",
+    ):
+        try:
+            setattr(config, attr_name, value)
+        except Exception:
+            pass
+    for child_name in ("text_config", "vision_config", "backbone_config"):
+        child_config = getattr(config, child_name, None)
+        if child_config is not None:
+            _set_transformers_attention_implementation(child_config, value)
+
+
+def _coerce_groot_beta_concentration(value: object, default: float) -> object:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if getattr(value, "is_meta", False):
+            return torch.tensor(float(default), device="cpu", dtype=torch.float32)
+        if value.numel() == 1:
+            return value.detach().to(device="cpu", dtype=torch.float32)
+        return value.detach().to(device="cpu", dtype=torch.float32)
+
+    try:
+        return torch.tensor(float(value), device="cpu", dtype=torch.float32)
+    except (TypeError, ValueError):
+        return value
+
+
+def install_groot_meta_tensor_compatibility_patch() -> None:
+    """Keep GR00T non-parameter distributions out of Transformers meta init."""
+    from lerobot.policies.groot.action_head import flow_matching_action_head
+
+    if getattr(
+        flow_matching_action_head,
+        "_corl_groot_beta_meta_patch_installed",
+        False,
+    ):
+        return
+
+    original_beta = flow_matching_action_head.Beta
+
+    def beta_with_cpu_scalar_concentrations(
+        concentration1, concentration0, *args, **kwargs
+    ):
+        concentration1 = _coerce_groot_beta_concentration(concentration1, default=1.5)
+        concentration0 = _coerce_groot_beta_concentration(concentration0, default=1.0)
+        return original_beta(concentration1, concentration0, *args, **kwargs)
+
+    flow_matching_action_head.Beta = beta_with_cpu_scalar_concentrations
+    flow_matching_action_head._corl_groot_original_beta = original_beta
+    flow_matching_action_head._corl_groot_beta_meta_patch_installed = True
+
+
+def _ensure_groot_transformers_loading_attrs(model: object) -> None:
+    if not hasattr(model, "all_tied_weights_keys"):
+        try:
+            tied_weights = model.get_expanded_tied_weights_keys(
+                all_submodels=False,
+            )
+        except Exception:
+            tied_weights = {}
+        model.all_tied_weights_keys = tied_weights
+
+    for attr_name in ("_tp_plan", "_ep_plan", "_pp_plan"):
+        if getattr(model, attr_name, None) is None:
+            setattr(model, attr_name, {})
+
+    for attr_name in (
+        "_keep_in_fp32_modules",
+        "_keep_in_fp32_modules_strict",
+        "_no_split_modules",
+    ):
+        value = getattr(model, attr_name, None)
+        if value is None:
+            setattr(model, attr_name, set())
+        elif not isinstance(value, set):
+            try:
+                setattr(model, attr_name, set(value))
+            except TypeError:
+                setattr(model, attr_name, {value})
+
+
+def install_groot_transformers_loading_compatibility_patch() -> None:
+    """Provide newer Transformers post-init attrs missing in LeRobot GR00T."""
+    import lerobot.policies.groot.groot_n1 as groot_n1
+
+    model_cls = groot_n1.GR00TN15
+    if getattr(
+        model_cls,
+        "_corl_groot_transformers_loading_patch_installed",
+        False,
+    ):
+        return
+
+    original_init = model_cls.__init__
+
+    def init_with_transformers_loading_attrs(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _ensure_groot_transformers_loading_attrs(self)
+
+    model_cls.__init__ = init_with_transformers_loading_attrs
+    model_cls._corl_original_init = original_init
+    model_cls._corl_groot_transformers_loading_patch_installed = True
+
+
+def install_groot_processor_tensor_compatibility_patch() -> None:
+    """Keep GR00T Eagle preprocessing tensorized for newer Transformers."""
+    import lerobot.policies.groot.processor_groot as processor_groot
+
+    if not getattr(
+        processor_groot.AutoProcessor,
+        "_corl_groot_regex_patch_installed",
+        False,
+    ):
+        original_from_pretrained = processor_groot.AutoProcessor.from_pretrained
+
+        def from_pretrained_with_mistral_regex_fix(*args, **kwargs):
+            if "fix_mistral_regex" in kwargs:
+                return original_from_pretrained(*args, **kwargs)
+
+            fixed_kwargs = dict(kwargs)
+            fixed_kwargs["fix_mistral_regex"] = True
+            try:
+                return original_from_pretrained(*args, **fixed_kwargs)
+            except (AttributeError, TypeError):
+                return original_from_pretrained(*args, **kwargs)
+
+        processor_groot.AutoProcessor.from_pretrained = staticmethod(
+            from_pretrained_with_mistral_regex_fix
+        )
+        processor_groot.AutoProcessor._corl_groot_original_from_pretrained = (
+            original_from_pretrained
+        )
+        processor_groot.AutoProcessor._corl_groot_regex_patch_installed = True
+
+    if getattr(
+        processor_groot,
+        "_corl_groot_collate_tensor_patch_installed",
+        False,
+    ):
+        return
+
+    original_collate = processor_groot.collate
+
+    def patch_eagle_processor_class(eagle_processor: object) -> None:
+        processor_cls = type(eagle_processor)
+        if getattr(
+            processor_cls,
+            "_corl_groot_replace_media_tensor_patch_installed",
+            False,
+        ):
+            return
+
+        original_replace_media_placeholder = processor_cls.replace_media_placeholder
+
+        def replace_media_placeholder_with_tensor_images(self, *args, **output_kwargs):
+            images_kwargs = dict(output_kwargs.get("images_kwargs") or {})
+            images_kwargs.setdefault("return_tensors", "pt")
+            output_kwargs["images_kwargs"] = images_kwargs
+
+            videos_kwargs = dict(output_kwargs.get("videos_kwargs") or {})
+            videos_kwargs.setdefault("return_tensors", "pt")
+            output_kwargs["videos_kwargs"] = videos_kwargs
+
+            return original_replace_media_placeholder(self, *args, **output_kwargs)
+
+        processor_cls.replace_media_placeholder = (
+            replace_media_placeholder_with_tensor_images
+        )
+        processor_cls._corl_groot_original_replace_media_placeholder = (
+            original_replace_media_placeholder
+        )
+        processor_cls._corl_groot_replace_media_tensor_patch_installed = True
+
+    def collate_with_tensorized_eagle_images(features, eagle_processor):
+        patch_eagle_processor_class(eagle_processor)
+        return original_collate(features, eagle_processor)
+
+    processor_groot.collate = collate_with_tensorized_eagle_images
+    processor_groot._corl_groot_original_collate = original_collate
+    processor_groot._corl_groot_collate_tensor_patch_installed = True
+
+
+def install_groot_attention_implementation_patch(attn_implementation: str) -> None:
+    """Patch LeRobot GR00T Eagle config loading away from unsupported FA2."""
+    resolved_attn_implementation = str(attn_implementation or "").strip()
+    if not resolved_attn_implementation:
+        return
+
+    import lerobot.policies.groot.groot_n1 as groot_n1
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+    from transformers.models.siglip.modeling_siglip import SiglipVisionModel
+
+    def patch_model_init(model_cls: type[object]) -> None:
+        if getattr(
+            model_cls,
+            "_corl_groot_attention_implementation_patch_installed",
+            False,
+        ):
+            model_cls._corl_groot_attention_implementation = resolved_attn_implementation
+            return
+
+        original_init = model_cls.__init__
+
+        def init_with_groot_attention(self, config, *args, **kwargs):
+            implementation = getattr(
+                model_cls,
+                "_corl_groot_attention_implementation",
+                resolved_attn_implementation,
+            )
+            _set_transformers_attention_implementation(config, implementation)
+            return original_init(self, config, *args, **kwargs)
+
+        model_cls.__init__ = init_with_groot_attention
+        model_cls._corl_groot_attention_implementation_patch_installed = True
+        model_cls._corl_original_init = original_init
+        model_cls._corl_groot_attention_implementation = resolved_attn_implementation
+
+    for child_model_cls in (
+        SiglipVisionModel,
+        LlamaForCausalLM,
+        Qwen2ForCausalLM,
+        Qwen3ForCausalLM,
+    ):
+        patch_model_init(child_model_cls)
+
+    auto_model_cls = groot_n1.AutoModel
+    if getattr(
+        auto_model_cls,
+        "_corl_groot_attention_implementation_patch_installed",
+        False,
+    ):
+        auto_model_cls._corl_groot_attention_implementation = resolved_attn_implementation
+        return
+
+    original_from_config = auto_model_cls.from_config
+
+    def from_config_with_groot_attention(config, **kwargs):
+        model_type = str(getattr(config, "model_type", ""))
+        class_name = type(config).__name__
+        if model_type.startswith("eagle") or class_name.startswith("Eagle"):
+            implementation = getattr(
+                auto_model_cls,
+                "_corl_groot_attention_implementation",
+                resolved_attn_implementation,
+            )
+            _set_transformers_attention_implementation(config, implementation)
+            kwargs.setdefault("attn_implementation", implementation)
+        return original_from_config(config, **kwargs)
+
+    auto_model_cls.from_config = staticmethod(from_config_with_groot_attention)
+    auto_model_cls._corl_groot_attention_implementation_patch_installed = True
+    auto_model_cls._corl_original_from_config = original_from_config
+    auto_model_cls._corl_groot_attention_implementation = resolved_attn_implementation
 
 
 def teardown_wandb_safely(exit_code: int) -> None:
@@ -583,6 +967,180 @@ def resolve_train_run_stamp(now: dt.datetime | None = None) -> str:
     return moment.strftime("%Y%m%d_%H%M%S")
 
 
+def resolve_fresh_distributed_launch_id(
+    *,
+    output_dir: Path,
+    run_stamp: str,
+    world_size: int,
+) -> str:
+    explicit_launch_id = os.environ.get("CORL_TRAIN_LAUNCH_ID")
+    if explicit_launch_id:
+        return str(explicit_launch_id)
+
+    shared_env_parts = {
+        "run_stamp": str(run_stamp),
+        "world_size": str(int(world_size)),
+        "output_dir": str(output_dir.resolve(strict=False)),
+        "master_addr": os.environ.get("MASTER_ADDR", ""),
+        "master_port": os.environ.get("MASTER_PORT", ""),
+        "torchelastic_run_id": os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_step_id": os.environ.get("SLURM_STEP_ID", ""),
+    }
+    return "|".join(f"{key}={value}" for key, value in shared_env_parts.items())
+
+
+def _fresh_distributed_output_marker_path(output_dir: Path) -> Path:
+    return output_dir / FRESH_DISTRIBUTED_RUN_MARKER_FILENAME
+
+
+def _read_fresh_distributed_output_marker(
+    marker_path: Path,
+) -> dict[str, object] | None:
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def fresh_distributed_output_marker_matches(
+    output_dir: Path,
+    *,
+    launch_id: str,
+) -> bool:
+    marker = _read_fresh_distributed_output_marker(
+        _fresh_distributed_output_marker_path(output_dir)
+    )
+    return bool(
+        marker is not None
+        and marker.get("version") == FRESH_DISTRIBUTED_RUN_MARKER_VERSION
+        and marker.get("launch_id") == launch_id
+    )
+
+
+def reserve_fresh_distributed_output_dir(
+    *,
+    output_dir: Path,
+    launch_id: str,
+    run_stamp: str,
+    world_size: int,
+    is_main_process: bool,
+    wait_seconds: float = FRESH_DISTRIBUTED_RUN_MARKER_WAIT_SECONDS,
+) -> FreshDistributedOutputReservation | None:
+    if int(world_size) <= 1:
+        return None
+
+    resolved_output_dir = output_dir.resolve(strict=False)
+    marker_path = _fresh_distributed_output_marker_path(resolved_output_dir)
+
+    if is_main_process:
+        try:
+            resolved_output_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "Output directory already exists before this fresh distributed "
+                f"launch: {resolved_output_dir}. Use --resume to continue a "
+                "checkpointed run, or choose a new output root/run stamp for a "
+                "fresh run."
+            ) from exc
+
+        marker_payload = {
+            "version": FRESH_DISTRIBUTED_RUN_MARKER_VERSION,
+            "launch_id": launch_id,
+            "run_stamp": str(run_stamp),
+            "world_size": int(world_size),
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        marker_path.write_text(
+            json.dumps(marker_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    else:
+        deadline = time.monotonic() + float(wait_seconds)
+        while time.monotonic() < deadline:
+            marker = _read_fresh_distributed_output_marker(marker_path)
+            if marker is None:
+                time.sleep(0.2)
+                continue
+            if (
+                marker.get("version") == FRESH_DISTRIBUTED_RUN_MARKER_VERSION
+                and marker.get("launch_id") == launch_id
+            ):
+                break
+            raise FileExistsError(
+                "Output directory was reserved by a different distributed launch: "
+                f"{resolved_output_dir}."
+            )
+        else:
+            raise TimeoutError(
+                "Timed out waiting for the main distributed process to reserve "
+                f"the output directory: {resolved_output_dir}."
+            )
+
+    return FreshDistributedOutputReservation(
+        output_dir=resolved_output_dir,
+        marker_path=marker_path,
+        launch_id=launch_id,
+    )
+
+
+def install_lerobot_fresh_distributed_output_validate_patch(
+    train_pipeline_config_cls: type[object],
+) -> None:
+    if getattr(
+        train_pipeline_config_cls,
+        "_corl_fresh_distributed_output_validate_patch_installed",
+        False,
+    ):
+        return
+
+    original_validate = train_pipeline_config_cls.validate
+
+    def validate_with_fresh_distributed_output_reservation(self) -> object:
+        raw_output_dir = getattr(self, "output_dir", None)
+        if raw_output_dir is not None:
+            output_dir = Path(raw_output_dir).resolve(strict=False)
+            launch_id = _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS.get(output_dir)
+            if (
+                launch_id
+                and not bool(getattr(self, "resume", False))
+                and fresh_distributed_output_marker_matches(
+                    output_dir,
+                    launch_id=launch_id,
+                )
+            ):
+                try:
+                    setattr(self, "output_dir", str(output_dir))
+                    return original_validate(self)
+                finally:
+                    setattr(self, "output_dir", raw_output_dir)
+
+        return original_validate(self)
+
+    train_pipeline_config_cls._corl_original_validate = original_validate
+    train_pipeline_config_cls.validate = (
+        validate_with_fresh_distributed_output_reservation
+    )
+    train_pipeline_config_cls._corl_fresh_distributed_output_validate_patch_installed = (
+        True
+    )
+
+
+def register_lerobot_fresh_distributed_output_reservation(
+    train_pipeline_config_cls: type[object],
+    reservation: FreshDistributedOutputReservation | None,
+) -> None:
+    if reservation is None:
+        return
+    _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS[
+        reservation.output_dir.resolve(strict=False)
+    ] = reservation.launch_id
+    install_lerobot_fresh_distributed_output_validate_patch(train_pipeline_config_cls)
+
+
 def install_torch_dataloader_patch(
     *,
     persistent_workers: bool,
@@ -705,6 +1263,290 @@ def install_episode_aware_sampler_patch() -> None:
     sampler_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
     lerobot_train_module.EpisodeAwareSampler = RelativeEpisodeAwareSampler
     sampler_module._corl_relative_index_patch_installed = True
+
+
+def _local_sgd_no_sync_context(accelerator, policy):
+    no_sync = getattr(accelerator, "no_sync", None)
+    if callable(no_sync):
+        return no_sync(policy)
+
+    no_sync = getattr(policy, "no_sync", None)
+    if callable(no_sync):
+        return no_sync()
+
+    return nullcontext()
+
+
+def _local_sgd_average_dense_tensors(
+    tensors: list,
+    *,
+    world_size: int,
+    bucket_bytes: int = 64 * 1024 * 1024,
+) -> int:
+    import torch
+    import torch.distributed as dist
+
+    averaged_count = 0
+    bucket: list = []
+    bucket_size = 0
+
+    def flush() -> None:
+        nonlocal averaged_count, bucket, bucket_size
+        if not bucket:
+            return
+
+        flat = torch.cat([tensor.detach().reshape(-1) for tensor in bucket])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+
+        offset = 0
+        for tensor in bucket:
+            numel = tensor.numel()
+            tensor.copy_(flat[offset : offset + numel].view_as(tensor))
+            offset += numel
+            averaged_count += 1
+
+        bucket = []
+        bucket_size = 0
+
+    current_key = None
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.numel() == 0 or not tensor.is_floating_point():
+            continue
+
+        tensor_key = (tensor.device, tensor.dtype)
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        if (
+            bucket
+            and (
+                tensor_key != current_key
+                or bucket_size + tensor_bytes > int(bucket_bytes)
+            )
+        ):
+            flush()
+
+        current_key = tensor_key
+        bucket.append(tensor)
+        bucket_size += tensor_bytes
+
+    flush()
+    return averaged_count
+
+
+def _local_sgd_average_model_parameters(policy, accelerator) -> int:
+    import torch
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    world_size = int(dist.get_world_size())
+    if world_size <= 1:
+        return 0
+
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    with torch.no_grad():
+        return _local_sgd_average_dense_tensors(
+            [parameter.data for parameter in unwrapped_policy.parameters()],
+            world_size=world_size,
+        )
+
+
+def _local_sgd_average_optimizer_state(optimizer, accelerator) -> int:
+    import torch
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    world_size = int(dist.get_world_size())
+    if world_size <= 1:
+        return 0
+
+    state_tensors: list = []
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                state_tensors.append(value.data)
+
+    with torch.no_grad():
+        return _local_sgd_average_dense_tensors(
+            state_tensors,
+            world_size=world_size,
+        )
+
+
+def _local_sgd_should_sync_after_step(runtime: LocalSGDRuntime) -> bool:
+    local_step = int(runtime.step)
+    warmup_steps = max(0, int(runtime.warmup_steps))
+    if local_step <= warmup_steps:
+        return False
+
+    local_sgd_step = local_step - warmup_steps
+    sync_every = max(1, int(runtime.sync_every))
+    if local_sgd_step % sync_every == 0:
+        return True
+
+    save_freq = int(runtime.save_freq)
+    if save_freq > 0 and local_step % save_freq == 0:
+        return True
+
+    total_steps = int(runtime.total_steps)
+    return total_steps > 0 and local_step >= total_steps
+
+
+def install_lerobot_local_sgd_update_policy_patch(lerobot_train_module) -> None:
+    if getattr(lerobot_train_module, "_corl_local_sgd_patch_installed", False):
+        return
+
+    original_update_policy = lerobot_train_module.update_policy
+
+    def update_policy_with_local_sgd(
+        train_metrics,
+        policy,
+        batch,
+        optimizer,
+        grad_clip_norm,
+        accelerator,
+        lr_scheduler=None,
+        lock=None,
+        rabc_weights_provider=None,
+    ):
+        import torch
+
+        runtime = getattr(accelerator, "_corl_local_sgd_runtime", None)
+        if (
+            runtime is None
+            or not bool(runtime.enabled)
+            or int(getattr(accelerator, "num_processes", 1)) <= 1
+        ):
+            return original_update_policy(
+                train_metrics,
+                policy,
+                batch,
+                optimizer,
+                grad_clip_norm,
+                accelerator,
+                lr_scheduler=lr_scheduler,
+                lock=lock,
+                rabc_weights_provider=rabc_weights_provider,
+            )
+
+        if int(runtime.step) < max(0, int(runtime.warmup_steps)):
+            train_metrics, output_dict = original_update_policy(
+                train_metrics,
+                policy,
+                batch,
+                optimizer,
+                grad_clip_norm,
+                accelerator,
+                lr_scheduler=lr_scheduler,
+                lock=lock,
+                rabc_weights_provider=rabc_weights_provider,
+            )
+            runtime.step += 1
+            if output_dict is None:
+                output_dict = {}
+            output_dict["local_sgd/sync"] = 0.0
+            output_dict["local_sgd/warmup"] = 1.0
+            return train_metrics, output_dict
+
+        start_time = time.perf_counter()
+        policy.train()
+
+        rabc_batch_weights = None
+        rabc_batch_stats = None
+        if rabc_weights_provider is not None:
+            rabc_batch_weights, rabc_batch_stats = (
+                rabc_weights_provider.compute_batch_weights(batch)
+            )
+
+        with _local_sgd_no_sync_context(accelerator, policy):
+            with accelerator.autocast():
+                if rabc_batch_weights is not None:
+                    per_sample_loss, output_dict = policy.forward(
+                        batch,
+                        reduction="none",
+                    )
+                    epsilon = 1e-6
+                    loss = (per_sample_loss * rabc_batch_weights).sum() / (
+                        rabc_batch_weights.sum() + epsilon
+                    )
+                    output_dict["rabc_mean_weight"] = rabc_batch_stats[
+                        "raw_mean_weight"
+                    ]
+                    output_dict["rabc_num_zero_weight"] = rabc_batch_stats[
+                        "num_zero_weight"
+                    ]
+                    output_dict["rabc_num_full_weight"] = rabc_batch_stats[
+                        "num_full_weight"
+                    ]
+                else:
+                    loss, output_dict = policy.forward(batch)
+
+            accelerator.backward(loss)
+
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(),
+                float("inf"),
+                error_if_nonfinite=False,
+            )
+
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
+        optimizer.zero_grad()
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+        if lerobot_train_module.has_method(unwrapped_policy, "update"):
+            unwrapped_policy.update()
+
+        runtime.step += 1
+        did_sync = False
+        averaged_parameters = 0
+        averaged_optimizer_tensors = 0
+        if _local_sgd_should_sync_after_step(runtime):
+            averaged_parameters = _local_sgd_average_model_parameters(
+                policy,
+                accelerator,
+            )
+            did_sync = averaged_parameters > 0
+            if did_sync and bool(runtime.sync_optimizer_state):
+                averaged_optimizer_tensors = _local_sgd_average_optimizer_state(
+                    optimizer,
+                    accelerator,
+                )
+
+        train_metrics.loss = loss.item()
+        train_metrics.grad_norm = (
+            grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+        )
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.update_s = time.perf_counter() - start_time
+
+        if output_dict is None:
+            output_dict = {}
+        output_dict["local_sgd/sync"] = 1.0 if did_sync else 0.0
+        output_dict["local_sgd/sync_every"] = float(runtime.sync_every)
+        output_dict["local_sgd/averaged_parameters"] = float(averaged_parameters)
+        if bool(runtime.sync_optimizer_state):
+            output_dict["local_sgd/averaged_optimizer_tensors"] = float(
+                averaged_optimizer_tensors
+            )
+        return train_metrics, output_dict
+
+    lerobot_train_module.update_policy = update_policy_with_local_sgd
+    lerobot_train_module._corl_original_update_policy = original_update_policy
+    lerobot_train_module._corl_local_sgd_patch_installed = True
 
 
 def install_lerobot_dataset_load_patch() -> None:
@@ -1062,11 +1904,15 @@ def install_lerobot_dataset_load_patch() -> None:
         start_s = time.perf_counter()
         original_load_metadata(self)
         runtime = get_signature_cache_runtime()
-        if (
+        runtime_reader = (
+            getattr(runtime, "reader", None) if runtime is not None else None
+        )
+        runtime_enabled_for_dataset = (
             runtime is not None
-            and getattr(runtime, "enabled", False)
+            and runtime_reader is not None
             and Path(self.root).resolve() == Path(runtime.dataset_root).resolve()
-        ):
+        )
+        if runtime_enabled_for_dataset:
             cache_metadata = load_signature_cache_metadata(
                 Path(self.root),
                 dataset_repo_id=str(runtime.dataset_repo_id),
@@ -1076,7 +1922,36 @@ def install_lerobot_dataset_load_patch() -> None:
                 info=self.info,
                 stats=self.stats,
                 cache_metadata=cache_metadata,
-                feature_keys=tuple(str(key) for key in runtime.feature_keys),
+                feature_keys=tuple(str(key) for key in runtime_reader.feature_keys),
+            )
+        self.info, self.stats, removed_signature_keys = (
+            drop_signature_cache_only_features_from_metadata(
+                info=self.info,
+                stats=self.stats,
+                keep_keys=(
+                    tuple(str(key) for key in runtime_reader.feature_keys)
+                    if runtime_enabled_for_dataset
+                    else ()
+                ),
+            )
+        )
+        if removed_signature_keys:
+            print(
+                "[INFO] dataset.load_metadata: ignoring signature-cache-only "
+                "features for this policy: "
+                f"{list(removed_signature_keys)}"
+            )
+        self.info, self.stats, removed_ignored_keys = (
+            drop_dataset_features_from_metadata(
+                info=self.info,
+                stats=self.stats,
+                feature_keys=get_ignored_dataset_feature_keys(),
+            )
+        )
+        if removed_ignored_keys:
+            print(
+                "[INFO] dataset.load_metadata: ignoring policy-excluded features: "
+                f"{list(removed_ignored_keys)}"
             )
         elapsed_s = time.perf_counter() - start_s
         print(
@@ -1092,8 +1967,11 @@ def install_lerobot_dataset_load_patch() -> None:
         metadata_cached_feature_keys = get_signature_cache_only_feature_keys(
             getattr(self.meta, "info", None)
         )
+        ignored_feature_keys = set(get_ignored_dataset_feature_keys())
         cached_feature_keys = (
-            runtime_cached_feature_keys | metadata_cached_feature_keys
+            runtime_cached_feature_keys
+            | metadata_cached_feature_keys
+            | ignored_feature_keys
         )
         load_feature_specs = {
             key: feature_spec
@@ -1109,6 +1987,11 @@ def install_lerobot_dataset_load_patch() -> None:
             print(
                 "[INFO] signature_cache: excluding cached parquet columns from HF load: "
                 f"{sorted(runtime_cached_feature_keys)}"
+            )
+        if ignored_feature_keys:
+            print(
+                "[INFO] dataset.load_hf_dataset: excluding policy-excluded "
+                f"features from parquet load: {sorted(ignored_feature_keys)}"
             )
         hf_transform = build_hf_transform_to_torch(load_feature_specs)
         parquet_paths = sorted((self.root / "data").glob("*/*.parquet"))
@@ -1565,6 +2448,7 @@ def build_policy_feature_overrides(
     prefix_train_max_steps: int,
     use_path_signature: bool,
     use_delta_signature: bool,
+    ignored_input_feature_keys: tuple[str, ...] = (),
 ):
     info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
     cache_metadata = load_signature_cache_metadata(
@@ -1588,9 +2472,6 @@ def build_policy_feature_overrides(
 
     from lerobot.configs.types import FeatureType
     from lerobot.datasets.utils import dataset_to_policy_features
-    from lerobot_policy_streaming_act.prefix_sequence import (
-        build_prefix_sequence_input_features,
-    )
 
     dataset_features = dataset_to_policy_features(info.get("features", {}))
     output_features = {
@@ -1598,12 +2479,17 @@ def build_policy_feature_overrides(
         for key, feature in dataset_features.items()
         if feature.type is FeatureType.ACTION
     }
+    ignored_input_key_set = set(str(key) for key in ignored_input_feature_keys)
     input_features = {
         key: feature
         for key, feature in dataset_features.items()
-        if key not in output_features
+        if key not in output_features and key not in ignored_input_key_set
     }
     if use_prefix_sequence_training:
+        from lerobot_policy_streaming_act.prefix_sequence import (
+            build_prefix_sequence_input_features,
+        )
+
         input_features = build_prefix_sequence_input_features(
             base_input_features=input_features,
             prefix_train_max_steps=prefix_train_max_steps,
@@ -1846,6 +2732,28 @@ def is_resumable_checkpoint_dir(checkpoint_dir: Path) -> bool:
     )
 
 
+def read_checkpoint_training_step(checkpoint_dir: Path) -> int:
+    step_path = checkpoint_dir / TRAINING_STATE_DIRNAME / TRAINING_STEP_FILENAME
+    try:
+        with step_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return 0
+
+    if isinstance(payload, int):
+        return max(0, payload)
+    if isinstance(payload, dict):
+        for key in ("step", "training_step", "global_step"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
 def resolve_resume_run_state(train_output_root: Path) -> ResumeRunState:
     run_dirs = iter_training_run_dirs(train_output_root)
     if not run_dirs:
@@ -1962,12 +2870,84 @@ def resolve_diffusion_drop_n_last_frames(
     return resolved_drop_n_last_frames
 
 
+def _parse_numeric_pair(value: str, *, option_name: str, item_type: type) -> tuple:
+    parts = [part.strip() for part in str(value).replace("x", ",").split(",")]
+    parts = [part for part in parts if part]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"{option_name} expects two comma-separated values, got {value!r}."
+        )
+    try:
+        return (item_type(parts[0]), item_type(parts[1]))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"{option_name} contains invalid values: {value!r}."
+        ) from exc
+
+
+def parse_int_pair(value: str) -> tuple[int, int]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--smolvla-resize-imgs-with-padding",
+        item_type=int,
+    )
+
+
+def parse_float_pair(value: str) -> tuple[float, float]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--smolvla-optimizer-betas",
+        item_type=float,
+    )
+
+
+def parse_groot_image_size(value: str) -> tuple[int, int]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--groot-image-size",
+        item_type=int,
+    )
+
+
+def parse_groot_optimizer_betas(value: str) -> tuple[float, float]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--groot-optimizer-betas",
+        item_type=float,
+    )
+
+
+def coerce_numeric_pair(value, *, option_name: str, item_type: type) -> tuple:
+    if isinstance(value, str):
+        return _parse_numeric_pair(
+            value,
+            option_name=option_name,
+            item_type=item_type,
+        )
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{option_name} expects exactly two values. Got {value!r}.")
+    try:
+        return (item_type(value[0]), item_type(value[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{option_name} contains invalid values: {value!r}.") from exc
+
+
+def optional_pretrained_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--defaults-path", type=Path, default=None)
     bootstrap.add_argument("--dataset", type=str, default=None)
     bootstrap.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default="act",
     )
     bootstrap.add_argument("--task", type=str, default=None)
@@ -1975,7 +2955,12 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap.add_argument("--cil", dest="task", type=str)
     known_args, _ = bootstrap.parse_known_args(argv)
     defaults, defaults_path = ({}, None)
-    if known_args.dataset or getattr(known_args, "task", None):
+    if known_args.defaults_path is not None:
+        defaults, defaults_path = load_policy_mode_defaults_from_path(
+            mode="train",
+            path=known_args.defaults_path,
+        )
+    elif known_args.dataset or getattr(known_args, "task", None):
         defaults, defaults_path = load_policy_mode_defaults_for_cli(
             mode="train",
             dataset_selector=known_args.dataset,
@@ -1985,20 +2970,30 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train LeRobot ACT, Diffusion, PRISM Diffusion, or Streaming ACT "
-            "on a local LeRobot dataset."
+            "Train LeRobot ACT, Diffusion, PRISM Diffusion, Streaming ACT, "
+            "SmolVLA, or GR00T N1.5 on a local LeRobot dataset."
         )
     )
     parser.add_argument(
         "--policy",
-        choices=["act", "diffusion", "prism_diffusion", "streaming_act"],
+        choices=POLICY_CHOICES,
         default=known_args.policy,
     )
     parser.add_argument(
+        "--defaults-path",
+        type=Path,
+        default=known_args.defaults_path,
+        help=(
+            "Optional YAML defaults file to load instead of resolving "
+            "bash/defaults/<dataset>/<policy>.yaml automatically."
+        ),
+    )
+    dataset_default = known_args.dataset or defaults.get("dataset_root")
+    parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        default=known_args.dataset,
+        required=dataset_default is None,
+        default=dataset_default,
         help=(
             "Dataset ID or path under data. This value is also used to resolve "
             "`bash/defaults/<dataset_key>/<policy>.yaml` when present. "
@@ -2209,6 +3204,85 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "`auto` selects bf16 on supported CUDA GPUs and otherwise falls back to fp16."
         ),
     )
+    ddp_find_unused_group = parser.add_mutually_exclusive_group()
+    ddp_find_unused_group.add_argument(
+        "--ddp-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_true",
+        help=(
+            "Ask DistributedDataParallel to search the autograd graph for unused "
+            "parameters. This is safer for experimental models but adds overhead."
+        ),
+    )
+    ddp_find_unused_group.add_argument(
+        "--ddp-no-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_false",
+        help="Disable the DDP unused-parameter graph traversal for faster training.",
+    )
+    default_ddp_find_unused_parameters = defaults.get("ddp_find_unused_parameters")
+    if default_ddp_find_unused_parameters is None:
+        default_ddp_find_unused_parameters = known_args.policy != "streaming_act"
+    parser.set_defaults(
+        ddp_find_unused_parameters=default_ddp_find_unused_parameters
+    )
+    default_distributed_training_mode = defaults.get("distributed_training_mode")
+    if default_distributed_training_mode is None:
+        default_distributed_training_mode = (
+            "local_sgd" if known_args.policy == "streaming_act" else "ddp"
+        )
+    parser.add_argument(
+        "--distributed-training-mode",
+        "--distributed-mode",
+        choices=["ddp", "local_sgd"],
+        default=default_distributed_training_mode,
+        help=(
+            "Distributed optimizer mode. `ddp` synchronizes gradients every step; "
+            "`local_sgd` lets each rank take local optimizer steps and periodically "
+            "averages model parameters."
+        ),
+    )
+    parser.add_argument(
+        "--local-sgd-sync-every",
+        type=int,
+        default=defaults.get("local_sgd_sync_every", 4),
+        help=(
+            "When using --distributed-training-mode=local_sgd, average model "
+            "parameters across ranks every N local optimizer steps."
+        ),
+    )
+    parser.add_argument(
+        "--local-sgd-warmup-steps",
+        type=int,
+        default=defaults.get("local_sgd_warmup_steps", 0),
+        help=(
+            "Run standard synchronized DDP for this many initial steps before "
+            "switching to Local SGD."
+        ),
+    )
+    local_sgd_sync_optimizer_state_group = parser.add_mutually_exclusive_group()
+    local_sgd_sync_optimizer_state_group.add_argument(
+        "--local-sgd-sync-optimizer-state",
+        dest="local_sgd_sync_optimizer_state",
+        action="store_true",
+        help=(
+            "Also average floating optimizer-state tensors at Local SGD sync "
+            "points. This is more stable for Adam-like optimizers but costs extra "
+            "communication."
+        ),
+    )
+    local_sgd_sync_optimizer_state_group.add_argument(
+        "--local-sgd-no-sync-optimizer-state",
+        dest="local_sgd_sync_optimizer_state",
+        action="store_false",
+        help="Only average model parameters at Local SGD sync points.",
+    )
+    parser.set_defaults(
+        local_sgd_sync_optimizer_state=defaults.get(
+            "local_sgd_sync_optimizer_state",
+            False,
+        )
+    )
     parser.add_argument(
         "--n-action-steps",
         type=int,
@@ -2218,16 +3292,20 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             "Set to 1 for per-step replanning."
         ),
     )
-    if known_args.policy in {"diffusion", "prism_diffusion"}:
+    if known_args.policy in {"diffusion", "prism_diffusion", "smolvla", "groot"}:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
-            default=defaults.get("n_obs_steps", 2),
+            default=defaults.get(
+                "n_obs_steps",
+                1 if known_args.policy in {"smolvla", "groot"} else 2,
+            ),
             help=(
-                "Number of observation steps passed to the diffusion policy "
+                "Number of observation steps passed to the policy "
                 "at each decision."
             ),
         )
+    if known_args.policy in {"diffusion", "prism_diffusion"}:
         parser.add_argument(
             "--horizon",
             type=int,
@@ -2474,6 +3552,24 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("slot_memory_routing_hidden_dim", 512),
             help="Hidden dimension used by the SISM routing network.",
         )
+        parser.add_argument(
+            "--slot-memory-identity-scale",
+            type=float,
+            default=defaults.get("slot_memory_identity_scale", 0.1),
+            help=(
+                "Scale for the fixed deterministic SISM slot identity used to "
+                "break slot permutation symmetry."
+            ),
+        )
+        parser.add_argument(
+            "--slot-memory-routing-temperature",
+            type=float,
+            default=defaults.get("slot_memory_routing_temperature", 1.0),
+            help=(
+                "Temperature applied to SISM routing logits. Lower values make "
+                "slot routing sharper."
+            ),
+        )
         slot_memory_delta_routing_group = parser.add_mutually_exclusive_group()
         slot_memory_delta_routing_group.add_argument(
             "--enable-slot-memory-delta-routing",
@@ -2536,6 +3632,15 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=float,
             default=defaults.get("slot_memory_balance_loss_coef", 0.0),
             help="Optional routing-balance loss coefficient for SISM.",
+        )
+        parser.add_argument(
+            "--slot-memory-entropy-loss-coef",
+            type=float,
+            default=defaults.get("slot_memory_entropy_loss_coef", 0.0),
+            help=(
+                "Optional per-step routing entropy loss coefficient for SISM. "
+                "Use with a small balance loss for confident but diverse slots."
+            ),
         )
         parser.add_argument(
             "--slot-memory-consistency-loss-coef",
@@ -2651,6 +3756,543 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             help=(
                 "Optional prefix-image cache directory override. Defaults to a "
                 "hidden cache folder under the dataset root."
+            ),
+        )
+    elif known_args.policy == "smolvla":
+        parser.add_argument(
+            "--policy-path",
+            type=str,
+            default=defaults.get(
+                "policy_path",
+                defaults.get("pretrained_path", SMOLVLA_DEFAULT_POLICY_PATH),
+            ),
+            help=(
+                "SmolVLA checkpoint to fine-tune. Defaults to the official "
+                "`lerobot/smolvla_base` checkpoint. Pass an empty string to train "
+                "SmolVLA from scratch."
+            ),
+        )
+        parser.add_argument(
+            "--smolvla-max-state-dim",
+            type=int,
+            default=defaults.get("max_state_dim", 32),
+            help="State vectors shorter than this are padded before SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-max-action-dim",
+            type=int,
+            default=defaults.get("max_action_dim", 32),
+            help="Action vectors shorter than this are padded before SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-resize-imgs-with-padding",
+            type=parse_int_pair,
+            default=defaults.get("resize_imgs_with_padding", (512, 512)),
+            help="SmolVLA image resize target as WIDTH,HEIGHT, e.g. 512,512.",
+        )
+        parser.add_argument(
+            "--smolvla-empty-cameras",
+            type=int,
+            default=defaults.get("empty_cameras", 0),
+            help="Number of zero-filled placeholder cameras appended by SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-tokenizer-max-length",
+            type=int,
+            default=defaults.get("tokenizer_max_length", 48),
+            help="Maximum language-token length for SmolVLA instructions.",
+        )
+        parser.add_argument(
+            "--smolvla-num-steps",
+            type=int,
+            default=defaults.get("num_steps", 10),
+            help="Flow-matching denoising steps used by SmolVLA.",
+        )
+        smolvla_cache_group = parser.add_mutually_exclusive_group()
+        smolvla_cache_group.add_argument(
+            "--smolvla-enable-cache",
+            dest="smolvla_use_cache",
+            action="store_true",
+            help="Enable SmolVLA key/value cache during action generation.",
+        )
+        smolvla_cache_group.add_argument(
+            "--smolvla-disable-cache",
+            dest="smolvla_use_cache",
+            action="store_false",
+            help="Disable SmolVLA key/value cache during action generation.",
+        )
+        parser.set_defaults(smolvla_use_cache=defaults.get("use_cache", True))
+        smolvla_vision_group = parser.add_mutually_exclusive_group()
+        smolvla_vision_group.add_argument(
+            "--smolvla-freeze-vision-encoder",
+            dest="smolvla_freeze_vision_encoder",
+            action="store_true",
+            help="Freeze the SmolVLA vision encoder while fine-tuning.",
+        )
+        smolvla_vision_group.add_argument(
+            "--smolvla-unfreeze-vision-encoder",
+            dest="smolvla_freeze_vision_encoder",
+            action="store_false",
+            help="Fine-tune the SmolVLA vision encoder.",
+        )
+        parser.set_defaults(
+            smolvla_freeze_vision_encoder=defaults.get("freeze_vision_encoder", True)
+        )
+        smolvla_expert_group = parser.add_mutually_exclusive_group()
+        smolvla_expert_group.add_argument(
+            "--smolvla-train-expert-only",
+            dest="smolvla_train_expert_only",
+            action="store_true",
+            help="Train only the SmolVLA action expert branch.",
+        )
+        smolvla_expert_group.add_argument(
+            "--smolvla-train-all-layers",
+            dest="smolvla_train_expert_only",
+            action="store_false",
+            help="Allow all unfrozen SmolVLA layers to train.",
+        )
+        parser.set_defaults(
+            smolvla_train_expert_only=defaults.get("train_expert_only", True)
+        )
+        smolvla_state_proj_group = parser.add_mutually_exclusive_group()
+        smolvla_state_proj_group.add_argument(
+            "--smolvla-train-state-proj",
+            dest="smolvla_train_state_proj",
+            action="store_true",
+            help="Train SmolVLA's state projection layers.",
+        )
+        smolvla_state_proj_group.add_argument(
+            "--smolvla-freeze-state-proj",
+            dest="smolvla_train_state_proj",
+            action="store_false",
+            help="Freeze SmolVLA's state projection layers.",
+        )
+        parser.set_defaults(
+            smolvla_train_state_proj=defaults.get("train_state_proj", True)
+        )
+        smolvla_vlm_weights_group = parser.add_mutually_exclusive_group()
+        smolvla_vlm_weights_group.add_argument(
+            "--smolvla-load-vlm-weights",
+            dest="smolvla_load_vlm_weights",
+            action="store_true",
+            help=(
+                "Initialize the VLM backbone from its model name when training "
+                "without a full SmolVLA checkpoint."
+            ),
+        )
+        smolvla_vlm_weights_group.add_argument(
+            "--smolvla-skip-vlm-weights",
+            dest="smolvla_load_vlm_weights",
+            action="store_false",
+            help="Skip separate VLM weight initialization.",
+        )
+        parser.set_defaults(
+            smolvla_load_vlm_weights=defaults.get("load_vlm_weights", False)
+        )
+        parser.add_argument(
+            "--smolvla-vlm-model-name",
+            type=str,
+            default=defaults.get(
+                "vlm_model_name",
+                "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+            ),
+            help="VLM backbone name recorded in SmolVLAConfig.",
+        )
+        parser.add_argument(
+            "--smolvla-attention-mode",
+            type=str,
+            default=defaults.get("attention_mode", "cross_attn"),
+            help="SmolVLA attention mode.",
+        )
+        parser.add_argument(
+            "--smolvla-prefix-length",
+            type=int,
+            default=defaults.get("prefix_length", -1),
+            help="SmolVLA prefix length; -1 keeps the upstream default.",
+        )
+        parser.add_argument(
+            "--smolvla-pad-language-to",
+            type=str,
+            choices=["longest", "max_length"],
+            default=defaults.get("pad_language_to", "longest"),
+            help="Language tokenizer padding mode for SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-num-expert-layers",
+            type=int,
+            default=defaults.get("num_expert_layers", -1),
+            help="Number of SmolVLA expert layers; <=0 keeps upstream default.",
+        )
+        parser.add_argument(
+            "--smolvla-num-vlm-layers",
+            type=int,
+            default=defaults.get("num_vlm_layers", 16),
+            help="Number of VLM layers used by SmolVLA.",
+        )
+        parser.add_argument(
+            "--smolvla-self-attn-every-n-layers",
+            type=int,
+            default=defaults.get("self_attn_every_n_layers", 2),
+            help="Frequency of self-attention layers in SmolVLA expert blocks.",
+        )
+        parser.add_argument(
+            "--smolvla-expert-width-multiplier",
+            type=float,
+            default=defaults.get("expert_width_multiplier", 0.75),
+            help="Width multiplier for the SmolVLA action expert.",
+        )
+        parser.add_argument(
+            "--smolvla-min-period",
+            type=float,
+            default=defaults.get("min_period", 0.004),
+            help="Minimum timestep period for SmolVLA positional encoding.",
+        )
+        parser.add_argument(
+            "--smolvla-max-period",
+            type=float,
+            default=defaults.get("max_period", 4.0),
+            help="Maximum timestep period for SmolVLA positional encoding.",
+        )
+        smolvla_compile_group = parser.add_mutually_exclusive_group()
+        smolvla_compile_group.add_argument(
+            "--smolvla-compile-model",
+            dest="smolvla_compile_model",
+            action="store_true",
+            help="Enable torch.compile for SmolVLA.",
+        )
+        smolvla_compile_group.add_argument(
+            "--smolvla-no-compile-model",
+            dest="smolvla_compile_model",
+            action="store_false",
+            help="Disable torch.compile for SmolVLA.",
+        )
+        parser.set_defaults(smolvla_compile_model=defaults.get("compile_model", False))
+        parser.add_argument(
+            "--smolvla-compile-mode",
+            type=str,
+            default=defaults.get("compile_mode", "max-autotune"),
+            help="torch.compile mode used when SmolVLA compilation is enabled.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-lr",
+            type=float,
+            default=defaults.get("optimizer_lr", 1e-4),
+            help="SmolVLA AdamW learning rate.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-betas",
+            type=parse_float_pair,
+            default=defaults.get("optimizer_betas", (0.9, 0.95)),
+            help="SmolVLA AdamW betas as beta1,beta2.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-eps",
+            type=float,
+            default=defaults.get("optimizer_eps", 1e-8),
+            help="SmolVLA AdamW epsilon.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-weight-decay",
+            type=float,
+            default=defaults.get("optimizer_weight_decay", 1e-10),
+            help="SmolVLA AdamW weight decay.",
+        )
+        parser.add_argument(
+            "--smolvla-optimizer-grad-clip-norm",
+            type=float,
+            default=defaults.get("optimizer_grad_clip_norm", 10),
+            help="SmolVLA optimizer gradient clipping norm.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-warmup-steps",
+            type=int,
+            default=defaults.get("scheduler_warmup_steps", 1000),
+            help="SmolVLA scheduler warmup steps.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-decay-steps",
+            type=int,
+            default=defaults.get("scheduler_decay_steps", 30000),
+            help="SmolVLA scheduler cosine-decay steps.",
+        )
+        parser.add_argument(
+            "--smolvla-scheduler-decay-lr",
+            type=float,
+            default=defaults.get("scheduler_decay_lr", 2.5e-6),
+            help="SmolVLA scheduler final decay learning rate.",
+        )
+    elif known_args.policy == "groot":
+        parser.add_argument(
+            "--policy-path",
+            type=str,
+            default=defaults.get("policy_path", defaults.get("pretrained_path")),
+            help=(
+                "Optional trained LeRobot GR00T checkpoint to fine-tune. "
+                "Leave empty to initialize from --groot-base-model-path."
+            ),
+        )
+        parser.add_argument(
+            "--groot-max-state-dim",
+            type=int,
+            default=defaults.get("max_state_dim", 64),
+            help="State vectors shorter than this are padded before GR00T.",
+        )
+        parser.add_argument(
+            "--groot-max-action-dim",
+            type=int,
+            default=defaults.get("max_action_dim", 32),
+            help="Action vectors shorter than this are padded before GR00T.",
+        )
+        parser.add_argument(
+            "--groot-image-size",
+            type=parse_groot_image_size,
+            default=defaults.get("image_size", (224, 224)),
+            help="GR00T image size as WIDTH,HEIGHT, e.g. 224,224.",
+        )
+        parser.add_argument(
+            "--groot-base-model-path",
+            type=str,
+            default=defaults.get("base_model_path", GROOT_DEFAULT_BASE_MODEL_PATH),
+            help="Base GR00T N1.5 model path or Hugging Face repo id.",
+        )
+        parser.add_argument(
+            "--groot-tokenizer-assets-repo",
+            type=str,
+            default=defaults.get(
+                "tokenizer_assets_repo",
+                GROOT_DEFAULT_TOKENIZER_ASSETS_REPO,
+            ),
+            help="Repo or path containing Eagle tokenizer assets for GR00T.",
+        )
+        parser.add_argument(
+            "--groot-attn-implementation",
+            type=str,
+            choices=["eager", "sdpa", "flash_attention_2"],
+            default=defaults.get(
+                "attn_implementation",
+                GROOT_DEFAULT_ATTN_IMPLEMENTATION,
+            ),
+            help=(
+                "Transformers attention implementation for the GR00T Eagle "
+                "backbone. `eager` avoids the current Eagle/Flash Attention 2 "
+                "compatibility failure."
+            ),
+        )
+        parser.add_argument(
+            "--groot-embodiment-tag",
+            type=str,
+            default=defaults.get("embodiment_tag", "new_embodiment"),
+            help="GR00T embodiment tag, e.g. new_embodiment, gr1, so100.",
+        )
+        groot_ignore_signature_group = parser.add_mutually_exclusive_group()
+        groot_ignore_signature_group.add_argument(
+            "--groot-ignore-signature",
+            dest="groot_ignore_signature_features",
+            action="store_true",
+            help="Exclude path/delta signature features from GR00T training.",
+        )
+        groot_ignore_signature_group.add_argument(
+            "--groot-keep-signature",
+            dest="groot_ignore_signature_features",
+            action="store_false",
+            help="Keep signature features visible to the GR00T data loader.",
+        )
+        parser.set_defaults(
+            groot_ignore_signature_features=defaults.get("ignore_signature", True),
+        )
+        groot_llm_group = parser.add_mutually_exclusive_group()
+        groot_llm_group.add_argument(
+            "--groot-tune-llm",
+            dest="groot_tune_llm",
+            action="store_true",
+            help="Fine-tune the GR00T language backbone.",
+        )
+        groot_llm_group.add_argument(
+            "--groot-freeze-llm",
+            dest="groot_tune_llm",
+            action="store_false",
+            help="Freeze the GR00T language backbone.",
+        )
+        parser.set_defaults(groot_tune_llm=defaults.get("tune_llm", False))
+        groot_visual_group = parser.add_mutually_exclusive_group()
+        groot_visual_group.add_argument(
+            "--groot-tune-visual",
+            dest="groot_tune_visual",
+            action="store_true",
+            help="Fine-tune the GR00T visual tower.",
+        )
+        groot_visual_group.add_argument(
+            "--groot-freeze-visual",
+            dest="groot_tune_visual",
+            action="store_false",
+            help="Freeze the GR00T visual tower.",
+        )
+        parser.set_defaults(groot_tune_visual=defaults.get("tune_visual", False))
+        groot_projector_group = parser.add_mutually_exclusive_group()
+        groot_projector_group.add_argument(
+            "--groot-tune-projector",
+            dest="groot_tune_projector",
+            action="store_true",
+            help="Fine-tune the GR00T projector.",
+        )
+        groot_projector_group.add_argument(
+            "--groot-freeze-projector",
+            dest="groot_tune_projector",
+            action="store_false",
+            help="Freeze the GR00T projector.",
+        )
+        parser.set_defaults(
+            groot_tune_projector=defaults.get("tune_projector", True),
+        )
+        groot_diffusion_group = parser.add_mutually_exclusive_group()
+        groot_diffusion_group.add_argument(
+            "--groot-tune-diffusion-model",
+            dest="groot_tune_diffusion_model",
+            action="store_true",
+            help="Fine-tune the GR00T diffusion/action model.",
+        )
+        groot_diffusion_group.add_argument(
+            "--groot-freeze-diffusion-model",
+            dest="groot_tune_diffusion_model",
+            action="store_false",
+            help="Freeze the GR00T diffusion/action model.",
+        )
+        parser.set_defaults(
+            groot_tune_diffusion_model=defaults.get("tune_diffusion_model", True),
+        )
+        parser.add_argument(
+            "--groot-lora-rank",
+            type=int,
+            default=defaults.get("lora_rank", 0),
+            help="GR00T LoRA rank. Use 0 to disable LoRA.",
+        )
+        parser.add_argument(
+            "--groot-lora-alpha",
+            type=int,
+            default=defaults.get("lora_alpha", 16),
+            help="GR00T LoRA alpha.",
+        )
+        parser.add_argument(
+            "--groot-lora-dropout",
+            type=float,
+            default=defaults.get("lora_dropout", 0.1),
+            help="GR00T LoRA dropout.",
+        )
+        groot_lora_full_group = parser.add_mutually_exclusive_group()
+        groot_lora_full_group.add_argument(
+            "--groot-lora-full-model",
+            dest="groot_lora_full_model",
+            action="store_true",
+            help="Apply LoRA to the full GR00T model.",
+        )
+        groot_lora_full_group.add_argument(
+            "--groot-lora-adapters-only",
+            dest="groot_lora_full_model",
+            action="store_false",
+            help="Apply LoRA only to the default GR00T adapter set.",
+        )
+        parser.set_defaults(
+            groot_lora_full_model=defaults.get("lora_full_model", False),
+        )
+        parser.add_argument(
+            "--groot-optimizer-lr",
+            type=float,
+            default=defaults.get("optimizer_lr", 1e-4),
+            help="GR00T AdamW learning rate.",
+        )
+        parser.add_argument(
+            "--groot-optimizer-betas",
+            type=parse_groot_optimizer_betas,
+            default=defaults.get("optimizer_betas", (0.95, 0.999)),
+            help="GR00T AdamW betas as beta1,beta2.",
+        )
+        parser.add_argument(
+            "--groot-optimizer-eps",
+            type=float,
+            default=defaults.get("optimizer_eps", 1e-8),
+            help="GR00T AdamW epsilon.",
+        )
+        parser.add_argument(
+            "--groot-optimizer-weight-decay",
+            type=float,
+            default=defaults.get("optimizer_weight_decay", 1e-5),
+            help="GR00T AdamW weight decay.",
+        )
+        parser.add_argument(
+            "--groot-optimizer-grad-clip-norm",
+            type=float,
+            default=defaults.get("optimizer_grad_clip_norm", 10),
+            help="GR00T optimizer gradient clipping norm.",
+        )
+        parser.add_argument(
+            "--groot-warmup-ratio",
+            type=float,
+            default=defaults.get("warmup_ratio", 0.05),
+            help="GR00T cosine schedule warmup ratio.",
+        )
+        parser.add_argument(
+            "--groot-scheduler-decay-lr",
+            type=float,
+            default=defaults.get("scheduler_decay_lr"),
+            help="Optional GR00T scheduler final learning rate.",
+        )
+        groot_bf16_group = parser.add_mutually_exclusive_group()
+        groot_bf16_group.add_argument(
+            "--groot-use-bf16",
+            dest="groot_use_bf16",
+            action="store_true",
+            help="Use bfloat16 autocast inside the GR00T model.",
+        )
+        groot_bf16_group.add_argument(
+            "--groot-disable-bf16",
+            dest="groot_use_bf16",
+            action="store_false",
+            help="Disable GR00T-internal bfloat16 autocast.",
+        )
+        parser.set_defaults(groot_use_bf16=defaults.get("use_bf16", True))
+        parser.add_argument(
+            "--groot-video-backend",
+            type=str,
+            default=defaults.get(
+                "groot_video_backend",
+                defaults.get("video_backend", "decord"),
+            ),
+            help="Video backend recorded in GrootConfig.",
+        )
+        groot_balance_dataset_group = parser.add_mutually_exclusive_group()
+        groot_balance_dataset_group.add_argument(
+            "--groot-balance-dataset-weights",
+            dest="groot_balance_dataset_weights",
+            action="store_true",
+            help="Balance GR00T mixture dataset weights.",
+        )
+        groot_balance_dataset_group.add_argument(
+            "--groot-no-balance-dataset-weights",
+            dest="groot_balance_dataset_weights",
+            action="store_false",
+            help="Disable GR00T mixture dataset balancing.",
+        )
+        parser.set_defaults(
+            groot_balance_dataset_weights=defaults.get(
+                "balance_dataset_weights", True
+            ),
+        )
+        groot_balance_trajectory_group = parser.add_mutually_exclusive_group()
+        groot_balance_trajectory_group.add_argument(
+            "--groot-balance-trajectory-weights",
+            dest="groot_balance_trajectory_weights",
+            action="store_true",
+            help="Weight GR00T trajectories by length.",
+        )
+        groot_balance_trajectory_group.add_argument(
+            "--groot-no-balance-trajectory-weights",
+            dest="groot_balance_trajectory_weights",
+            action="store_false",
+            help="Disable GR00T trajectory-length weighting.",
+        )
+        parser.set_defaults(
+            groot_balance_trajectory_weights=defaults.get(
+                "balance_trajectory_weights", True
             ),
         )
     elif known_args.policy == "prism_diffusion":
@@ -2988,6 +4630,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.prefix_image_cache_root, Path
     ):
         args.prefix_image_cache_root = Path(args.prefix_image_cache_root)
+    if int(args.local_sgd_sync_every) < 1:
+        parser.error("--local-sgd-sync-every must be >= 1")
+    if int(args.local_sgd_warmup_steps) < 0:
+        parser.error("--local-sgd-warmup-steps must be >= 0")
     return args
 
 
@@ -3007,13 +4653,14 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from lerobot.configs.default import DatasetConfig, WandBConfig
         from lerobot.configs.train import TrainPipelineConfig
-        from lerobot.scripts.lerobot_train import train
+        from lerobot.scripts import lerobot_train as lerobot_train_module
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Missing LeRobot training dependencies. Install the pip package first, "
             "for example `pip install lerobot`, and ensure torch is installed for "
             "your platform."
         ) from exc
+    train = lerobot_train_module.train
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
     source_dataset_root = resolve_training_dataset_root(
@@ -3061,6 +4708,33 @@ def main(argv: list[str] | None = None) -> None:
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 
     PrismDiffusionConfig = None
+    SmolVLAConfig = None
+    GrootConfig = None
+    if args.policy == "smolvla":
+        try:
+            from lerobot.policies.smolvla.configuration_smolvla import (
+                SmolVLAConfig,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "SmolVLA support is missing from this LeRobot installation. "
+                "Install LeRobot with the SmolVLA extras, for example "
+                '`pip install -e ".[smolvla]"` in the LeRobot checkout.'
+            ) from exc
+    elif args.policy == "groot":
+        try:
+            from lerobot.policies.groot.configuration_groot import GrootConfig
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "GR00T support is missing from this LeRobot installation. "
+                "Install a LeRobot version that provides "
+                "`lerobot.policies.groot`, plus the GR00T CUDA dependencies "
+                "such as flash-attn."
+            ) from exc
+        install_groot_attention_implementation_patch(args.groot_attn_implementation)
+        install_groot_meta_tensor_compatibility_patch()
+        install_groot_transformers_loading_compatibility_patch()
+        install_groot_processor_tensor_compatibility_patch()
     if policy_supports_signature_features(args.policy):
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
@@ -3088,6 +4762,14 @@ def main(argv: list[str] | None = None) -> None:
         prepare_prefix_image_cache_runtime = None
         configure_signature_cache_runtime = None
         prepare_signature_cache_runtime = None
+    configure_ignored_dataset_feature_keys(
+        tuple(SIGNATURE_FEATURE_KEYS)
+        if (
+            args.policy == "groot"
+            and bool(getattr(args, "groot_ignore_signature_features", True))
+        )
+        else ()
+    )
     install_torch_dataloader_patch(
         persistent_workers=bool(args.dataloader_persistent_workers),
         prefetch_factor=int(args.dataloader_prefetch_factor),
@@ -3259,16 +4941,26 @@ def main(argv: list[str] | None = None) -> None:
 
     input_features_override = None
     output_features_override = None
+    groot_ignored_input_feature_keys = (
+        tuple(SIGNATURE_FEATURE_KEYS)
+        if (
+            args.policy == "groot"
+            and bool(getattr(args, "groot_ignore_signature_features", True))
+        )
+        else ()
+    )
     if active_use_prefix_sequence_training:
         install_prefix_sequence_dataset_patch()
+    if active_use_prefix_sequence_training or groot_ignored_input_feature_keys:
         input_features_override, output_features_override = build_policy_feature_overrides(
             dataset_root=dataset_root,
             dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
+            signature_cache_root=getattr(args, "signature_cache_root", None),
             use_prefix_sequence_training=active_use_prefix_sequence_training,
-            prefix_train_max_steps=int(args.prefix_train_max_steps),
+            prefix_train_max_steps=int(getattr(args, "prefix_train_max_steps", 32)),
             use_path_signature=active_use_path_signature,
             use_delta_signature=active_use_delta_signature,
+            ignored_input_feature_keys=groot_ignored_input_feature_keys,
         )
 
     dataset_cfg = DatasetConfig(
@@ -3317,10 +5009,15 @@ def main(argv: list[str] | None = None) -> None:
             num_memory_slots=int(args.num_memory_slots),
             slot_memory_num_slots=int(args.slot_memory_num_slots),
             slot_memory_routing_hidden_dim=int(args.slot_memory_routing_hidden_dim),
+            slot_memory_identity_scale=float(args.slot_memory_identity_scale),
+            slot_memory_routing_temperature=float(
+                args.slot_memory_routing_temperature
+            ),
             slot_memory_use_delta_routing=bool(args.slot_memory_use_delta_routing),
             slot_memory_use_softmax_routing=bool(args.slot_memory_use_softmax_routing),
             slot_memory_use_readout_pooling=bool(args.slot_memory_use_readout_pooling),
             slot_memory_balance_loss_coef=float(args.slot_memory_balance_loss_coef),
+            slot_memory_entropy_loss_coef=float(args.slot_memory_entropy_loss_coef),
             slot_memory_consistency_loss_coef=float(
                 args.slot_memory_consistency_loss_coef
             ),
@@ -3385,6 +5082,118 @@ def main(argv: list[str] | None = None) -> None:
                 use_path_signature=bool(use_path_signature),
                 use_delta_signature=bool(use_delta_signature),
             )
+        )
+    elif args.policy == "smolvla":
+        if SmolVLAConfig is None:
+            raise RuntimeError("SmolVLAConfig failed to import.")
+        if configure_signature_cache_runtime is not None:
+            configure_signature_cache_runtime(None)
+        if configure_prefix_image_cache_runtime is not None:
+            configure_prefix_image_cache_runtime(None)
+        policy_cfg = SmolVLAConfig(
+            device=args.device,
+            use_amp=bool(args.use_amp),
+            push_to_hub=False,
+            pretrained_path=optional_pretrained_path(args.policy_path),
+            n_obs_steps=int(args.n_obs_steps),
+            chunk_size=int(args.chunk_size),
+            n_action_steps=int(args.n_action_steps),
+            max_state_dim=int(args.smolvla_max_state_dim),
+            max_action_dim=int(args.smolvla_max_action_dim),
+            resize_imgs_with_padding=coerce_numeric_pair(
+                args.smolvla_resize_imgs_with_padding,
+                option_name="--smolvla-resize-imgs-with-padding",
+                item_type=int,
+            ),
+            empty_cameras=int(args.smolvla_empty_cameras),
+            tokenizer_max_length=int(args.smolvla_tokenizer_max_length),
+            num_steps=int(args.smolvla_num_steps),
+            use_cache=bool(args.smolvla_use_cache),
+            freeze_vision_encoder=bool(args.smolvla_freeze_vision_encoder),
+            train_expert_only=bool(args.smolvla_train_expert_only),
+            train_state_proj=bool(args.smolvla_train_state_proj),
+            optimizer_lr=float(args.smolvla_optimizer_lr),
+            optimizer_betas=coerce_numeric_pair(
+                args.smolvla_optimizer_betas,
+                option_name="--smolvla-optimizer-betas",
+                item_type=float,
+            ),
+            optimizer_eps=float(args.smolvla_optimizer_eps),
+            optimizer_weight_decay=float(args.smolvla_optimizer_weight_decay),
+            optimizer_grad_clip_norm=float(args.smolvla_optimizer_grad_clip_norm),
+            scheduler_warmup_steps=int(args.smolvla_scheduler_warmup_steps),
+            scheduler_decay_steps=int(args.smolvla_scheduler_decay_steps),
+            scheduler_decay_lr=float(args.smolvla_scheduler_decay_lr),
+            vlm_model_name=str(args.smolvla_vlm_model_name),
+            load_vlm_weights=bool(args.smolvla_load_vlm_weights),
+            attention_mode=str(args.smolvla_attention_mode),
+            prefix_length=int(args.smolvla_prefix_length),
+            pad_language_to=str(args.smolvla_pad_language_to),
+            num_expert_layers=int(args.smolvla_num_expert_layers),
+            num_vlm_layers=int(args.smolvla_num_vlm_layers),
+            self_attn_every_n_layers=int(args.smolvla_self_attn_every_n_layers),
+            expert_width_multiplier=float(args.smolvla_expert_width_multiplier),
+            min_period=float(args.smolvla_min_period),
+            max_period=float(args.smolvla_max_period),
+            compile_model=bool(args.smolvla_compile_model),
+            compile_mode=str(args.smolvla_compile_mode),
+        )
+    elif args.policy == "groot":
+        if GrootConfig is None:
+            raise RuntimeError("GrootConfig failed to import.")
+        if configure_signature_cache_runtime is not None:
+            configure_signature_cache_runtime(None)
+        if configure_prefix_image_cache_runtime is not None:
+            configure_prefix_image_cache_runtime(None)
+        policy_cfg = GrootConfig(
+            device=args.device,
+            use_amp=bool(args.use_amp),
+            push_to_hub=False,
+            pretrained_path=optional_pretrained_path(args.policy_path),
+            n_obs_steps=int(args.n_obs_steps),
+            chunk_size=int(args.chunk_size),
+            n_action_steps=int(args.n_action_steps),
+            input_features=input_features_override,
+            output_features=output_features_override,
+            max_state_dim=int(args.groot_max_state_dim),
+            max_action_dim=int(args.groot_max_action_dim),
+            image_size=coerce_numeric_pair(
+                args.groot_image_size,
+                option_name="--groot-image-size",
+                item_type=int,
+            ),
+            base_model_path=str(args.groot_base_model_path),
+            tokenizer_assets_repo=str(args.groot_tokenizer_assets_repo),
+            embodiment_tag=str(args.groot_embodiment_tag),
+            tune_llm=bool(args.groot_tune_llm),
+            tune_visual=bool(args.groot_tune_visual),
+            tune_projector=bool(args.groot_tune_projector),
+            tune_diffusion_model=bool(args.groot_tune_diffusion_model),
+            lora_rank=int(args.groot_lora_rank),
+            lora_alpha=int(args.groot_lora_alpha),
+            lora_dropout=float(args.groot_lora_dropout),
+            lora_full_model=bool(args.groot_lora_full_model),
+            optimizer_lr=float(args.groot_optimizer_lr),
+            optimizer_betas=coerce_numeric_pair(
+                args.groot_optimizer_betas,
+                option_name="--groot-optimizer-betas",
+                item_type=float,
+            ),
+            optimizer_eps=float(args.groot_optimizer_eps),
+            optimizer_weight_decay=float(args.groot_optimizer_weight_decay),
+            warmup_ratio=float(args.groot_warmup_ratio),
+            use_bf16=bool(args.groot_use_bf16),
+            video_backend=str(args.groot_video_backend),
+            balance_dataset_weights=bool(args.groot_balance_dataset_weights),
+            balance_trajectory_weights=bool(args.groot_balance_trajectory_weights),
+            dataset_paths=[str(dataset_root)],
+            output_dir=str(args.output_root),
+            save_steps=int(args.save_freq),
+            max_steps=int(args.steps),
+            batch_size=int(args.batch_size),
+            dataloader_num_workers=int(args.num_workers),
+            report_to="wandb" if bool(args.enable_wandb) else "none",
+            resume=bool(resume_run_state is not None),
         )
     elif args.policy in {"diffusion", "prism_diffusion"}:
         diffusion_config_cls = (
@@ -3619,6 +5428,36 @@ def main(argv: list[str] | None = None) -> None:
         use_amp=bool(getattr(policy_cfg, "use_amp", False)),
         amp_dtype=str(args.amp_dtype),
     )
+    use_policy_training_preset = True
+    if args.policy == "groot" and resume_run_state is None:
+        from lerobot.optim.optimizers import AdamWConfig
+        from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+
+        groot_optimizer_lr = float(args.groot_optimizer_lr)
+        groot_warmup_ratio = max(0.0, float(args.groot_warmup_ratio))
+        groot_decay_lr = (
+            float(args.groot_scheduler_decay_lr)
+            if args.groot_scheduler_decay_lr is not None
+            else groot_optimizer_lr * 0.1
+        )
+        resume_optimizer_cfg = AdamWConfig(
+            lr=groot_optimizer_lr,
+            betas=coerce_numeric_pair(
+                args.groot_optimizer_betas,
+                option_name="--groot-optimizer-betas",
+                item_type=float,
+            ),
+            eps=float(args.groot_optimizer_eps),
+            weight_decay=float(args.groot_optimizer_weight_decay),
+            grad_clip_norm=float(args.groot_optimizer_grad_clip_norm),
+        )
+        resume_scheduler_cfg = CosineDecayWithWarmupSchedulerConfig(
+            num_warmup_steps=int(max(0, int(args.steps)) * groot_warmup_ratio),
+            num_decay_steps=max(1, int(args.steps)),
+            peak_lr=groot_optimizer_lr,
+            decay_lr=groot_decay_lr,
+        )
+        use_policy_training_preset = False
 
     effective_eval_freq = -1
     if int(args.eval_freq) > 0:
@@ -3642,6 +5481,7 @@ def main(argv: list[str] | None = None) -> None:
         eval_freq=effective_eval_freq,
         log_freq=args.log_freq,
         save_freq=args.save_freq,
+        use_policy_training_preset=use_policy_training_preset,
         optimizer=resume_optimizer_cfg,
         scheduler=resume_scheduler_cfg,
         wandb=wandb_cfg,
@@ -3718,6 +5558,13 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
+    elif args.policy in {"smolvla", "groot"}:
+        print(
+            "- action_execution: "
+            f"n_obs_steps={int(args.n_obs_steps)}, "
+            f"chunk_size={int(args.chunk_size)}, "
+            f"n_action_steps={int(args.n_action_steps)}"
+        )
     else:
         print(
             f"- action_execution: chunk_size={args.chunk_size}, "
@@ -3755,6 +5602,9 @@ def main(argv: list[str] | None = None) -> None:
                     "- slot_memory: "
                     f"num_slots={int(args.slot_memory_num_slots)}, "
                     f"routing_hidden={int(args.slot_memory_routing_hidden_dim)}, "
+                    f"identity_scale={float(args.slot_memory_identity_scale)}, "
+                    "routing_temperature="
+                    f"{float(args.slot_memory_routing_temperature)}, "
                     "delta_routing="
                     f"{bool(args.slot_memory_use_delta_routing)}, "
                     "softmax_routing="
@@ -3763,6 +5613,8 @@ def main(argv: list[str] | None = None) -> None:
                     f"{bool(args.slot_memory_use_readout_pooling)}, "
                     "balance_loss_coef="
                     f"{float(args.slot_memory_balance_loss_coef)}, "
+                    "entropy_loss_coef="
+                    f"{float(args.slot_memory_entropy_loss_coef)}, "
                     "consistency_loss_coef="
                     f"{float(args.slot_memory_consistency_loss_coef)}"
                 )
@@ -3782,6 +5634,79 @@ def main(argv: list[str] | None = None) -> None:
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
         )
+    elif args.policy == "smolvla":
+        smolvla_resize = tuple(
+            coerce_numeric_pair(
+                args.smolvla_resize_imgs_with_padding,
+                option_name="--smolvla-resize-imgs-with-padding",
+                item_type=int,
+            )
+        )
+        print(
+            "- smolvla: "
+            f"policy_path={args.policy_path or '<scratch>'}, "
+            f"max_state_dim={int(args.smolvla_max_state_dim)}, "
+            f"max_action_dim={int(args.smolvla_max_action_dim)}, "
+            f"resize_imgs_with_padding={smolvla_resize}, "
+            f"tokenizer_max_length={int(args.smolvla_tokenizer_max_length)}, "
+            f"num_steps={int(args.smolvla_num_steps)}"
+        )
+        print(
+            "- smolvla_finetune: "
+            f"freeze_vision_encoder={bool(args.smolvla_freeze_vision_encoder)}, "
+            f"train_expert_only={bool(args.smolvla_train_expert_only)}, "
+            f"train_state_proj={bool(args.smolvla_train_state_proj)}, "
+            f"optimizer_lr={float(args.smolvla_optimizer_lr)}, "
+            f"scheduler_warmup_steps={int(args.smolvla_scheduler_warmup_steps)}, "
+            f"scheduler_decay_steps={int(args.smolvla_scheduler_decay_steps)}"
+        )
+    elif args.policy == "groot":
+        groot_image_size = tuple(
+            coerce_numeric_pair(
+                args.groot_image_size,
+                option_name="--groot-image-size",
+                item_type=int,
+            )
+        )
+        ignored_groot_features = (
+            sorted(SIGNATURE_FEATURE_KEYS)
+            if bool(args.groot_ignore_signature_features)
+            else []
+        )
+        groot_decay_lr = (
+            float(args.groot_scheduler_decay_lr)
+            if args.groot_scheduler_decay_lr is not None
+            else float(args.groot_optimizer_lr) * 0.1
+        )
+        print(
+            "- groot: "
+            f"policy_path={args.policy_path or '<base-model>'}, "
+            f"base_model_path={args.groot_base_model_path}, "
+            f"tokenizer_assets_repo={args.groot_tokenizer_assets_repo}, "
+            f"attn_implementation={args.groot_attn_implementation}, "
+            f"embodiment_tag={args.groot_embodiment_tag}, "
+            f"image_size={groot_image_size}, "
+            f"max_state_dim={int(args.groot_max_state_dim)}, "
+            f"max_action_dim={int(args.groot_max_action_dim)}"
+        )
+        print(
+            "- groot_finetune: "
+            f"tune_llm={bool(args.groot_tune_llm)}, "
+            f"tune_visual={bool(args.groot_tune_visual)}, "
+            f"tune_projector={bool(args.groot_tune_projector)}, "
+            f"tune_diffusion_model={bool(args.groot_tune_diffusion_model)}, "
+            f"lora_rank={int(args.groot_lora_rank)}, "
+            f"use_bf16={bool(args.groot_use_bf16)}"
+        )
+        print(
+            "- groot_optimizer: "
+            f"lr={float(args.groot_optimizer_lr)}, "
+            f"weight_decay={float(args.groot_optimizer_weight_decay)}, "
+            f"grad_clip_norm={float(args.groot_optimizer_grad_clip_norm)}, "
+            f"warmup_ratio={float(args.groot_warmup_ratio)}, "
+            f"decay_lr={groot_decay_lr}"
+        )
+        print(f"- ignored_features: {ignored_groot_features}")
     elif args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- diffusion: "
@@ -3845,7 +5770,19 @@ def main(argv: list[str] | None = None) -> None:
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    distributed_training_mode = str(args.distributed_training_mode)
+    local_sgd_requested = distributed_training_mode == "local_sgd"
+    ddp_kwargs_options = {
+        "find_unused_parameters": bool(args.ddp_find_unused_parameters)
+    }
+    if not bool(args.ddp_find_unused_parameters) and not local_sgd_requested:
+        try:
+            ddp_signature = inspect.signature(DistributedDataParallelKwargs)
+        except (TypeError, ValueError):
+            ddp_signature = None
+        if ddp_signature is not None and "static_graph" in ddp_signature.parameters:
+            ddp_kwargs_options["static_graph"] = True
+    ddp_kwargs = DistributedDataParallelKwargs(**ddp_kwargs_options)
     force_cpu = str(policy_cfg.device).split(":", 1)[0] == "cpu"
     accelerator = Accelerator(
         step_scheduler_with_optimizer=False,
@@ -3857,13 +5794,88 @@ def main(argv: list[str] | None = None) -> None:
         int(getattr(accelerator, "num_processes", distributed_world_size)),
         1,
     )
+    local_sgd_enabled = (
+        distributed_training_mode == "local_sgd" and accelerator_world_size > 1
+    )
+    local_sgd_initial_step = (
+        read_checkpoint_training_step(resume_run_state.checkpoint_dir)
+        if resume_run_state is not None
+        else 0
+    )
+    setattr(
+        accelerator,
+        "_corl_local_sgd_runtime",
+        LocalSGDRuntime(
+            enabled=local_sgd_enabled,
+            sync_every=max(1, int(args.local_sgd_sync_every)),
+            warmup_steps=max(0, int(args.local_sgd_warmup_steps)),
+            sync_optimizer_state=bool(args.local_sgd_sync_optimizer_state),
+            total_steps=max(0, int(args.steps)),
+            save_freq=int(args.save_freq),
+            step=local_sgd_initial_step,
+        ),
+    )
+    if local_sgd_enabled:
+        install_lerobot_local_sgd_update_policy_patch(lerobot_train_module)
     if accelerator.is_main_process:
+        if local_sgd_enabled:
+            distributed_batch_summary = (
+                f"local_update_batch_size={int(args.batch_size)}, "
+                "parallel_samples_per_local_step="
+                f"{int(args.batch_size) * accelerator_world_size}"
+            )
+        else:
+            distributed_batch_summary = (
+                f"per_device_batch_size={int(args.batch_size)}, "
+                "global_batch_size="
+                f"{int(args.batch_size) * accelerator_world_size}"
+            )
         print(
             "- distributed: "
             f"world_size={accelerator_world_size}, "
-            f"per_device_batch_size={int(args.batch_size)}, "
-            f"global_batch_size={int(args.batch_size) * accelerator_world_size}"
+            f"mode={distributed_training_mode}, "
+            f"{distributed_batch_summary}, "
+            "ddp_find_unused_parameters="
+            f"{bool(args.ddp_find_unused_parameters)}, "
+            f"ddp_static_graph={bool(ddp_kwargs_options.get('static_graph', False))}"
         )
+        if distributed_training_mode == "local_sgd":
+            print(
+                "- local_sgd: "
+                f"enabled={local_sgd_enabled}, "
+                f"sync_every={max(1, int(args.local_sgd_sync_every))}, "
+                f"warmup_steps={max(0, int(args.local_sgd_warmup_steps))}, "
+                "sync_optimizer_state="
+                f"{bool(args.local_sgd_sync_optimizer_state)}, "
+                f"initial_step={local_sgd_initial_step}"
+            )
+
+    fresh_distributed_output_reservation = None
+    if resume_run_state is None and accelerator_world_size > 1:
+        # Rank 0 must create the shared fresh-run directory without making
+        # LeRobot's non-resume overwrite guard reject the other ranks.
+        fresh_distributed_launch_id = resolve_fresh_distributed_launch_id(
+            output_dir=output_dir,
+            run_stamp=run_stamp,
+            world_size=accelerator_world_size,
+        )
+        fresh_distributed_output_reservation = reserve_fresh_distributed_output_dir(
+            output_dir=output_dir,
+            launch_id=fresh_distributed_launch_id,
+            run_stamp=run_stamp,
+            world_size=accelerator_world_size,
+            is_main_process=bool(accelerator.is_main_process),
+        )
+        register_lerobot_fresh_distributed_output_reservation(
+            TrainPipelineConfig,
+            fresh_distributed_output_reservation,
+        )
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            print(
+                "- distributed_output_reservation: "
+                f"{fresh_distributed_output_reservation.marker_path}"
+            )
 
     resume_config_arg = None
     if resume_run_state is not None and not any(
