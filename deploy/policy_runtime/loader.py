@@ -270,6 +270,7 @@ def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> Non
             install_groot_attention_implementation_patch,
             install_groot_meta_tensor_compatibility_patch,
             install_groot_processor_tensor_compatibility_patch,
+            install_groot_state_dict_compatibility_patch,
             install_groot_transformers_loading_compatibility_patch,
         )
     except ModuleNotFoundError as exc:
@@ -283,6 +284,7 @@ def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> Non
     install_groot_meta_tensor_compatibility_patch()
     install_groot_transformers_loading_compatibility_patch()
     install_groot_processor_tensor_compatibility_patch()
+    install_groot_state_dict_compatibility_patch()
 
 
 def _missing_dependency_error(

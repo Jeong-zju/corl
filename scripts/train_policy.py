@@ -766,6 +766,88 @@ def install_groot_processor_tensor_compatibility_patch() -> None:
     processor_groot._corl_groot_collate_tensor_patch_installed = True
 
 
+def _remap_groot_legacy_vision_model_state_dict_keys(
+    state_dict: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    legacy_substring = ".vision_model.vision_model."
+    if not any(legacy_substring in key for key in state_dict):
+        return state_dict, False
+
+    # Keep canonical keys first, then backfill legacy keys after collapsing one
+    # duplicated `vision_model` segment. This preserves already-correct entries
+    # when a checkpoint mixes both layouts.
+    remapped_state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if legacy_substring not in key
+    }
+    changed = False
+    for key, value in state_dict.items():
+        if legacy_substring not in key:
+            continue
+        changed = True
+        remapped_key = key.replace(legacy_substring, ".vision_model.", 1)
+        remapped_state_dict.setdefault(remapped_key, value)
+    return remapped_state_dict, changed
+
+
+def install_groot_state_dict_compatibility_patch() -> None:
+    """Accept Groot checkpoints saved with an older Eagle vision prefix layout."""
+    import lerobot.policies.pretrained as pretrained
+
+    if getattr(pretrained, "_corl_groot_state_dict_patch_installed", False):
+        return
+
+    from safetensors.torch import _remove_duplicate_names, load_file
+
+    original_load_model_as_safetensor = pretrained.load_model_as_safetensor
+
+    def load_model_as_safetensor_with_groot_compat(
+        model,
+        filename,
+        strict: bool = True,
+        device: str | int = "cpu",
+    ):
+        state_dict = load_file(filename, device=device)
+        if type(model).__name__ == "GrootPolicy":
+            state_dict, changed = _remap_groot_legacy_vision_model_state_dict_keys(
+                state_dict
+            )
+            if changed:
+                print(
+                    "[GROOT] Remapped legacy `vision_model.vision_model` checkpoint keys"
+                )
+
+        model_state_dict = model.state_dict()
+        to_removes = _remove_duplicate_names(
+            model_state_dict, preferred_names=state_dict.keys()
+        )
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing = set(missing)
+        for to_remove_group in to_removes.values():
+            for to_remove in to_remove_group:
+                if to_remove not in missing:
+                    unexpected.append(to_remove)
+                else:
+                    missing.remove(to_remove)
+        if strict and (missing or unexpected):
+            missing_keys = ", ".join([f'"{k}"' for k in sorted(missing)])
+            unexpected_keys = ", ".join([f'"{k}"' for k in sorted(unexpected)])
+            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
+            if missing:
+                error += f"\n    Missing key(s) in state_dict: {missing_keys}"
+            if unexpected:
+                error += f"\n    Unexpected key(s) in state_dict: {unexpected_keys}"
+            raise RuntimeError(error)
+        return missing, unexpected
+
+    pretrained.load_model_as_safetensor = load_model_as_safetensor_with_groot_compat
+    pretrained._corl_groot_original_load_model_as_safetensor = (
+        original_load_model_as_safetensor
+    )
+    pretrained._corl_groot_state_dict_patch_installed = True
+
+
 def install_groot_attention_implementation_patch(attn_implementation: str) -> None:
     """Patch LeRobot GR00T Eagle config loading away from unsupported FA2."""
     resolved_attn_implementation = str(attn_implementation or "").strip()
@@ -5040,6 +5122,7 @@ def main(argv: list[str] | None = None) -> None:
         install_groot_meta_tensor_compatibility_patch()
         install_groot_transformers_loading_compatibility_patch()
         install_groot_processor_tensor_compatibility_patch()
+        install_groot_state_dict_compatibility_patch()
     if policy_supports_signature_features(args.policy):
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
