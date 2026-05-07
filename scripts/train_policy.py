@@ -688,6 +688,51 @@ def install_groot_transformers_loading_compatibility_patch() -> None:
     model_cls._corl_groot_transformers_loading_patch_installed = True
 
 
+def _coerce_groot_action_inputs_batch_feature(action_inputs: object) -> object:
+    if not isinstance(action_inputs, dict):
+        return action_inputs
+    if hasattr(action_inputs, "embodiment_id"):
+        return action_inputs
+
+    batch_feature_type = None
+    try:
+        from transformers import BatchFeature
+
+        batch_feature_type = BatchFeature
+    except ImportError:
+        try:
+            from transformers.feature_extraction_utils import BatchFeature
+
+            batch_feature_type = BatchFeature
+        except ImportError:
+            return action_inputs
+
+    return batch_feature_type(data=action_inputs)
+
+
+def install_groot_action_input_batch_feature_compatibility_patch() -> None:
+    """Keep GR00T action inputs attribute-addressable after input packing."""
+    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
+    model_cls = groot_n1.GR00TN15
+    if getattr(
+        model_cls,
+        "_corl_groot_action_input_batch_feature_patch_installed",
+        False,
+    ):
+        return
+
+    original_prepare_input = model_cls.prepare_input
+
+    def prepare_input_with_batch_feature(*args, **kwargs):
+        backbone_inputs, action_inputs = original_prepare_input(*args, **kwargs)
+        action_inputs = _coerce_groot_action_inputs_batch_feature(action_inputs)
+        return backbone_inputs, action_inputs
+
+    model_cls.prepare_input = prepare_input_with_batch_feature
+    model_cls._corl_original_prepare_input = original_prepare_input
+    model_cls._corl_groot_action_input_batch_feature_patch_installed = True
+
+
 def install_groot_processor_tensor_compatibility_patch() -> None:
     """Keep GR00T Eagle preprocessing tensorized for newer Transformers."""
     import lerobot.policies.groot.processor_groot as processor_groot
@@ -5121,6 +5166,7 @@ def main(argv: list[str] | None = None) -> None:
         install_groot_attention_implementation_patch(args.groot_attn_implementation)
         install_groot_meta_tensor_compatibility_patch()
         install_groot_transformers_loading_compatibility_patch()
+        install_groot_action_input_batch_feature_compatibility_patch()
         install_groot_processor_tensor_compatibility_patch()
         install_groot_state_dict_compatibility_patch()
     if policy_supports_signature_features(args.policy):

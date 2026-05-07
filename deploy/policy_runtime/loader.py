@@ -272,6 +272,7 @@ def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
 def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> None:
     try:
         from train_policy import (
+            install_groot_action_input_batch_feature_compatibility_patch,
             install_groot_attention_implementation_patch,
             install_groot_meta_tensor_compatibility_patch,
             install_groot_processor_tensor_compatibility_patch,
@@ -288,6 +289,7 @@ def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> Non
     install_groot_attention_implementation_patch(attn_implementation)
     install_groot_meta_tensor_compatibility_patch()
     install_groot_transformers_loading_compatibility_patch()
+    install_groot_action_input_batch_feature_compatibility_patch()
     install_groot_processor_tensor_compatibility_patch()
     install_groot_state_dict_compatibility_patch()
 

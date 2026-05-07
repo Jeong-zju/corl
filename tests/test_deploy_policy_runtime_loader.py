@@ -238,7 +238,7 @@ def test_missing_pi05_dependency_error_uses_pi_extra() -> None:
     assert "lerobot[pi]==0.5.0" in message
 
 
-def test_groot_deploy_compatibility_patches_include_state_dict_compatibility(
+def test_groot_deploy_compatibility_patches_include_action_input_batch_feature_compatibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -258,6 +258,9 @@ def test_groot_deploy_compatibility_patches_include_state_dict_compatibility(
     fake_train_policy.install_groot_transformers_loading_compatibility_patch = _record(
         "transformers"
     )
+    fake_train_policy.install_groot_action_input_batch_feature_compatibility_patch = (
+        _record("action_input_batch_feature")
+    )
     fake_train_policy.install_groot_processor_tensor_compatibility_patch = _record(
         "processor"
     )
@@ -273,6 +276,7 @@ def test_groot_deploy_compatibility_patches_include_state_dict_compatibility(
         "attention",
         "meta",
         "transformers",
+        "action_input_batch_feature",
         "processor",
         "state_dict",
     ]
