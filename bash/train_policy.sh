@@ -11,6 +11,7 @@ cd "${REPO_ROOT}"
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1 --policy act
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy diffusion
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --steps 20000
+#   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy pi05
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy smolvla
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy groot
 #   ./bash/train_policy.sh --dataset zeno-ai/day3_5_Exp1_processed --policy streaming_act --resume --steps 40000

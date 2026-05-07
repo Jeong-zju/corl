@@ -114,19 +114,25 @@ wandb login
 cd data
 ./hfd.sh zeno-ai/CleanTableTopDelayedToolChoice --dataset --local-dir zeno-ai/CleanTableTopDelayedToolChoice --hf_username jeong-zju --hf_token <token>
 ./hfd.sh zeno-ai/BookOriginRelocation --dataset --local-dir zeno-ai/BookOriginRelocation --hf_username jeong-zju --hf_token <token>
+./hfd.sh zeno-ai/DailyLaundryOrganization --dataset --local-dir zeno-ai/DailyLaundryOrganization --hf_username jeong-zju --hf_token <token>
 cd ..
 python data/process_dataset.py zeno-ai/CleanTableTopDelayedToolChoice
 python data/process_dataset.py zeno-ai/BookOriginRelocation
+python data/process_dataset.py zeno-ai/DailyLaundryOrganization
 bash bash/train_policy.sh --dataset zeno-ai/CleanTableTopDelayedToolChoice --policy streaming_act
 bash bash/train_policy.sh --dataset zeno-ai/BookOriginRelocation --policy streaming_act
+bash bash/train_policy.sh --dataset zeno-ai/DailyLaundryOrganization --policy streaming_act
 vim bash/defaults/zeno-ai/CleanTableTopDelayedToolChoice/streaming_act.yaml
 vim bash/defaults/zeno-ai/BookOriginRelocation/streaming_act.yaml
+vim bash/defaults/zeno-ai/DailyLaundryOrganization/streaming_act.yaml
 
 (new terminal)
 
 python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/streaming-act-prism --repo-id zeno-ai/CleanTableTopDelayedToolChoice-streaming-act --mode full --watch
 
 python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism --repo-id zeno-ai/BookOriginRelocation-streaming-act --mode full --watch
+
+python scripts/upload_checkpoints_to_hf.py --train-output-root outputs/train/zeno-ai/DailyLaundryOrganization/streaming-act-prism --repo-id zeno-ai/DailyLaundryOrganization-streaming-act --mode full --watch
 ```
 
 # Test
@@ -157,4 +163,5 @@ git clone https://github.com/Jeong-zju/corl.git && cd corl/ && git switch develo
 
 vim bash/defaults/zeno-ai/BookOriginRelocation/streaming_act.yaml
 
-bash bash/install_deploy_zeno.sh --dataset zeno-ai/BookOriginRelocation --hf-token <hf-token> --wandb-token <wandb-token>
+bash bash/install_deploy_zeno.sh --dataset zeno-ai/BookOriginRelocation --policy pi05 --hf-token <hf-token> --wandb-token <wandb-token>
+bash bash/install_deploy_zeno.sh --dataset zeno-ai/DailyLaundryOrganization --policy streaming_act --hf-token <hf-token> --wandb-token <wandb-token>

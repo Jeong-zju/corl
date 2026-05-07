@@ -25,6 +25,20 @@ policy:
     left: observation.images.left
     right: observation.images.right
     top: observation.images.top
+command:
+  deadzone_linear_x: 0.02
+  deadzone_linear_y: 0.03
+  deadzone_angular_z: 0.04
+  mutual_exclusion:
+    enabled: true
+    rules:
+      - source_index: 0
+        threshold: 0.4
+        target_indices: [4, 10]
+      - source_index: 2
+        threshold: 0.2
+        target_indices: [1]
+        mask_value: -1.0
 """,
         encoding="utf-8",
     )
@@ -34,3 +48,11 @@ policy:
     assert cfg.policy.type == "groot"
     assert cfg.policy.task == "Return the book to its original location."
     assert cfg.policy.groot_attn_implementation == "sdpa"
+    assert cfg.command.deadzone_linear_x == 0.02
+    assert cfg.command.deadzone_linear_y == 0.03
+    assert cfg.command.deadzone_angular_z == 0.04
+    assert cfg.command.mutual_exclusion.enabled is True
+    assert len(cfg.command.mutual_exclusion.rules) == 2
+    assert cfg.command.mutual_exclusion.rules[0].source_index == 0
+    assert cfg.command.mutual_exclusion.rules[0].target_indices == (4, 10)
+    assert cfg.command.mutual_exclusion.rules[1].mask_value == -1.0

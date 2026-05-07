@@ -100,6 +100,9 @@ def _make_deploy_config(policy: PolicyConfig) -> DeployConfig:
             max_linear_x=1.0,
             max_linear_y=1.0,
             max_angular_z=1.0,
+            deadzone_linear_x=0.0,
+            deadzone_linear_y=0.0,
+            deadzone_angular_z=0.0,
         ),
     )
 
@@ -138,11 +141,14 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert cfg.n_action_steps == 1
 
 
-def test_policy_runtime_requires_vla_task_before_importing_lerobot() -> None:
+@pytest.mark.parametrize("policy_type", ["pi05", "smolvla"])
+def test_policy_runtime_requires_vla_task_before_importing_lerobot(
+    policy_type: str,
+) -> None:
     runtime = PolicyRuntime(
         _make_deploy_config(
             _make_policy_config(
-                type="smolvla",
+                type=policy_type,
                 task="",
             )
         )
@@ -165,23 +171,54 @@ def test_missing_vla_dependency_error_names_nested_module() -> None:
     assert "lerobot[smolvla]==0.5.0" in message
 
 
+def test_missing_pi05_dependency_error_uses_pi_extra() -> None:
+    error = _missing_dependency_error(
+        policy_name="PI05",
+        extra_name="pi",
+        exc=ModuleNotFoundError("No module named 'transformers'", name="transformers"),
+    )
+
+    message = str(error)
+    assert "`transformers`" in message
+    assert "pip install -r requirements.txt" in message
+    assert "lerobot[pi]==0.5.0" in message
+
+
+@pytest.mark.parametrize(
+    ("policy_type", "module_file", "module_name"),
+    [
+        (
+            "pi05",
+            "configuration_pi05.py",
+            "lerobot.policies.pi05.configuration_pi05",
+        ),
+        (
+            "smolvla",
+            "configuration_smolvla.py",
+            "lerobot.policies.smolvla.configuration_smolvla",
+        ),
+    ],
+)
 def test_lerobot_policy_import_shim_skips_eager_policy_inits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    policy_type: str,
+    module_file: str,
+    module_name: str,
 ) -> None:
     package_root = tmp_path / "lerobot"
-    smolvla_root = package_root / "policies" / "smolvla"
-    smolvla_root.mkdir(parents=True)
+    policy_root = package_root / "policies" / policy_type
+    policy_root.mkdir(parents=True)
     (package_root / "__init__.py").write_text("", encoding="utf-8")
     (package_root / "policies" / "__init__.py").write_text(
         "raise RuntimeError('eager policies init ran')\n",
         encoding="utf-8",
     )
-    (smolvla_root / "__init__.py").write_text(
-        "raise RuntimeError('eager smolvla init ran')\n",
+    (policy_root / "__init__.py").write_text(
+        f"raise RuntimeError('eager {policy_type} init ran')\n",
         encoding="utf-8",
     )
-    (smolvla_root / "configuration_smolvla.py").write_text(
+    (policy_root / module_file).write_text(
         "SENTINEL = 'loaded directly'\n",
         encoding="utf-8",
     )
@@ -196,10 +233,7 @@ def test_lerobot_policy_import_shim_skips_eager_policy_inits(
 
     monkeypatch.syspath_prepend(str(tmp_path))
     try:
-        module = _import_lerobot_policy_submodule(
-            "smolvla",
-            "lerobot.policies.smolvla.configuration_smolvla",
-        )
+        module = _import_lerobot_policy_submodule(policy_type, module_name)
         assert module.SENTINEL == "loaded directly"
     finally:
         for name in list(sys.modules):
