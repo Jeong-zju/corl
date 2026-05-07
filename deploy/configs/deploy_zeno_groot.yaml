@@ -1,6 +1,6 @@
 policy:
   type: groot
-  path: ../../outputs/train/zeno-ai/BookOriginRelocation/groot
+  path: ../../outputs/train/zeno-ai/BookOriginRelocation/groot/20260506_132134/checkpoints/180000
   task: Return the book to its original location.
   device: cuda
   load_device: null
