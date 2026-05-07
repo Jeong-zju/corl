@@ -85,9 +85,10 @@ def _install_lerobot_policies_namespace_shim() -> Path | None:
     """Avoid LeRobot 0.5.0's eager `lerobot.policies` imports during deploy.
 
     LeRobot's policy package imports every policy config at package import time.
-    In Python 3.12, the GR00T dataclass currently raises before SmolVLA deploy
-    can even import its own modules.  Treating `lerobot.policies` as a namespace
-    package lets us import only the concrete policy submodules we need.
+    On some Python 3.12 / older LeRobot combinations, the GR00T dataclass
+    raises during import before deploy can reach the policy it actually needs.
+    Treating `lerobot.policies` as a namespace package lets us import only the
+    concrete policy submodules we need.
     """
     existing = sys.modules.get("lerobot.policies")
     if existing is not None and getattr(existing, "__path__", None):

@@ -631,9 +631,43 @@ def _ensure_groot_transformers_loading_attrs(model: object) -> None:
                 setattr(model, attr_name, {value})
 
 
+def _import_groot_n1_with_kw_only_dataclass_compatibility():
+    """Import GR00T N1 while tolerating older dataclass field ordering bugs."""
+    import dataclasses as stdlib_dataclasses
+
+    original_dataclass = stdlib_dataclasses.dataclass
+
+    def dataclass_with_groot_kw_only(cls=None, /, **kwargs):
+        if cls is None:
+            def wrap(inner_cls):
+                return dataclass_with_groot_kw_only(inner_cls, **kwargs)
+
+            return wrap
+
+        try:
+            return original_dataclass(cls, **kwargs)
+        except TypeError as exc:
+            if (
+                getattr(cls, "__module__", "") == "lerobot.policies.groot.groot_n1"
+                and "non-default argument" in str(exc)
+                and "follows default argument" in str(exc)
+            ):
+                patched_kwargs = dict(kwargs)
+                patched_kwargs["kw_only"] = True
+                return original_dataclass(cls, **patched_kwargs)
+            raise
+
+    stdlib_dataclasses.dataclass = dataclass_with_groot_kw_only
+    try:
+        import lerobot.policies.groot.groot_n1 as groot_n1
+    finally:
+        stdlib_dataclasses.dataclass = original_dataclass
+    return groot_n1
+
+
 def install_groot_transformers_loading_compatibility_patch() -> None:
     """Provide newer Transformers post-init attrs missing in LeRobot GR00T."""
-    import lerobot.policies.groot.groot_n1 as groot_n1
+    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
 
     model_cls = groot_n1.GR00TN15
     if getattr(
@@ -738,7 +772,7 @@ def install_groot_attention_implementation_patch(attn_implementation: str) -> No
     if not resolved_attn_implementation:
         return
 
-    import lerobot.policies.groot.groot_n1 as groot_n1
+    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
     from transformers.models.llama.modeling_llama import LlamaForCausalLM
     from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
     from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
