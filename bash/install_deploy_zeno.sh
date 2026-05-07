@@ -31,6 +31,7 @@ LOG_ROOT=""
 DATASETS=(
   "zeno-ai/CleanTableTopDelayedToolChoice"
   "zeno-ai/BookOriginRelocation"
+  "zeno-ai/DailyLaundryOrganization"
 )
 CUSTOM_DATASETS=0
 TRAIN_EXTRA_ARGS=()
@@ -59,8 +60,10 @@ Options:
   --hf-username USER            Hugging Face username for gated dataset checks.
                                 Default: jeong-zju
   --dataset REPO_ID             Dataset repo id to handle. Can be repeated.
-                                Defaults to the two zeno-ai datasets in README.
+                                Defaults to the zeno-ai datasets in README.
   --policy POLICY               Policy name passed to bash/train_policy.sh.
+                                Supports the same policies as train_policy.sh,
+                                including streaming_act, pi05, smolvla, and groot.
                                 Default: streaming_act
   --python-bin PATH             Python executable. Default: python3
   --download-tool aria2c|wget   Downloader for data/hfd.sh. Default: aria2c
@@ -86,6 +89,8 @@ Options:
 Examples:
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --skip-train
+  bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --policy pi05
+  bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --dataset zeno-ai/DailyLaundryOrganization --policy streaming_act
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --dataset zeno-ai/BookOriginRelocation -- --steps 1000
 EOF
 }

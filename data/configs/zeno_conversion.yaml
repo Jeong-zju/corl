@@ -1,8 +1,8 @@
 dataset:
-  data_root: data/zeno-ai/mem-book-merge
+  data_root: data/zeno-ai/mem-cloth-merge
   output_dir: data/zeno-ai
-  output_name: BookOriginRelocation
-  task_label: "pick and place"
+  output_name: DailyLaundryOrganization
+  task_label: "daily laundry organization"
   robot_type: zeno
   bag_glob: "*.bag"
   overwrite_output: true
