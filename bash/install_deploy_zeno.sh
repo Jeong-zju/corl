@@ -18,6 +18,8 @@ DOWNLOAD_TOOL="aria2c"
 DOWNLOAD_THREADS=4
 DOWNLOAD_JOBS=5
 POLICY="streaming_act"
+HF_MIRROR_ENDPOINT="https://hf-mirror.com"
+HF_OFFICIAL_ENDPOINT="https://huggingface.co"
 INSTALL_SYSTEM_DEPS=1
 INSTALL_PYTHON_DEPS=1
 DOWNLOAD_DATASETS=1
@@ -37,6 +39,7 @@ CUSTOM_DATASETS=0
 TRAIN_EXTRA_ARGS=()
 CHILD_PIDS=()
 STARTED_BG_PID=""
+POLICY_HF_ENDPOINT=""
 
 usage() {
   cat <<'EOF'
@@ -138,6 +141,20 @@ format_cmd() {
     fi
   done
   printf "%q " "${display[@]}"
+}
+
+resolve_policy_hf_endpoint() {
+  POLICY_HF_ENDPOINT=""
+  if [[ "${POLICY}" != "pi05" ]]; then
+    return 0
+  fi
+
+  local current_endpoint="${HF_ENDPOINT:-}"
+  current_endpoint="${current_endpoint%/}"
+  if [[ "${current_endpoint}" == "${HF_MIRROR_ENDPOINT}" ]]; then
+    POLICY_HF_ENDPOINT="${HF_OFFICIAL_ENDPOINT}"
+    log "Policy pi05 will use ${HF_OFFICIAL_ENDPOINT} for model/tokenizer access during training and checkpoint upload."
+  fi
 }
 
 run_cmd() {
@@ -548,11 +565,19 @@ stop_background_process() {
 run_final_checkpoint_upload() {
   local run_dir="$1"
   local repo_id="$2"
-  run_cmd \
-    "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
-    --run-dir "${run_dir}" \
-    --repo-id "${repo_id}" \
-    --mode full
+  if [[ -n "${POLICY_HF_ENDPOINT}" ]]; then
+    run_cmd env "HF_ENDPOINT=${POLICY_HF_ENDPOINT}" \
+      "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+      --run-dir "${run_dir}" \
+      --repo-id "${repo_id}" \
+      --mode full
+  else
+    run_cmd \
+      "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+      --run-dir "${run_dir}" \
+      --repo-id "${repo_id}" \
+      --mode full
+  fi
 }
 
 train_dataset() {
@@ -577,12 +602,24 @@ train_dataset() {
   log "Upload repo: ${repo_id}"
 
   if ((DRY_RUN)); then
-    run_cmd env "CORL_TRAIN_RUN_STAMP=${run_stamp}" \
-      bash bash/train_policy.sh --dataset "${dataset}" --policy "${POLICY}" \
-      "${TRAIN_EXTRA_ARGS[@]}"
+    if [[ -n "${POLICY_HF_ENDPOINT}" ]]; then
+      run_cmd env "HF_ENDPOINT=${POLICY_HF_ENDPOINT}" "CORL_TRAIN_RUN_STAMP=${run_stamp}" \
+        bash bash/train_policy.sh --dataset "${dataset}" --policy "${POLICY}" \
+        "${TRAIN_EXTRA_ARGS[@]}"
+    else
+      run_cmd env "CORL_TRAIN_RUN_STAMP=${run_stamp}" \
+        bash bash/train_policy.sh --dataset "${dataset}" --policy "${POLICY}" \
+        "${TRAIN_EXTRA_ARGS[@]}"
+    fi
     if ((UPLOAD_WATCH)); then
-      run_cmd "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
-        --run-dir "${run_dir}" --repo-id "${repo_id}" --mode full --watch
+      if [[ -n "${POLICY_HF_ENDPOINT}" ]]; then
+        run_cmd env "HF_ENDPOINT=${POLICY_HF_ENDPOINT}" \
+          "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+          --run-dir "${run_dir}" --repo-id "${repo_id}" --mode full --watch
+      else
+        run_cmd "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+          --run-dir "${run_dir}" --repo-id "${repo_id}" --mode full --watch
+      fi
     fi
     return 0
   fi
@@ -594,6 +631,9 @@ train_dataset() {
     export HF_TOKEN
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
     [[ -n "${WANDB_TOKEN}" ]] && export WANDB_API_KEY="${WANDB_TOKEN}"
+    if [[ -n "${POLICY_HF_ENDPOINT}" ]]; then
+      export HF_ENDPOINT="${POLICY_HF_ENDPOINT}"
+    fi
     bash bash/train_policy.sh --dataset "${dataset}" --policy "${POLICY}" \
       "${TRAIN_EXTRA_ARGS[@]}" >>"${train_log}" 2>&1
   ) &
@@ -610,12 +650,22 @@ train_dataset() {
     local wait_status=0
     wait_for_run_dir "${run_dir}" "${train_pid}" "${UPLOAD_START_TIMEOUT}" || wait_status=$?
     if ((wait_status == 0)); then
-      start_background "${upload_log}" \
-        "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
-        --run-dir "${run_dir}" \
-        --repo-id "${repo_id}" \
-        --mode full \
-        --watch
+      if [[ -n "${POLICY_HF_ENDPOINT}" ]]; then
+        start_background "${upload_log}" \
+          env "HF_ENDPOINT=${POLICY_HF_ENDPOINT}" \
+          "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+          --run-dir "${run_dir}" \
+          --repo-id "${repo_id}" \
+          --mode full \
+          --watch
+      else
+        start_background "${upload_log}" \
+          "${PYTHON_BIN}" scripts/upload_checkpoints_to_hf.py \
+          --run-dir "${run_dir}" \
+          --repo-id "${repo_id}" \
+          --mode full \
+          --watch
+      fi
       upload_pid="${STARTED_BG_PID}"
       log "Upload watcher PID: ${upload_pid}"
     elif ((wait_status == 2)); then
@@ -653,6 +703,7 @@ main() {
   parse_args "$@"
   validate_args
   configure_tokens
+  resolve_policy_hf_endpoint
 
   if [[ -z "${LOG_ROOT}" ]]; then
     LOG_ROOT="outputs/deploy_logs/$(date +%Y%m%d_%H%M%S)"

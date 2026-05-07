@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +72,8 @@ SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
 GROOT_DEFAULT_BASE_MODEL_PATH = "nvidia/GR00T-N1.5-3B"
 GROOT_DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 GROOT_DEFAULT_ATTN_IMPLEMENTATION = "eager"
+HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
+HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
 SIGNATURE_FEATURE_KEYS = (
     PATH_SIGNATURE_FEATURE_KEY,
     DELTA_SIGNATURE_FEATURE_KEY,
@@ -79,6 +81,39 @@ SIGNATURE_FEATURE_KEYS = (
     PREFIX_DELTA_SIGNATURE_FEATURE_KEY,
 )
 _IGNORED_DATASET_FEATURE_KEYS: tuple[str, ...] = ()
+
+
+@contextmanager
+def temporarily_use_official_hf_endpoint_for_pi05(policy_name: str):
+    """Route pi05 tokenizer/model downloads to the official Hugging Face endpoint.
+
+    pi05 depends on a gated PaliGemma tokenizer repo. When the global endpoint is a
+    mirror, the mirror can return 403 even if the local HF login is valid. For pi05
+    runs we therefore retry through huggingface.co so the tokenizer can be resolved
+    directly from the source of truth.
+    """
+
+    current_endpoint = os.environ.get("HF_ENDPOINT")
+    normalized_endpoint = current_endpoint.rstrip("/") if current_endpoint else None
+    should_override = policy_name == "pi05" and normalized_endpoint == HF_MIRROR_ENDPOINT
+
+    if not should_override:
+        yield
+        return
+
+    print(
+        "[INFO] HF_ENDPOINT is set to hf-mirror.com. "
+        "pi05 loads a gated PaliGemma tokenizer, so training will temporarily use "
+        "https://huggingface.co for model/tokenizer downloads."
+    )
+    os.environ["HF_ENDPOINT"] = HF_OFFICIAL_ENDPOINT
+    try:
+        yield
+    finally:
+        if current_endpoint is None:
+            os.environ.pop("HF_ENDPOINT", None)
+        else:
+            os.environ["HF_ENDPOINT"] = current_endpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -6406,7 +6441,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.argv.append(resume_config_arg)
 
     try:
-        train(cfg, accelerator=accelerator)
+        with temporarily_use_official_hf_endpoint_for_pi05(args.policy):
+            train(cfg, accelerator=accelerator)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             saved_split_path = save_dataset_split(output_dir, split_spec)
