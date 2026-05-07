@@ -21,7 +21,7 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - `policy.task`：pi05 / SmolVLA / GROOT 的语言指令；部署 VLA policy 时必须填写
 - `policy.device`：推理设备
 - `policy.groot_attn_implementation`：GROOT 加载时注入到 Transformers 的 attention 实现，默认 `eager`
-- `policy.temporal_ensemble_coeff`：`0` 表示按 `n_action_steps` 开环执行；非 `0` 表示每步推理一次，并按该系数做 temporal ensemble（deploy 会强制按单步执行，即 `n_action_steps=1`）
+- `policy.temporal_ensemble_coeff`：`0` 表示按 `n_action_steps` 开环执行；非 `0` 时，如果策略 config 自带 `temporal_ensemble_coeff`，deploy 会每步推理并按该系数做 temporal ensemble（deploy 会强制按单步执行，即 `n_action_steps=1`）；如果是 GR00T 且模型 config 没有这个字段，deploy 会把它降级成输出端动作平滑，同时保留 `n_action_steps`
 - `ros.topics.*`：订阅/发布话题
 - `runtime.control_hz`：推理控制频率
 - `ros.joint_names_left.name` / `ros.joint_names_right.name`
@@ -43,9 +43,10 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - 如果你的 checkpoint 依赖 `path_signature` / `delta_signature`，node 现在会优先按 checkpoint 真实配置自动开启在线 signature 计算，不再要求你在 deploy YAML 里手工保持一致。
 - 如果 checkpoint 把 signature 特征标记成 `pre_normalized_observation_keys`，deploy 会自动从训练 run 关联的数据集 `meta/stats.json` 读取统计量，对在线 `path_signature` / `delta_signature` 做同样的归一化；为了抑制真实机器人噪声在零方差维度上的放大，归一化前还会先裁到训练数据的 `min/max` 支持范围内。
 - 对 `streaming_act` 的 PRISM 变体，在线部署走的是“当前帧 + 在线 visual prefix memory / slot memory 更新”路径，不需要每步重建显式 prefix sequence tensor。
-- 对 `pi05` / `smolvla` / `groot`，deploy 会把 YAML 里的 `policy.task` 随每帧 observation 送入 LeRobot processor；`policy.temporal_ensemble_coeff` 应保持 `0`，由策略预测 action chunk 后按 `n_action_steps` 开环消费。
+- 对 `pi05` / `smolvla`，deploy 会把 YAML 里的 `policy.task` 随每帧 observation 送入 LeRobot processor；`policy.temporal_ensemble_coeff` 应保持 `0`，由策略预测 action chunk 后按 `n_action_steps` 开环消费。
+- 对 `groot`，deploy 同样会把 `policy.task` 送入 LeRobot processor；如果 `policy.temporal_ensemble_coeff` 非 `0`，它会被当成输出端动作平滑系数，而不是模型内部的 temporal ensemble。
 - 如果图像颜色和训练时不一致，优先改 YAML 里的 `image.color_order`。
-- `policy.temporal_ensemble_coeff=0` 时，deploy 会缓存一段 action chunk 并开环消费；`!=0` 时，每个控制周期都会重新推理，并使用 temporal ensemble 输出当前动作。
+- `policy.temporal_ensemble_coeff=0` 时，deploy 会缓存一段 action chunk 并开环消费；`!=0` 时，ACT / Streaming ACT 会每个控制周期重新推理并使用 temporal ensemble，GR00T 则会对输出动作做平滑。
 
 视觉调试：
 

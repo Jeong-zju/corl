@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -140,6 +141,58 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert enabled is True
     assert cfg.temporal_ensemble_coeff == 0.01
     assert cfg.n_action_steps == 1
+
+
+def test_apply_deploy_policy_overrides_allows_groot_action_smoothing_fallback() -> None:
+    cfg = SimpleNamespace(
+        n_action_steps=25,
+    )
+
+    coeff, enabled = apply_deploy_policy_overrides(
+        cfg,
+        _make_policy_config(
+            type="groot",
+            n_action_steps=16,
+            temporal_ensemble_coeff=0.05,
+        ),
+    )
+
+    assert coeff == 0.05
+    assert enabled is False
+    assert cfg.n_action_steps == 16
+    assert not hasattr(cfg, "temporal_ensemble_coeff")
+
+
+def test_policy_runtime_applies_action_smoothing_for_groot_fallback() -> None:
+    runtime = PolicyRuntime(
+        _make_deploy_config(
+            _make_policy_config(
+                type="groot",
+                temporal_ensemble_coeff=0.05,
+            )
+        )
+    )
+    runtime.action_smoothing_enabled = True
+    runtime.temporal_ensemble_coeff = 0.05
+    runtime.gripper_hysteresis = None
+    runtime._smoothed_action = None
+
+    first = runtime._apply_action_filters(
+        np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        {},
+    )
+    second = runtime._apply_action_filters(
+        np.asarray([10.0, 11.0, 12.0], dtype=np.float32),
+        {},
+    )
+
+    decay = float(np.exp(-0.05))
+    expected_second = decay * np.asarray([0.0, 1.0, 2.0], dtype=np.float32) + (
+        1.0 - decay
+    ) * np.asarray([10.0, 11.0, 12.0], dtype=np.float32)
+
+    assert np.allclose(first, [0.0, 1.0, 2.0])
+    assert np.allclose(second, expected_second)
 
 
 @pytest.mark.parametrize("policy_type", ["pi05", "smolvla"])

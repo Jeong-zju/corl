@@ -241,11 +241,16 @@ def apply_deploy_policy_overrides(
         cfg.temporal_ensemble_coeff = (
             temporal_ensemble_coeff if temporal_ensemble_enabled else None
         )
-    elif temporal_ensemble_enabled:
+    elif temporal_ensemble_enabled and deploy_policy.type != "groot":
         raise ValueError(
             "Deploy `policy.temporal_ensemble_coeff` is only supported for policies "
             "whose config exposes `temporal_ensemble_coeff`."
         )
+    elif temporal_ensemble_enabled:
+        # GR00T configs do not currently expose a temporal ensemble knob, so the
+        # deploy runtime will smooth emitted actions instead of mutating the model
+        # config or forcing one-step inference.
+        temporal_ensemble_enabled = False
 
     if temporal_ensemble_enabled:
         # Temporal ensembling must query the policy at every control step.
@@ -378,8 +383,10 @@ class PolicyRuntime:
         self.visual_keys = list(config.policy.image_keys.values())
         self.temporal_ensemble_coeff = float(config.policy.temporal_ensemble_coeff)
         self.temporal_ensemble_enabled = self.temporal_ensemble_coeff != 0.0
+        self.action_smoothing_enabled = False
         self._supports_action_chunk_prediction = False
         self._open_loop_action_queue: deque[tuple[np.ndarray, int]] = deque()
+        self._smoothed_action: np.ndarray | None = None
 
     def load(self) -> None:
         policy_path = self.deploy_config.policy.path
@@ -441,12 +448,18 @@ class PolicyRuntime:
             self.temporal_ensemble_coeff,
             self.temporal_ensemble_enabled,
         ) = apply_deploy_policy_overrides(cfg, self.deploy_config.policy)
+        self.action_smoothing_enabled = (
+            self.deploy_config.policy.type == "groot"
+            and self.temporal_ensemble_coeff != 0.0
+            and not hasattr(cfg, "temporal_ensemble_coeff")
+        )
 
         if hasattr(policy, "to"):
             policy.to(self.deploy_config.policy.device)
         policy.eval()
         if hasattr(policy, "reset"):
             policy.reset()
+        self._smoothed_action = None
 
         preprocessor_overrides = {
             "device_processor": {"device": self.deploy_config.policy.device},
@@ -493,6 +506,7 @@ class PolicyRuntime:
 
     def reset(self) -> None:
         self._open_loop_action_queue.clear()
+        self._smoothed_action = None
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
         if self.gripper_hysteresis is not None:
@@ -502,6 +516,8 @@ class PolicyRuntime:
     def execution_summary(self) -> str:
         if self.temporal_ensemble_enabled:
             return f"temporal_ensemble(coeff={self.temporal_ensemble_coeff:g})"
+        if self.action_smoothing_enabled:
+            return f"action_smoothing(coeff={self.temporal_ensemble_coeff:g})"
         n_action_steps = (
             1
             if self.cfg is None
@@ -530,11 +546,29 @@ class PolicyRuntime:
             return {}
         return {"debug": self._debug_to_numpy(getter())}
 
+    def _apply_action_smoothing(self, action: np.ndarray) -> np.ndarray:
+        vector = np.asarray(action, dtype=np.float32).reshape(-1)
+        if not self.action_smoothing_enabled:
+            return vector
+
+        # Use an exponential moving average as the deploy-side fallback for
+        # policies that do not expose native temporal ensembling.
+        if self._smoothed_action is None or self._smoothed_action.shape != vector.shape:
+            self._smoothed_action = vector.copy()
+            return self._smoothed_action.copy()
+
+        decay = float(np.exp(-self.temporal_ensemble_coeff))
+        self._smoothed_action = (
+            decay * self._smoothed_action + (1.0 - decay) * vector
+        ).astype(np.float32, copy=False)
+        return self._smoothed_action.copy()
+
     def _apply_action_filters(
         self,
         action: np.ndarray,
         observation_packet: dict[str, Any],
     ) -> np.ndarray:
+        action = self._apply_action_smoothing(action)
         if self.gripper_hysteresis is not None:
             action = self.gripper_hysteresis.apply(
                 action,
