@@ -36,6 +36,7 @@ from eval_helpers import (  # noqa: E402
     import_local_streaming_act_policy_class,
     load_streaming_act_config_from_pretrained_dir,
     resolve_policy_dir,
+    quiet_transformers_loading,
 )
 from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
@@ -425,11 +426,12 @@ class PolicyRuntime:
             self.deploy_config.policy.load_device or self.deploy_config.policy.device
         )
         cfg.device = load_device
-        policy = policy_cls.from_pretrained(
-            self.policy_dir,
-            config=cfg,
-            local_files_only=local_files_only,
-        )
+        with quiet_transformers_loading():
+            policy = policy_cls.from_pretrained(
+                self.policy_dir,
+                config=cfg,
+                local_files_only=local_files_only,
+            )
 
         cfg = policy.config
         cfg.device = self.deploy_config.policy.device

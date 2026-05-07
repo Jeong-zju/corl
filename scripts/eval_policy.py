@@ -37,6 +37,7 @@ from eval_helpers import (
     load_streaming_act_config_from_pretrained_dir,
     resolve_eval_policy_path,
     resolve_signature_backend,
+    quiet_transformers_loading,
     write_summary,
 )
 from policy_capabilities import (
@@ -2418,11 +2419,12 @@ def main(argv: list[str] | None = None) -> None:
 
     policy_load_start_s = time.perf_counter()
     print("[load] Loading policy weights...")
-    policy = policy_cls.from_pretrained(
-        policy_dir,
-        config=cfg,
-        local_files_only=local_files_only,
-    )
+    with quiet_transformers_loading():
+        policy = policy_cls.from_pretrained(
+            policy_dir,
+            config=cfg,
+            local_files_only=local_files_only,
+        )
     print(
         "[timing] Policy weights loaded in "
         f"{format_elapsed_s(time.perf_counter() - policy_load_start_s)}"

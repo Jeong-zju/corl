@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -22,6 +22,7 @@ from deploy.config import (
     TopicConfig,
 )
 from deploy.gripper_hysteresis import GripperHysteresisConfig
+import deploy.policy_runtime.loader as loader
 from deploy.policy_runtime.loader import (
     PolicyRuntime,
     _import_lerobot_policy_submodule,
@@ -182,6 +183,115 @@ def test_missing_pi05_dependency_error_uses_pi_extra() -> None:
     assert "`transformers`" in message
     assert "pip install -r requirements.txt" in message
     assert "lerobot[pi]==0.5.0" in message
+
+
+def test_policy_runtime_load_quiets_transformers_loading_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_sequence: list[object] = []
+
+    class FakeTransformersLogging:
+        def __init__(self) -> None:
+            self.verbosity = 11
+
+        def get_verbosity(self) -> int:
+            call_sequence.append(("get", self.verbosity))
+            return self.verbosity
+
+        def set_verbosity_error(self) -> None:
+            call_sequence.append("set_error")
+            self.verbosity = 40
+
+        def set_verbosity(self, level: int) -> None:
+            call_sequence.append(("set", level))
+            self.verbosity = level
+
+    fake_logging = FakeTransformersLogging()
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_utils = ModuleType("transformers.utils")
+    fake_transformers_utils.logging = fake_logging
+    fake_transformers.utils = fake_transformers_utils
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_transformers_utils)
+
+    dummy_cfg = SimpleNamespace(
+        device=None,
+        n_action_steps=8,
+        temporal_ensemble_coeff=None,
+        image_features={
+            "observation.images.left": SimpleNamespace(shape=(3, 224, 224)),
+        },
+    )
+
+    class DummyPreTrainedConfig:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return dummy_cfg
+
+    class DummyPolicy:
+        def __init__(self, config):
+            self.config = config
+            self.to_calls: list[str] = []
+            self.eval_called = False
+            self.reset_called = False
+
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            assert fake_logging.verbosity == 40
+            return DummyPolicy(dummy_cfg)
+
+        def to(self, device: str):
+            self.to_calls.append(device)
+
+        def eval(self):
+            self.eval_called = True
+
+        def reset(self):
+            self.reset_called = True
+
+    monkeypatch.setattr(
+        loader,
+        "_load_lerobot_pretrained_config_class",
+        lambda policy_type: DummyPreTrainedConfig,
+    )
+    monkeypatch.setattr(
+        loader,
+        "resolve_policy_dir",
+        lambda policy_path: Path("/tmp/fake_policy"),
+    )
+    monkeypatch.setattr(
+        loader,
+        "resolve_deploy_policy_class",
+        lambda policy_type, deploy_policy: DummyPolicy,
+    )
+    monkeypatch.setattr(
+        loader,
+        "_make_deploy_pre_post_processors",
+        lambda **kwargs: ("pre", "post"),
+    )
+
+    runtime = PolicyRuntime(
+        _make_deploy_config(
+            _make_policy_config(
+                type="groot",
+                task="Return the book to its original location.",
+                path=Path("/tmp/fake_policy"),
+                device="cuda",
+                load_device="cpu",
+            )
+        )
+    )
+
+    runtime.load()
+
+    assert fake_logging.verbosity == 11
+    assert ("set", 11) in call_sequence
+    assert "set_error" in call_sequence
+    assert runtime.policy is not None
+    assert runtime.policy.to_calls == ["cuda"]
+    assert runtime.policy.eval_called is True
+    assert runtime.policy.reset_called is True
 
 
 @pytest.mark.parametrize(
