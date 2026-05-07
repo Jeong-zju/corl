@@ -61,9 +61,9 @@ train:
   slot_memory_use_delta_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
-  slot_memory_balance_loss_coef: 0.05
-  slot_memory_entropy_loss_coef: 0.0
-  slot_memory_consistency_loss_coef: 0.002
+  slot_memory_balance_loss_coef: 0.02
+  slot_memory_entropy_loss_coef: 0.003
+  slot_memory_consistency_loss_coef: 0.0
   history_length: 0
   signature_dim: 0
   signature_depth: 3
