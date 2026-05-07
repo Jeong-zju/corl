@@ -1,10 +1,10 @@
 policy:
   type: smolvla
-  path: ../../outputs/train/zeno-ai/BookOriginRelocation/smolvla
+  path: ../../outputs/train/zeno-ai/BookOriginRelocation/smolvla/20260505_154159/checkpoints/180000
   task: Return the book to its original location.
   device: cuda
   load_device: null
-  n_action_steps: 16
+  n_action_steps: 100
   temporal_ensemble_coeff: 0.0
   state_dim: 17
   action_dim: 17
