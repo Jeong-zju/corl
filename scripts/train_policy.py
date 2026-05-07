@@ -692,6 +692,12 @@ def _import_groot_n1_with_kw_only_dataclass_compatibility():
                 return original_dataclass(cls, **patched_kwargs)
             raise
 
+    # Torch imports this temporary replacement as `dataclass` and probes
+    # `__kwdefaults__` to decide whether `kw_only` is supported, so preserve the
+    # stdlib metadata on the wrapper before handing it to the import machinery.
+    dataclass_with_groot_kw_only.__kwdefaults__ = dict(
+        original_dataclass.__kwdefaults__ or {}
+    )
     stdlib_dataclasses.dataclass = dataclass_with_groot_kw_only
     try:
         import lerobot.policies.groot.groot_n1 as groot_n1

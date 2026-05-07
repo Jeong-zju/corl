@@ -57,6 +57,78 @@ def test_import_groot_n1_with_kw_only_dataclass_compatibility_recovers_from_bug(
         sys.modules.update(original_modules)
 
 
+def test_import_groot_n1_with_kw_only_dataclass_compatibility_preserves_kwdefaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "lerobot"
+    policies_root = package_root / "policies"
+    groot_root = policies_root / "groot"
+    torch_root = tmp_path / "torch"
+    distributed_root = torch_root / "distributed"
+    tensor_root = distributed_root / "tensor"
+    groot_root.mkdir(parents=True)
+    tensor_root.mkdir(parents=True)
+
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (policies_root / "__init__.py").write_text(
+        "from torch.distributed.tensor import placement_types\n",
+        encoding="utf-8",
+    )
+    (groot_root / "__init__.py").write_text("", encoding="utf-8")
+    (groot_root / "groot_n1.py").write_text(
+        "from dataclasses import dataclass\n"
+        "\n"
+        "@dataclass\n"
+        "class GR00TN15Config:\n"
+        '    compute_dtype: str = "float32"\n'
+        "    backbone_cfg: dict\n",
+        encoding="utf-8",
+    )
+    (torch_root / "__init__.py").write_text("", encoding="utf-8")
+    (distributed_root / "__init__.py").write_text("", encoding="utf-8")
+    (tensor_root / "__init__.py").write_text("", encoding="utf-8")
+    (tensor_root / "placement_types.py").write_text(
+        "from dataclasses import dataclass\n"
+        "\n"
+        "KW_ONLY_METADATA_PRESENT = 'kw_only' in dataclass.__kwdefaults__\n",
+        encoding="utf-8",
+    )
+
+    original_lerobot_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "lerobot" or name.startswith("lerobot.")
+    }
+    original_torch_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "torch" or name.startswith("torch.")
+    }
+    for name in original_lerobot_modules:
+        sys.modules.pop(name, None)
+    for name in original_torch_modules:
+        sys.modules.pop(name, None)
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        module = _import_groot_n1_with_kw_only_dataclass_compatibility()
+        placement_types = sys.modules["torch.distributed.tensor.placement_types"]
+        cfg = module.GR00TN15Config(backbone_cfg={"hidden_size": 1})
+
+        assert cfg.compute_dtype == "float32"
+        assert cfg.backbone_cfg == {"hidden_size": 1}
+        assert placement_types.KW_ONLY_METADATA_PRESENT is True
+    finally:
+        for name in list(sys.modules):
+            if name == "lerobot" or name.startswith("lerobot."):
+                sys.modules.pop(name, None)
+            if name == "torch" or name.startswith("torch."):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_lerobot_modules)
+        sys.modules.update(original_torch_modules)
+
+
 def test_install_groot_action_input_batch_feature_compatibility_patch_wraps_dicts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
