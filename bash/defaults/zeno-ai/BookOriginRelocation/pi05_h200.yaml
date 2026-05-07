@@ -1,8 +1,5 @@
 # pi05 defaults for zeno-ai/BookOriginRelocation on H200.
-# Throughput-oriented preset for large-memory datacenter GPUs:
-# - larger per-device batch than the 5090 preset
-# - bf16 AMP + compiled model
-# - no gradient checkpointing
+# Thin override over the base pi05 preset.
 train:
   dataset_root: data/zeno-ai/BookOriginRelocation
   dataset_repo_id: zeno-ai/BookOriginRelocation
@@ -44,41 +41,7 @@ train:
   enable_wandb: true
   wandb_console: 'off'
   wandb_service_wait: 10
-  policy_path: lerobot/pi05_base
-  n_obs_steps: 1
-  max_state_dim: 32
-  max_action_dim: 32
-  empty_cameras: 0
-  tokenizer_max_length: 200
-  freeze_vision_encoder: true
-  train_expert_only: true
-  optimizer_lr: 2.5e-05
-  optimizer_betas:
-  - 0.9
-  - 0.95
-  optimizer_eps: 1.0e-08
-  optimizer_weight_decay: 0.01
-  optimizer_grad_clip_norm: 1.0
-  scheduler_warmup_steps: 1000
-  scheduler_decay_steps: 30000
-  scheduler_decay_lr: 2.5e-06
-  min_period: 0.004
-  max_period: 4.0
-  compile_model: true
-  compile_mode: max-autotune
-  image_resolution:
-  - 224
-  - 224
-  num_inference_steps: 10
-  paligemma_variant: gemma_2b
-  action_expert_variant: gemma_300m
   dtype: bfloat16
-  ignore_signature: true
-  gradient_checkpointing: false
-  time_sampling_beta_alpha: 1.5
-  time_sampling_beta_beta: 1.0
-  time_sampling_scale: 0.999
-  time_sampling_offset: 0.001
 eval:
   train_output_root: outputs/train/zeno-ai/BookOriginRelocation/pi05-h200
   output_dir: outputs/eval/zeno-ai/BookOriginRelocation/pi05-h200/{run_tag}
