@@ -20,6 +20,10 @@ sys.path.insert(
     ),
 )
 
+from policy_imports import ensure_lerobot_policy_imports
+
+ensure_lerobot_policy_imports("act")
+
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from env.robocasa_env import (

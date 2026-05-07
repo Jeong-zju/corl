@@ -33,7 +33,15 @@ python scripts/collect_imitation_dataset.py --env braidedhub --num-per-task 100 
 ./bash/train_policy.sh --env braidedhub --policy streaming_act
 ./bash/train_policy.sh --dataset metaworld_mt50 --policy act
 ./bash/train_policy.sh --dataset metaworld_mt50 --policy streaming_act
+```
 
+如果要对同一个数据集或环境按顺序跑多个算法，可以用：
+
+```bash
+./bash/train_policies.sh --dataset zeno-ai/DailyLaundryOrganization --policy act --policy streaming_act --policy smolvla
+```
+
+```bash
 lerobot-train \
   --policy.type=act \
   --policy.push_to_hub=false \
@@ -163,5 +171,5 @@ git clone https://github.com/Jeong-zju/corl.git && cd corl/ && git switch develo
 
 vim bash/defaults/zeno-ai/BookOriginRelocation/streaming_act.yaml
 
-bash bash/install_deploy_zeno.sh --dataset zeno-ai/BookOriginRelocation --policy pi05 --hf-token <hf-token> --wandb-token <wandb-token>
+bash bash/install_deploy_zeno.sh --dataset zeno-ai/BookOriginRelocation --policy streaming_act --hf-token <hf-token> --wandb-token <wandb-token>
 bash bash/install_deploy_zeno.sh --dataset zeno-ai/DailyLaundryOrganization --policy streaming_act --hf-token <hf-token> --wandb-token <wandb-token>

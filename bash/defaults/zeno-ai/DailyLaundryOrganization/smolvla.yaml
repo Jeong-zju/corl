@@ -19,7 +19,7 @@ train:
     machine_rank: 0
     main_process_ip: null
     main_process_port: null
-  steps: 120000
+  steps: 180000
   batch_size: 8
   num_workers: 8
   dataloader_persistent_workers: true
@@ -28,7 +28,7 @@ train:
   torch_sharing_strategy: file_system
   torchcodec_decoder_cache_size: 32
   seed: 42
-  log_freq: 1000
+  log_freq: 200
   save_freq: 20000
   eval_freq: -1
   test_ratio: 0

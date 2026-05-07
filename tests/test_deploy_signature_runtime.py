@@ -27,7 +27,6 @@ def _make_policy_config(**overrides) -> PolicyConfig:
         device="cpu",
         load_device=None,
         task="",
-        groot_attn_implementation="eager",
         n_action_steps=None,
         temporal_ensemble_coeff=0.0,
         state_dim=17,

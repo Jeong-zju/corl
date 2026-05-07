@@ -15,7 +15,14 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-import lerobot.policies  # noqa: F401
+try:
+    from policy_imports import install_lerobot_policies_namespace_shim
+except ModuleNotFoundError:
+    def install_lerobot_policies_namespace_shim() -> None:
+        return None
+
+install_lerobot_policies_namespace_shim()
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig

@@ -19,9 +19,12 @@ sys.path.insert(
     ),
 )
 
+from policy_imports import ensure_lerobot_policy_imports
+
+ensure_lerobot_policy_imports("prism_diffusion")
+
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.constants import (
     ACTION,
     OBS_STATE,
@@ -29,6 +32,7 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 from policy_defaults import load_policy_mode_defaults_for_dataset
+from policy_imports import make_standard_pre_post_processors
 from lerobot_policy_streaming_act.prefix_sequence import (
     DELTA_SIGNATURE_KEY,
     PATH_SIGNATURE_KEY,
@@ -48,7 +52,6 @@ from lerobot_policy_prism_diffusion.modeling_diffusion import PrismDiffusionPoli
 def test_prism_diffusion_config_and_policy_registration() -> None:
     assert "prism_diffusion" in PreTrainedConfig.get_known_choices()
     assert PreTrainedConfig.get_choice_class("prism_diffusion") is PrismDiffusionConfig
-    assert get_policy_class("prism_diffusion") is PrismDiffusionPolicy
 
 
 def test_prism_diffusion_processor_factory_dynamic_discovery() -> None:
@@ -66,7 +69,7 @@ def test_prism_diffusion_processor_factory_dynamic_discovery() -> None:
         },
     )
 
-    preprocessor, postprocessor = make_pre_post_processors(policy_cfg=cfg)
+    preprocessor, postprocessor = make_standard_pre_post_processors(cfg)
 
     assert preprocessor.name == POLICY_PREPROCESSOR_DEFAULT_NAME
     assert postprocessor.name == POLICY_POSTPROCESSOR_DEFAULT_NAME

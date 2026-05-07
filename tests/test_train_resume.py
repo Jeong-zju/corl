@@ -12,7 +12,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
 from policy_defaults import load_policy_mode_defaults_for_dataset
+from policy_imports import ensure_lerobot_policy_imports
 from train_policy import (
+    build_smolvla_policy_config,
     fresh_distributed_output_marker_matches,
     parse_args,
     register_lerobot_fresh_distributed_output_reservation,
@@ -127,6 +129,60 @@ def test_parse_args_supports_resume_flag_and_defaults_expose_resume() -> None:
     )
 
     assert args.resume is True
+    assert hasattr(args, "signature_cache_root")
+    assert args.signature_cache_root is None
+    assert hasattr(args, "prefix_image_cache_root")
+    assert args.prefix_image_cache_root is None
+
+
+def test_build_smolvla_policy_config_maps_policy_path_to_pretrained_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_kwargs: dict[str, object] = {}
+
+    class DummySmolVLAConfig:
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
+            self.pretrained_path = None
+
+    monkeypatch.setattr(
+        "train_policy.import_lerobot_policy_config_class",
+        lambda policy_type: DummySmolVLAConfig,
+    )
+
+    args = parse_args(
+        [
+            "--dataset",
+            "robocasa/atomic/CloseFridge",
+            "--policy",
+            "smolvla",
+        ]
+    )
+
+    policy_cfg = build_smolvla_policy_config(
+        args,
+        input_features_override={"observation.state": {"shape": [1]}},
+        output_features_override={"action": {"shape": [1]}},
+    )
+
+    assert "policy_path" not in constructor_kwargs
+    assert policy_cfg.pretrained_path == Path("lerobot/smolvla_base")
+    assert constructor_kwargs["push_to_hub"] is False
+
+
+def test_ensure_lerobot_policy_imports_registers_smolvla_processor_step() -> None:
+    sys.modules.pop("lerobot.policies.smolvla.processor_smolvla", None)
+
+    from lerobot.processor import ProcessorStepRegistry
+
+    ProcessorStepRegistry.unregister("smolvla_new_line_processor")
+
+    ensure_lerobot_policy_imports("smolvla")
+
+    assert (
+        ProcessorStepRegistry.get("smolvla_new_line_processor").__name__
+        == "SmolVLANewLineProcessor"
+    )
 
 
 def test_resolve_train_run_stamp_prefers_shared_env(monkeypatch) -> None:

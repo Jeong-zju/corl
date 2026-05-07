@@ -39,7 +39,6 @@ def _make_policy_config(**overrides) -> PolicyConfig:
         device="cpu",
         load_device=None,
         task="",
-        groot_attn_implementation="eager",
         n_action_steps=50,
         temporal_ensemble_coeff=0.0,
         state_dim=17,
@@ -143,59 +142,7 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert cfg.n_action_steps == 1
 
 
-def test_apply_deploy_policy_overrides_allows_groot_action_smoothing_fallback() -> None:
-    cfg = SimpleNamespace(
-        n_action_steps=25,
-    )
-
-    coeff, enabled = apply_deploy_policy_overrides(
-        cfg,
-        _make_policy_config(
-            type="groot",
-            n_action_steps=16,
-            temporal_ensemble_coeff=0.05,
-        ),
-    )
-
-    assert coeff == 0.05
-    assert enabled is False
-    assert cfg.n_action_steps == 16
-    assert not hasattr(cfg, "temporal_ensemble_coeff")
-
-
-def test_policy_runtime_applies_action_smoothing_for_groot_fallback() -> None:
-    runtime = PolicyRuntime(
-        _make_deploy_config(
-            _make_policy_config(
-                type="groot",
-                temporal_ensemble_coeff=0.05,
-            )
-        )
-    )
-    runtime.action_smoothing_enabled = True
-    runtime.temporal_ensemble_coeff = 0.05
-    runtime.gripper_hysteresis = None
-    runtime._smoothed_action = None
-
-    first = runtime._apply_action_filters(
-        np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
-        {},
-    )
-    second = runtime._apply_action_filters(
-        np.asarray([10.0, 11.0, 12.0], dtype=np.float32),
-        {},
-    )
-
-    decay = float(np.exp(-0.05))
-    expected_second = decay * np.asarray([0.0, 1.0, 2.0], dtype=np.float32) + (
-        1.0 - decay
-    ) * np.asarray([10.0, 11.0, 12.0], dtype=np.float32)
-
-    assert np.allclose(first, [0.0, 1.0, 2.0])
-    assert np.allclose(second, expected_second)
-
-
-@pytest.mark.parametrize("policy_type", ["pi05", "smolvla"])
+@pytest.mark.parametrize("policy_type", ["smolvla"])
 def test_policy_runtime_requires_vla_task_before_importing_lerobot(
     policy_type: str,
 ) -> None:
@@ -223,63 +170,6 @@ def test_missing_vla_dependency_error_names_nested_module() -> None:
     assert "`transformers`" in message
     assert "pip install -r requirements.txt" in message
     assert "lerobot[smolvla]==0.5.0" in message
-
-
-def test_missing_pi05_dependency_error_uses_pi_extra() -> None:
-    error = _missing_dependency_error(
-        policy_name="PI05",
-        extra_name="pi",
-        exc=ModuleNotFoundError("No module named 'transformers'", name="transformers"),
-    )
-
-    message = str(error)
-    assert "`transformers`" in message
-    assert "pip install -r requirements.txt" in message
-    assert "lerobot[pi]==0.5.0" in message
-
-
-def test_groot_deploy_compatibility_patches_include_action_input_batch_feature_compatibility(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-
-    fake_train_policy = ModuleType("train_policy")
-
-    def _record(name: str):
-        def _fn(*args, **kwargs):
-            calls.append(name)
-
-        return _fn
-
-    fake_train_policy.install_groot_attention_implementation_patch = _record(
-        "attention"
-    )
-    fake_train_policy.install_groot_meta_tensor_compatibility_patch = _record("meta")
-    fake_train_policy.install_groot_transformers_loading_compatibility_patch = _record(
-        "transformers"
-    )
-    fake_train_policy.install_groot_action_input_batch_feature_compatibility_patch = (
-        _record("action_input_batch_feature")
-    )
-    fake_train_policy.install_groot_processor_tensor_compatibility_patch = _record(
-        "processor"
-    )
-    fake_train_policy.install_groot_state_dict_compatibility_patch = _record(
-        "state_dict"
-    )
-
-    monkeypatch.setitem(sys.modules, "train_policy", fake_train_policy)
-
-    loader._install_groot_deploy_compatibility_patches("eager")
-
-    assert calls == [
-        "attention",
-        "meta",
-        "transformers",
-        "action_input_batch_feature",
-        "processor",
-        "state_dict",
-    ]
 
 
 def test_policy_runtime_load_quiets_transformers_loading_warnings(
@@ -371,7 +261,7 @@ def test_policy_runtime_load_quiets_transformers_loading_warnings(
     runtime = PolicyRuntime(
         _make_deploy_config(
             _make_policy_config(
-                type="groot",
+                type="smolvla",
                 task="Return the book to its original location.",
                 path=Path("/tmp/fake_policy"),
                 device="cuda",
@@ -394,11 +284,6 @@ def test_policy_runtime_load_quiets_transformers_loading_warnings(
 @pytest.mark.parametrize(
     ("policy_type", "module_file", "module_name"),
     [
-        (
-            "pi05",
-            "configuration_pi05.py",
-            "lerobot.policies.pi05.configuration_pi05",
-        ),
         (
             "smolvla",
             "configuration_smolvla.py",

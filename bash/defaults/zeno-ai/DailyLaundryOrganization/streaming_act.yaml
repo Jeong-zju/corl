@@ -23,7 +23,7 @@ train:
   # CleanTableTop datasets, but the public-prefix branch still needs explicit
   # path/delta memory. Keep a long prefix window so the source drawer cue is
   # preserved through the shared table-side organization phase.
-  steps: 160000
+  steps: 180000
   batch_size: 8
   num_workers: 8
   dataloader_persistent_workers: true
@@ -32,7 +32,7 @@ train:
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
   seed: 42
-  log_freq: 1000
+  log_freq: 200
   save_freq: 20000
   eval_freq: -1
   test_ratio: 0

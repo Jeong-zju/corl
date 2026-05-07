@@ -12,6 +12,8 @@ from contextlib import contextmanager
 
 import numpy as np
 
+from policy_imports import install_lerobot_policies_namespace_shim
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -234,6 +236,8 @@ def _ensure_local_streaming_act_modules(
     streaming_act_src_str = str(streaming_act_src)
     if streaming_act_src_str not in sys.path:
         sys.path.insert(0, streaming_act_src_str)
+
+    install_lerobot_policies_namespace_shim()
 
     for module_name, module in list(sys.modules.items()):
         if (

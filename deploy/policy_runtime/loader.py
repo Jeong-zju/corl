@@ -41,32 +41,25 @@ from eval_helpers import (  # noqa: E402
 from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
 
-VLA_POLICY_TYPES = {"pi05", "smolvla", "groot"}
+VLA_POLICY_TYPES = {"smolvla"}
 
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
     "diffusion": "diffusion",
-    "groot": "groot",
-    "pi05": "pi05",
     "smolvla": "smolvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
-    "pi05": ("rtc",),
     "smolvla": ("rtc",),
 }
 
 _LEROBOT_CONFIG_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.configuration_act",
-    "groot": "lerobot.policies.groot.configuration_groot",
-    "pi05": "lerobot.policies.pi05.configuration_pi05",
     "smolvla": "lerobot.policies.smolvla.configuration_smolvla",
 }
 
 _LEROBOT_PROCESSOR_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.processor_act",
-    "groot": "lerobot.policies.groot.processor_groot",
-    "pi05": "lerobot.policies.pi05.processor_pi05",
     "smolvla": "lerobot.policies.smolvla.processor_smolvla",
 }
 
@@ -86,31 +79,38 @@ def _install_lerobot_policies_namespace_shim() -> Path | None:
     """Avoid LeRobot 0.5.0's eager `lerobot.policies` imports during deploy.
 
     LeRobot's policy package imports every policy config at package import time.
-    On some Python 3.12 / older LeRobot combinations, the GR00T dataclass
+    On some Python 3.12 / older LeRobot combinations, a dataclass bug
     raises during import before deploy can reach the policy it actually needs.
     Treating `lerobot.policies` as a namespace package lets us import only the
     concrete policy submodules we need.
     """
-    existing = sys.modules.get("lerobot.policies")
-    if existing is not None and getattr(existing, "__path__", None):
-        paths = list(getattr(existing, "__path__"))
-        return Path(paths[0]) if paths else None
-
     lerobot_spec = importlib.util.find_spec("lerobot")
     search_locations = getattr(lerobot_spec, "submodule_search_locations", None)
     if not search_locations:
         return None
 
+    policies_path: Path | None = None
     for root in search_locations:
-        policies_path = Path(root) / "policies"
-        if policies_path.is_dir():
-            module = _make_namespace_package("lerobot.policies", policies_path)
-            sys.modules["lerobot.policies"] = module
-            parent = sys.modules.get("lerobot")
-            if parent is not None:
-                setattr(parent, "policies", module)
-            return policies_path
-    return None
+        candidate = Path(root) / "policies"
+        if candidate.is_dir():
+            policies_path = candidate
+            break
+    if policies_path is None:
+        return None
+
+    existing = sys.modules.get("lerobot.policies")
+    if existing is not None and getattr(existing, "__path__", None):
+        existing_paths = [Path(path) for path in getattr(existing, "__path__", ())]
+        existing_origin = getattr(getattr(existing, "__spec__", None), "origin", None)
+        if existing_origin is None and existing_paths and existing_paths[0] == policies_path:
+            return existing_paths[0]
+
+    module = _make_namespace_package("lerobot.policies", policies_path)
+    sys.modules["lerobot.policies"] = module
+    parent = sys.modules.get("lerobot")
+    if parent is not None:
+        setattr(parent, "policies", module)
+    return policies_path
 
 
 def _install_lerobot_policy_subpackage_shim_by_name(package_name: str) -> None:
@@ -152,15 +152,20 @@ def _import_lerobot_policy_submodule(policy_type: str, module_name: str):
 
 def _load_lerobot_pretrained_config_class(policy_type: str):
     _install_lerobot_policies_namespace_shim()
-    try:
-        from lerobot.configs.policies import PreTrainedConfig
-    except ModuleNotFoundError:
-        raise
+    if policy_type == "streaming_act":
+        from lerobot_policy_streaming_act.configuration_streaming_act import (
+            StreamingACTConfig,
+        )
 
+        return StreamingACTConfig
     config_module_name = _LEROBOT_CONFIG_MODULES_BY_TYPE.get(policy_type)
     if config_module_name is not None:
-        _import_lerobot_policy_submodule(policy_type, config_module_name)
-    return PreTrainedConfig
+        module = _import_lerobot_policy_submodule(policy_type, config_module_name)
+        if policy_type == "act":
+            return module.ACTConfig
+        if policy_type == "smolvla":
+            return module.SmolVLAConfig
+    raise ValueError(f"Unsupported policy type for deploy config loading: {policy_type!r}")
 
 
 def _register_deploy_processor_steps(policy_type: str) -> None:
@@ -196,21 +201,6 @@ def _make_deploy_pre_post_processors(
         POLICY_PREPROCESSOR_DEFAULT_NAME,
     )
 
-    if policy_type == "groot":
-        preprocessor_overrides = {
-            "groot_pack_inputs_v3": {
-                "stats": None,
-                "normalize_min_max": True,
-            }
-        }
-        env_action_dim = policy_cfg.output_features[ACTION].shape[0]
-        postprocessor_overrides = {
-            "groot_action_unpack_unnormalize_v1": {
-                "stats": None,
-                "normalize_min_max": True,
-                "env_action_dim": env_action_dim,
-            }
-        }
 
     return (
         PolicyProcessorPipeline.from_pretrained(
@@ -241,16 +231,11 @@ def apply_deploy_policy_overrides(
         cfg.temporal_ensemble_coeff = (
             temporal_ensemble_coeff if temporal_ensemble_enabled else None
         )
-    elif temporal_ensemble_enabled and deploy_policy.type != "groot":
+    elif temporal_ensemble_enabled:
         raise ValueError(
             "Deploy `policy.temporal_ensemble_coeff` is only supported for policies "
             "whose config exposes `temporal_ensemble_coeff`."
         )
-    elif temporal_ensemble_enabled:
-        # GR00T configs do not currently expose a temporal ensemble knob, so the
-        # deploy runtime will smooth emitted actions instead of mutating the model
-        # config or forcing one-step inference.
-        temporal_ensemble_enabled = False
 
     if temporal_ensemble_enabled:
         # Temporal ensembling must query the policy at every control step.
@@ -268,30 +253,6 @@ def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
     split_spec = load_dataset_split(split_path)
     return Path(split_spec.dataset_root).expanduser().resolve()
 
-
-def _install_groot_deploy_compatibility_patches(attn_implementation: str) -> None:
-    try:
-        from train_policy import (
-            install_groot_action_input_batch_feature_compatibility_patch,
-            install_groot_attention_implementation_patch,
-            install_groot_meta_tensor_compatibility_patch,
-            install_groot_processor_tensor_compatibility_patch,
-            install_groot_state_dict_compatibility_patch,
-            install_groot_transformers_loading_compatibility_patch,
-        )
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "GR00T deploy support could not import the local training compatibility "
-            "patches. Run deploy from this repository so `main/scripts` is on the "
-            "runtime path."
-        ) from exc
-
-    install_groot_attention_implementation_patch(attn_implementation)
-    install_groot_meta_tensor_compatibility_patch()
-    install_groot_transformers_loading_compatibility_patch()
-    install_groot_action_input_batch_feature_compatibility_patch()
-    install_groot_processor_tensor_compatibility_patch()
-    install_groot_state_dict_compatibility_patch()
 
 
 def _missing_dependency_error(
@@ -319,19 +280,6 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
     _install_lerobot_policies_namespace_shim()
     if policy_type == "streaming_act":
         return import_local_streaming_act_policy_class()
-    if policy_type == "pi05":
-        try:
-            module = _import_lerobot_policy_submodule(
-                policy_type,
-                "lerobot.policies.pi05.modeling_pi05",
-            )
-        except ModuleNotFoundError as exc:
-            raise _missing_dependency_error(
-                policy_name="PI05",
-                extra_name="pi",
-                exc=exc,
-            ) from exc
-        return module.PI05Policy
     if policy_type == "smolvla":
         try:
             module = _import_lerobot_policy_submodule(
@@ -345,28 +293,18 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
                 exc=exc,
             ) from exc
         return module.SmolVLAPolicy
-    if policy_type == "groot":
+    if policy_type == "act":
         try:
-            _install_groot_deploy_compatibility_patches(
-                deploy_policy.groot_attn_implementation
-            )
             module = _import_lerobot_policy_submodule(
                 policy_type,
-                "lerobot.policies.groot.modeling_groot",
+                "lerobot.policies.act.modeling_act",
             )
         except ModuleNotFoundError as exc:
             raise _missing_dependency_error(
-                policy_name="GR00T",
-                extra_name="groot",
+                policy_name="ACT",
+                extra_name="act",
                 exc=exc,
             ) from exc
-        return module.GrootPolicy
-    if policy_type == "act":
-        module = _import_lerobot_policy_submodule(
-            policy_type,
-            "lerobot.policies.act.modeling_act",
-        )
-
         return module.ACTPolicy
     raise ValueError(f"Unsupported policy type: {policy_type!r}")
 
@@ -400,7 +338,7 @@ class PolicyRuntime:
             raise ValueError(
                 "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
                 "The current deploy runtime supports 'act', 'streaming_act', "
-                "'pi05', 'smolvla', and 'groot'. "
+                "'smolvla'. "
                 "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
                 "until deploy support is added."
             )
@@ -450,11 +388,7 @@ class PolicyRuntime:
             self.temporal_ensemble_coeff,
             self.temporal_ensemble_enabled,
         ) = apply_deploy_policy_overrides(cfg, self.deploy_config.policy)
-        self.action_smoothing_enabled = (
-            self.deploy_config.policy.type == "groot"
-            and self.temporal_ensemble_coeff != 0.0
-            and not hasattr(cfg, "temporal_ensemble_coeff")
-        )
+        self.action_smoothing_enabled = False
 
         if hasattr(policy, "to"):
             policy.to(self.deploy_config.policy.device)

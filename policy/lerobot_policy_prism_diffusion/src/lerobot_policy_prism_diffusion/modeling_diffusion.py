@@ -34,6 +34,14 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
+try:
+    from policy_imports import install_lerobot_policies_namespace_shim
+except ModuleNotFoundError:
+    def install_lerobot_policies_namespace_shim() -> None:
+        return None
+
+install_lerobot_policies_namespace_shim()
+
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,

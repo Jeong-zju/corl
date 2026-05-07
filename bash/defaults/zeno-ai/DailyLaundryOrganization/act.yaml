@@ -23,8 +23,8 @@ train:
   # The fixed-base 17-dim state/action and 3 synchronized 224px cameras
   # match the other zeno-ai dual-arm tasks, so this can reuse the same ACT
   # template with a slightly smaller training budget.
-  steps: 120000
-  batch_size: 32
+  steps: 180000
+  batch_size: 8
   num_workers: 8
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
@@ -32,8 +32,8 @@ train:
   torch_sharing_strategy: "file_system"
   torchcodec_decoder_cache_size: 32
   seed: 42
-  log_freq: 1000
-  save_freq: 30000
+  log_freq: 200
+  save_freq: 20000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42

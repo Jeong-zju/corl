@@ -9,7 +9,7 @@ import os
 import re
 import sys
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +33,10 @@ from policy_capabilities import policy_supports_signature_features
 from policy_defaults import (
     load_policy_mode_defaults_for_cli,
     load_policy_mode_defaults_from_path,
+)
+from policy_imports import (
+    ensure_lerobot_policy_imports,
+    import_lerobot_policy_config_class,
 )
 
 warnings.filterwarnings(
@@ -63,17 +67,9 @@ POLICY_CHOICES = (
     "diffusion",
     "prism_diffusion",
     "streaming_act",
-    "pi05",
     "smolvla",
-    "groot",
 )
-PI05_DEFAULT_POLICY_PATH = "lerobot/pi05_base"
 SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
-GROOT_DEFAULT_BASE_MODEL_PATH = "nvidia/GR00T-N1.5-3B"
-GROOT_DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
-GROOT_DEFAULT_ATTN_IMPLEMENTATION = "eager"
-HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
-HF_OFFICIAL_ENDPOINT = "https://huggingface.co"
 SIGNATURE_FEATURE_KEYS = (
     PATH_SIGNATURE_FEATURE_KEY,
     DELTA_SIGNATURE_FEATURE_KEY,
@@ -81,39 +77,6 @@ SIGNATURE_FEATURE_KEYS = (
     PREFIX_DELTA_SIGNATURE_FEATURE_KEY,
 )
 _IGNORED_DATASET_FEATURE_KEYS: tuple[str, ...] = ()
-
-
-@contextmanager
-def temporarily_use_official_hf_endpoint_for_pi05(policy_name: str):
-    """Route pi05 tokenizer/model downloads to the official Hugging Face endpoint.
-
-    pi05 depends on a gated PaliGemma tokenizer repo. When the global endpoint is a
-    mirror, the mirror can return 403 even if the local HF login is valid. For pi05
-    runs we therefore retry through huggingface.co so the tokenizer can be resolved
-    directly from the source of truth.
-    """
-
-    current_endpoint = os.environ.get("HF_ENDPOINT")
-    normalized_endpoint = current_endpoint.rstrip("/") if current_endpoint else None
-    should_override = policy_name == "pi05" and normalized_endpoint == HF_MIRROR_ENDPOINT
-
-    if not should_override:
-        yield
-        return
-
-    print(
-        "[INFO] HF_ENDPOINT is set to hf-mirror.com. "
-        "pi05 loads a gated PaliGemma tokenizer, so training will temporarily use "
-        "https://huggingface.co for model/tokenizer downloads."
-    )
-    os.environ["HF_ENDPOINT"] = HF_OFFICIAL_ENDPOINT
-    try:
-        yield
-    finally:
-        if current_endpoint is None:
-            os.environ.pop("HF_ENDPOINT", None)
-        else:
-            os.environ["HF_ENDPOINT"] = current_endpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -604,495 +567,6 @@ def _set_transformers_attention_implementation(config: object, value: str) -> No
         if child_config is not None:
             _set_transformers_attention_implementation(child_config, value)
 
-
-def _coerce_groot_beta_concentration(value: object, default: float) -> object:
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        if getattr(value, "is_meta", False):
-            return torch.tensor(float(default), device="cpu", dtype=torch.float32)
-        if value.numel() == 1:
-            return value.detach().to(device="cpu", dtype=torch.float32)
-        return value.detach().to(device="cpu", dtype=torch.float32)
-
-    try:
-        return torch.tensor(float(value), device="cpu", dtype=torch.float32)
-    except (TypeError, ValueError):
-        return value
-
-
-def install_groot_meta_tensor_compatibility_patch() -> None:
-    """Keep GR00T non-parameter distributions out of Transformers meta init."""
-    from lerobot.policies.groot.action_head import flow_matching_action_head
-
-    if getattr(
-        flow_matching_action_head,
-        "_corl_groot_beta_meta_patch_installed",
-        False,
-    ):
-        return
-
-    original_beta = flow_matching_action_head.Beta
-
-    def beta_with_cpu_scalar_concentrations(
-        concentration1, concentration0, *args, **kwargs
-    ):
-        concentration1 = _coerce_groot_beta_concentration(concentration1, default=1.5)
-        concentration0 = _coerce_groot_beta_concentration(concentration0, default=1.0)
-        return original_beta(concentration1, concentration0, *args, **kwargs)
-
-    flow_matching_action_head.Beta = beta_with_cpu_scalar_concentrations
-    flow_matching_action_head._corl_groot_original_beta = original_beta
-    flow_matching_action_head._corl_groot_beta_meta_patch_installed = True
-
-
-def _ensure_groot_transformers_loading_attrs(model: object) -> None:
-    if not hasattr(model, "all_tied_weights_keys"):
-        try:
-            tied_weights = model.get_expanded_tied_weights_keys(
-                all_submodels=False,
-            )
-        except Exception:
-            tied_weights = {}
-        model.all_tied_weights_keys = tied_weights
-
-    for attr_name in ("_tp_plan", "_ep_plan", "_pp_plan"):
-        if getattr(model, attr_name, None) is None:
-            setattr(model, attr_name, {})
-
-    for attr_name in (
-        "_keep_in_fp32_modules",
-        "_keep_in_fp32_modules_strict",
-        "_no_split_modules",
-    ):
-        value = getattr(model, attr_name, None)
-        if value is None:
-            setattr(model, attr_name, set())
-        elif not isinstance(value, set):
-            try:
-                setattr(model, attr_name, set(value))
-            except TypeError:
-                setattr(model, attr_name, {value})
-
-
-def _import_groot_n1_with_kw_only_dataclass_compatibility():
-    """Import GR00T N1 while tolerating older dataclass field ordering bugs."""
-    import dataclasses as stdlib_dataclasses
-
-    original_dataclass = stdlib_dataclasses.dataclass
-
-    def dataclass_with_groot_kw_only(cls=None, /, **kwargs):
-        if cls is None:
-            def wrap(inner_cls):
-                return dataclass_with_groot_kw_only(inner_cls, **kwargs)
-
-            return wrap
-
-        try:
-            return original_dataclass(cls, **kwargs)
-        except TypeError as exc:
-            if (
-                getattr(cls, "__module__", "") == "lerobot.policies.groot.groot_n1"
-                and "non-default argument" in str(exc)
-                and "follows default argument" in str(exc)
-            ):
-                patched_kwargs = dict(kwargs)
-                patched_kwargs["kw_only"] = True
-                return original_dataclass(cls, **patched_kwargs)
-            raise
-
-    # Torch imports this temporary replacement as `dataclass` and probes
-    # `__kwdefaults__` to decide whether `kw_only` is supported, so preserve the
-    # stdlib metadata on the wrapper before handing it to the import machinery.
-    dataclass_with_groot_kw_only.__kwdefaults__ = dict(
-        original_dataclass.__kwdefaults__ or {}
-    )
-    stdlib_dataclasses.dataclass = dataclass_with_groot_kw_only
-    try:
-        import lerobot.policies.groot.groot_n1 as groot_n1
-    finally:
-        stdlib_dataclasses.dataclass = original_dataclass
-    return groot_n1
-
-
-def install_groot_transformers_loading_compatibility_patch() -> None:
-    """Provide newer Transformers post-init attrs missing in LeRobot GR00T."""
-    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
-
-    model_cls = groot_n1.GR00TN15
-    if getattr(
-        model_cls,
-        "_corl_groot_transformers_loading_patch_installed",
-        False,
-    ):
-        return
-
-    original_init = model_cls.__init__
-
-    def init_with_transformers_loading_attrs(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        _ensure_groot_transformers_loading_attrs(self)
-
-    model_cls.__init__ = init_with_transformers_loading_attrs
-    model_cls._corl_original_init = original_init
-    model_cls._corl_groot_transformers_loading_patch_installed = True
-
-
-def _coerce_groot_action_inputs_batch_feature(action_inputs: object) -> object:
-    if not isinstance(action_inputs, dict):
-        return action_inputs
-    if hasattr(action_inputs, "embodiment_id"):
-        return action_inputs
-
-    batch_feature_type = None
-    try:
-        from transformers import BatchFeature
-
-        batch_feature_type = BatchFeature
-    except ImportError:
-        try:
-            from transformers.feature_extraction_utils import BatchFeature
-
-            batch_feature_type = BatchFeature
-        except ImportError:
-            return action_inputs
-
-    return batch_feature_type(data=action_inputs)
-
-
-def install_groot_action_input_batch_feature_compatibility_patch() -> None:
-    """Keep GR00T action inputs attribute-addressable after input packing."""
-    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
-    model_cls = groot_n1.GR00TN15
-    if getattr(
-        model_cls,
-        "_corl_groot_action_input_batch_feature_patch_installed",
-        False,
-    ):
-        return
-
-    original_prepare_input = model_cls.prepare_input
-
-    def prepare_input_with_batch_feature(*args, **kwargs):
-        backbone_inputs, action_inputs = original_prepare_input(*args, **kwargs)
-        action_inputs = _coerce_groot_action_inputs_batch_feature(action_inputs)
-        return backbone_inputs, action_inputs
-
-    model_cls.prepare_input = prepare_input_with_batch_feature
-    model_cls._corl_original_prepare_input = original_prepare_input
-    model_cls._corl_groot_action_input_batch_feature_patch_installed = True
-
-
-def install_groot_processor_tensor_compatibility_patch() -> None:
-    """Keep GR00T Eagle preprocessing tensorized for newer Transformers."""
-    import lerobot.policies.groot.processor_groot as processor_groot
-
-    if not getattr(
-        processor_groot.AutoProcessor,
-        "_corl_groot_regex_patch_installed",
-        False,
-    ):
-        original_from_pretrained = processor_groot.AutoProcessor.from_pretrained
-
-        def from_pretrained_with_mistral_regex_fix(*args, **kwargs):
-            if "fix_mistral_regex" in kwargs:
-                return original_from_pretrained(*args, **kwargs)
-
-            fixed_kwargs = dict(kwargs)
-            fixed_kwargs["fix_mistral_regex"] = True
-            try:
-                return original_from_pretrained(*args, **fixed_kwargs)
-            except (AttributeError, TypeError):
-                return original_from_pretrained(*args, **kwargs)
-
-        processor_groot.AutoProcessor.from_pretrained = staticmethod(
-            from_pretrained_with_mistral_regex_fix
-        )
-        processor_groot.AutoProcessor._corl_groot_original_from_pretrained = (
-            original_from_pretrained
-        )
-        processor_groot.AutoProcessor._corl_groot_regex_patch_installed = True
-
-    if getattr(
-        processor_groot,
-        "_corl_groot_collate_tensor_patch_installed",
-        False,
-    ):
-        return
-
-    original_collate = processor_groot.collate
-
-    def patch_eagle_processor_class(eagle_processor: object) -> None:
-        processor_cls = type(eagle_processor)
-        if getattr(
-            processor_cls,
-            "_corl_groot_replace_media_tensor_patch_installed",
-            False,
-        ):
-            return
-
-        original_replace_media_placeholder = processor_cls.replace_media_placeholder
-
-        def replace_media_placeholder_with_tensor_images(self, *args, **output_kwargs):
-            images_kwargs = dict(output_kwargs.get("images_kwargs") or {})
-            images_kwargs.setdefault("return_tensors", "pt")
-            output_kwargs["images_kwargs"] = images_kwargs
-
-            videos_kwargs = dict(output_kwargs.get("videos_kwargs") or {})
-            videos_kwargs.setdefault("return_tensors", "pt")
-            output_kwargs["videos_kwargs"] = videos_kwargs
-
-            return original_replace_media_placeholder(self, *args, **output_kwargs)
-
-        processor_cls.replace_media_placeholder = (
-            replace_media_placeholder_with_tensor_images
-        )
-        processor_cls._corl_groot_original_replace_media_placeholder = (
-            original_replace_media_placeholder
-        )
-        processor_cls._corl_groot_replace_media_tensor_patch_installed = True
-
-    def collate_with_tensorized_eagle_images(features, eagle_processor):
-        patch_eagle_processor_class(eagle_processor)
-        return original_collate(features, eagle_processor)
-
-    processor_groot.collate = collate_with_tensorized_eagle_images
-    processor_groot._corl_groot_original_collate = original_collate
-    processor_groot._corl_groot_collate_tensor_patch_installed = True
-
-
-def _remap_groot_legacy_vision_model_state_dict_keys(
-    state_dict: dict[str, object],
-) -> tuple[dict[str, object], bool]:
-    legacy_substring = ".vision_model.vision_model."
-    if not any(legacy_substring in key for key in state_dict):
-        return state_dict, False
-
-    # Keep canonical keys first, then backfill legacy keys after collapsing one
-    # duplicated `vision_model` segment. This preserves already-correct entries
-    # when a checkpoint mixes both layouts.
-    remapped_state_dict = {
-        key: value
-        for key, value in state_dict.items()
-        if legacy_substring not in key
-    }
-    changed = False
-    for key, value in state_dict.items():
-        if legacy_substring not in key:
-            continue
-        changed = True
-        remapped_key = key.replace(legacy_substring, ".vision_model.", 1)
-        remapped_state_dict.setdefault(remapped_key, value)
-    return remapped_state_dict, changed
-
-
-def _remap_pi05_state_dict_keys(
-    state_dict: dict[str, object],
-) -> tuple[dict[str, object], bool]:
-    legacy_vision_substring = ".vision_tower.vision_model."
-    remapped_state_dict: dict[str, object] = {}
-    changed = False
-
-    for key, value in state_dict.items():
-        remapped_key = key
-        if not remapped_key.startswith("model."):
-            remapped_key = f"model.{remapped_key}"
-            changed = True
-        if legacy_vision_substring in remapped_key:
-            remapped_key = remapped_key.replace(
-                legacy_vision_substring,
-                ".vision_tower.",
-                1,
-            )
-            changed = True
-        remapped_state_dict.setdefault(remapped_key, value)
-
-    return remapped_state_dict, changed
-
-
-def install_groot_state_dict_compatibility_patch() -> None:
-    """Accept Groot checkpoints saved with an older Eagle vision prefix layout."""
-    import lerobot.policies.pretrained as pretrained
-
-    if getattr(pretrained, "_corl_groot_state_dict_patch_installed", False):
-        return
-
-    from safetensors.torch import _remove_duplicate_names, load_file
-
-    original_load_model_as_safetensor = pretrained.load_model_as_safetensor
-
-    def load_model_as_safetensor_with_groot_compat(
-        model,
-        filename,
-        strict: bool = True,
-        device: str | int = "cpu",
-    ):
-        state_dict = load_file(filename, device=device)
-        if type(model).__name__ == "GrootPolicy":
-            state_dict, changed = _remap_groot_legacy_vision_model_state_dict_keys(
-                state_dict
-            )
-            if changed:
-                print(
-                    "[GROOT] Remapped legacy `vision_model.vision_model` checkpoint keys"
-                )
-
-        model_state_dict = model.state_dict()
-        to_removes = _remove_duplicate_names(
-            model_state_dict, preferred_names=state_dict.keys()
-        )
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        missing = set(missing)
-        for to_remove_group in to_removes.values():
-            for to_remove in to_remove_group:
-                if to_remove not in missing:
-                    unexpected.append(to_remove)
-                else:
-                    missing.remove(to_remove)
-        if strict and (missing or unexpected):
-            missing_keys = ", ".join([f'"{k}"' for k in sorted(missing)])
-            unexpected_keys = ", ".join([f'"{k}"' for k in sorted(unexpected)])
-            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
-            if missing:
-                error += f"\n    Missing key(s) in state_dict: {missing_keys}"
-            if unexpected:
-                error += f"\n    Unexpected key(s) in state_dict: {unexpected_keys}"
-            raise RuntimeError(error)
-        return missing, unexpected
-
-    pretrained.load_model_as_safetensor = load_model_as_safetensor_with_groot_compat
-    pretrained._corl_groot_original_load_model_as_safetensor = (
-        original_load_model_as_safetensor
-    )
-    pretrained._corl_groot_state_dict_patch_installed = True
-
-
-def install_pi05_state_dict_compatibility_patch() -> None:
-    """Accept PI05 checkpoints that still use the legacy vision_tower prefix."""
-    import lerobot.policies.pretrained as pretrained
-
-    if getattr(pretrained, "_corl_pi05_state_dict_patch_installed", False):
-        return
-
-    from safetensors.torch import _remove_duplicate_names, load_file
-
-    original_load_model_as_safetensor = pretrained.load_model_as_safetensor
-
-    def load_model_as_safetensor_with_pi05_compat(
-        model,
-        filename,
-        strict: bool = True,
-        device: str | int = "cpu",
-    ):
-        state_dict = load_file(filename, device=device)
-        if type(model).__name__ == "PI05Policy":
-            state_dict, changed = _remap_pi05_state_dict_keys(state_dict)
-            if changed:
-                print("[PI05] Remapped legacy checkpoint keys for compatibility")
-
-        model_state_dict = model.state_dict()
-        to_removes = _remove_duplicate_names(
-            model_state_dict, preferred_names=state_dict.keys()
-        )
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        missing = set(missing)
-        for to_remove_group in to_removes.values():
-            for to_remove in to_remove_group:
-                if to_remove not in missing:
-                    unexpected.append(to_remove)
-                else:
-                    missing.remove(to_remove)
-        if strict and (missing or unexpected):
-            missing_keys = ", ".join([f'"{k}"' for k in sorted(missing)])
-            unexpected_keys = ", ".join([f'"{k}"' for k in sorted(unexpected)])
-            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
-            if missing:
-                error += f"\n    Missing key(s) in state_dict: {missing_keys}"
-            if unexpected:
-                error += f"\n    Unexpected key(s) in state_dict: {unexpected_keys}"
-            raise RuntimeError(error)
-        return missing, unexpected
-
-    pretrained.load_model_as_safetensor = load_model_as_safetensor_with_pi05_compat
-    pretrained._corl_pi05_original_load_model_as_safetensor = (
-        original_load_model_as_safetensor
-    )
-    pretrained._corl_pi05_state_dict_patch_installed = True
-
-
-def install_groot_attention_implementation_patch(attn_implementation: str) -> None:
-    """Patch LeRobot GR00T Eagle config loading away from unsupported FA2."""
-    resolved_attn_implementation = str(attn_implementation or "").strip()
-    if not resolved_attn_implementation:
-        return
-
-    groot_n1 = _import_groot_n1_with_kw_only_dataclass_compatibility()
-    from transformers.models.llama.modeling_llama import LlamaForCausalLM
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-    from transformers.models.siglip.modeling_siglip import SiglipVisionModel
-
-    def patch_model_init(model_cls: type[object]) -> None:
-        if getattr(
-            model_cls,
-            "_corl_groot_attention_implementation_patch_installed",
-            False,
-        ):
-            model_cls._corl_groot_attention_implementation = resolved_attn_implementation
-            return
-
-        original_init = model_cls.__init__
-
-        def init_with_groot_attention(self, config, *args, **kwargs):
-            implementation = getattr(
-                model_cls,
-                "_corl_groot_attention_implementation",
-                resolved_attn_implementation,
-            )
-            _set_transformers_attention_implementation(config, implementation)
-            return original_init(self, config, *args, **kwargs)
-
-        model_cls.__init__ = init_with_groot_attention
-        model_cls._corl_groot_attention_implementation_patch_installed = True
-        model_cls._corl_original_init = original_init
-        model_cls._corl_groot_attention_implementation = resolved_attn_implementation
-
-    for child_model_cls in (
-        SiglipVisionModel,
-        LlamaForCausalLM,
-        Qwen2ForCausalLM,
-        Qwen3ForCausalLM,
-    ):
-        patch_model_init(child_model_cls)
-
-    auto_model_cls = groot_n1.AutoModel
-    if getattr(
-        auto_model_cls,
-        "_corl_groot_attention_implementation_patch_installed",
-        False,
-    ):
-        auto_model_cls._corl_groot_attention_implementation = resolved_attn_implementation
-        return
-
-    original_from_config = auto_model_cls.from_config
-
-    def from_config_with_groot_attention(config, **kwargs):
-        model_type = str(getattr(config, "model_type", ""))
-        class_name = type(config).__name__
-        if model_type.startswith("eagle") or class_name.startswith("Eagle"):
-            implementation = getattr(
-                auto_model_cls,
-                "_corl_groot_attention_implementation",
-                resolved_attn_implementation,
-            )
-            _set_transformers_attention_implementation(config, implementation)
-            kwargs.setdefault("attn_implementation", implementation)
-        return original_from_config(config, **kwargs)
-
-    auto_model_cls.from_config = staticmethod(from_config_with_groot_attention)
-    auto_model_cls._corl_groot_attention_implementation_patch_installed = True
-    auto_model_cls._corl_original_from_config = original_from_config
-    auto_model_cls._corl_groot_attention_implementation = resolved_attn_implementation
 
 
 def teardown_wandb_safely(exit_code: int) -> None:
@@ -2452,7 +1926,7 @@ def install_lerobot_dataset_load_patch() -> None:
             item["index"].item() if isinstance(item["index"], torch.Tensor) else item["index"]
         )
         for key in signature_cache_reader.feature_keys:
-            if key not in item:
+            if key not in item or item[key] is None:
                 item[key] = signature_cache_reader.get(key, absolute_index)
         return item
 
@@ -3187,14 +2661,6 @@ def parse_int_pair(value: str) -> tuple[int, int]:
     )
 
 
-def parse_pi05_image_resolution(value: str) -> tuple[int, int]:
-    return _parse_numeric_pair(
-        value,
-        option_name="--pi05-image-resolution",
-        item_type=int,
-    )
-
-
 def parse_float_pair(value: str) -> tuple[float, float]:
     return _parse_numeric_pair(
         value,
@@ -3202,29 +2668,6 @@ def parse_float_pair(value: str) -> tuple[float, float]:
         item_type=float,
     )
 
-
-def parse_pi05_optimizer_betas(value: str) -> tuple[float, float]:
-    return _parse_numeric_pair(
-        value,
-        option_name="--pi05-optimizer-betas",
-        item_type=float,
-    )
-
-
-def parse_groot_image_size(value: str) -> tuple[int, int]:
-    return _parse_numeric_pair(
-        value,
-        option_name="--groot-image-size",
-        item_type=int,
-    )
-
-
-def parse_groot_optimizer_betas(value: str) -> tuple[float, float]:
-    return _parse_numeric_pair(
-        value,
-        option_name="--groot-optimizer-betas",
-        item_type=float,
-    )
 
 
 def coerce_numeric_pair(value, *, option_name: str, item_type: type) -> tuple:
@@ -3249,6 +2692,72 @@ def optional_pretrained_path(value: str | Path | None) -> Path | None:
     if not text:
         return None
     return Path(text)
+
+
+def apply_policy_pretrained_path(
+    policy_cfg,
+    policy_path_value: str | Path | None,
+) -> None:
+    pretrained_path = optional_pretrained_path(policy_path_value)
+    if pretrained_path is not None:
+        policy_cfg.pretrained_path = pretrained_path
+
+
+def build_smolvla_policy_config(
+    args: argparse.Namespace,
+    *,
+    input_features_override,
+    output_features_override,
+):
+    SmolVLAConfig = import_lerobot_policy_config_class("smolvla")
+    smolvla_resize = tuple(
+        coerce_numeric_pair(
+            args.smolvla_resize_imgs_with_padding,
+            option_name="--smolvla-resize-imgs-with-padding",
+            item_type=int,
+        )
+    )
+    policy_cfg = SmolVLAConfig(
+        device=args.device,
+        use_amp=bool(args.use_amp),
+        push_to_hub=False,
+        input_features=input_features_override,
+        output_features=output_features_override,
+        n_obs_steps=int(args.n_obs_steps),
+        max_state_dim=int(args.smolvla_max_state_dim),
+        max_action_dim=int(args.smolvla_max_action_dim),
+        resize_imgs_with_padding=smolvla_resize,
+        empty_cameras=int(args.smolvla_empty_cameras),
+        tokenizer_max_length=int(args.smolvla_tokenizer_max_length),
+        num_steps=int(args.smolvla_num_steps),
+        use_cache=bool(args.smolvla_use_cache),
+        freeze_vision_encoder=bool(args.smolvla_freeze_vision_encoder),
+        train_expert_only=bool(args.smolvla_train_expert_only),
+        train_state_proj=bool(args.smolvla_train_state_proj),
+        load_vlm_weights=bool(args.smolvla_load_vlm_weights),
+        vlm_model_name=str(args.smolvla_vlm_model_name),
+        attention_mode=str(args.smolvla_attention_mode),
+        prefix_length=int(args.smolvla_prefix_length),
+        pad_language_to=str(args.smolvla_pad_language_to),
+        num_expert_layers=int(args.smolvla_num_expert_layers),
+        num_vlm_layers=int(args.smolvla_num_vlm_layers),
+        self_attn_every_n_layers=int(args.smolvla_self_attn_every_n_layers),
+        expert_width_multiplier=float(args.smolvla_expert_width_multiplier),
+        min_period=float(args.smolvla_min_period),
+        max_period=float(args.smolvla_max_period),
+        compile_model=bool(args.smolvla_compile_model),
+        compile_mode=str(args.smolvla_compile_mode),
+        optimizer_lr=float(args.smolvla_optimizer_lr),
+        optimizer_betas=tuple(args.smolvla_optimizer_betas),
+        optimizer_eps=float(args.smolvla_optimizer_eps),
+        optimizer_weight_decay=float(args.smolvla_optimizer_weight_decay),
+        optimizer_grad_clip_norm=float(args.smolvla_optimizer_grad_clip_norm),
+        scheduler_warmup_steps=int(args.smolvla_scheduler_warmup_steps),
+        scheduler_decay_steps=int(args.smolvla_scheduler_decay_steps),
+        scheduler_decay_lr=float(args.smolvla_scheduler_decay_lr),
+    )
+    apply_policy_pretrained_path(policy_cfg, getattr(args, "policy_path", None))
+    return policy_cfg
 
 
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
@@ -3281,8 +2790,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Train LeRobot ACT, Diffusion, PRISM Diffusion, Streaming ACT, "
-            "pi05, SmolVLA, or GR00T N1.5 on a local "
-            "LeRobot dataset."
+            "SmolVLA on a local LeRobot dataset."
         )
     )
     parser.add_argument(
@@ -3606,16 +3114,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     if known_args.policy in {
         "diffusion",
         "prism_diffusion",
-        "pi05",
         "smolvla",
-        "groot",
-    }:
+        }:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
             default=defaults.get(
                 "n_obs_steps",
-                1 if known_args.policy in {"pi05", "smolvla", "groot"} else 2,
+                1 if known_args.policy == "smolvla" else 2,
             ),
             help=(
                 "Number of observation steps passed to the policy "
@@ -4075,242 +3581,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "hidden cache folder under the dataset root."
             ),
         )
-    elif known_args.policy == "pi05":
-        parser.add_argument(
-            "--policy-path",
-            type=str,
-            default=defaults.get(
-                "policy_path",
-                defaults.get("pretrained_path", PI05_DEFAULT_POLICY_PATH),
-            ),
-            help=(
-                "pi05 checkpoint to fine-tune. Defaults to the "
-                "official `lerobot/pi05_base` checkpoint. Pass an empty string to "
-                "train pi05 from scratch."
-            ),
-        )
-        parser.add_argument(
-            "--pi05-max-state-dim",
-            type=int,
-            default=defaults.get("max_state_dim", 32),
-            help="State vectors shorter than this are padded before pi05.",
-        )
-        parser.add_argument(
-            "--pi05-max-action-dim",
-            type=int,
-            default=defaults.get("max_action_dim", 32),
-            help="Action vectors shorter than this are padded before pi05.",
-        )
-        parser.add_argument(
-            "--pi05-image-resolution",
-            type=parse_pi05_image_resolution,
-            default=defaults.get("image_resolution", (224, 224)),
-            help="pi05 image resolution as WIDTH,HEIGHT, e.g. 224,224.",
-        )
-        parser.add_argument(
-            "--pi05-empty-cameras",
-            type=int,
-            default=defaults.get("empty_cameras", 0),
-            help="Number of zero-filled placeholder cameras appended by pi05.",
-        )
-        parser.add_argument(
-            "--pi05-tokenizer-max-length",
-            type=int,
-            default=defaults.get("tokenizer_max_length", 200),
-            help="Maximum language-token length for pi05 instructions.",
-        )
-        parser.add_argument(
-            "--pi05-num-inference-steps",
-            type=int,
-            default=defaults.get("num_inference_steps", 10),
-            help="Flow-matching denoising steps used by pi05 at inference time.",
-        )
-        parser.add_argument(
-            "--pi05-paligemma-variant",
-            choices=["gemma_300m", "gemma_2b"],
-            default=defaults.get("paligemma_variant", "gemma_2b"),
-            help="PaliGemma backbone size recorded in PI05Config.",
-        )
-        parser.add_argument(
-            "--pi05-action-expert-variant",
-            choices=["gemma_300m", "gemma_2b"],
-            default=defaults.get("action_expert_variant", "gemma_300m"),
-            help="Action expert size recorded in PI05Config.",
-        )
-        parser.add_argument(
-            "--pi05-dtype",
-            choices=["float32", "bfloat16"],
-            default=defaults.get("dtype", "float32"),
-            help="Internal pi05 model dtype.",
-        )
-        pi05_ignore_signature_group = parser.add_mutually_exclusive_group()
-        pi05_ignore_signature_group.add_argument(
-            "--pi05-ignore-signature",
-            dest="pi05_ignore_signature_features",
-            action="store_true",
-            help="Exclude path/delta signature features from pi05 training.",
-        )
-        pi05_ignore_signature_group.add_argument(
-            "--pi05-keep-signature",
-            dest="pi05_ignore_signature_features",
-            action="store_false",
-            help="Keep signature features visible to the pi05 data loader.",
-        )
-        parser.set_defaults(
-            pi05_ignore_signature_features=defaults.get("ignore_signature", True),
-        )
-        pi05_vision_group = parser.add_mutually_exclusive_group()
-        pi05_vision_group.add_argument(
-            "--pi05-freeze-vision-encoder",
-            dest="pi05_freeze_vision_encoder",
-            action="store_true",
-            help="Freeze the pi05 vision encoder while fine-tuning.",
-        )
-        pi05_vision_group.add_argument(
-            "--pi05-unfreeze-vision-encoder",
-            dest="pi05_freeze_vision_encoder",
-            action="store_false",
-            help="Fine-tune the pi05 vision encoder.",
-        )
-        parser.set_defaults(
-            pi05_freeze_vision_encoder=defaults.get("freeze_vision_encoder", True)
-        )
-        pi05_expert_group = parser.add_mutually_exclusive_group()
-        pi05_expert_group.add_argument(
-            "--pi05-train-expert-only",
-            dest="pi05_train_expert_only",
-            action="store_true",
-            help="Train only the pi05 action expert branch.",
-        )
-        pi05_expert_group.add_argument(
-            "--pi05-train-all-layers",
-            dest="pi05_train_expert_only",
-            action="store_false",
-            help="Allow all unfrozen pi05 layers to train.",
-        )
-        parser.set_defaults(
-            pi05_train_expert_only=defaults.get("train_expert_only", True)
-        )
-        pi05_checkpointing_group = parser.add_mutually_exclusive_group()
-        pi05_checkpointing_group.add_argument(
-            "--pi05-gradient-checkpointing",
-            dest="pi05_gradient_checkpointing",
-            action="store_true",
-            help="Enable pi05 gradient checkpointing.",
-        )
-        pi05_checkpointing_group.add_argument(
-            "--pi05-no-gradient-checkpointing",
-            dest="pi05_gradient_checkpointing",
-            action="store_false",
-            help="Disable pi05 gradient checkpointing.",
-        )
-        parser.set_defaults(
-            pi05_gradient_checkpointing=defaults.get("gradient_checkpointing", False)
-        )
-        pi05_compile_group = parser.add_mutually_exclusive_group()
-        pi05_compile_group.add_argument(
-            "--pi05-compile-model",
-            dest="pi05_compile_model",
-            action="store_true",
-            help="Enable torch.compile for pi05.",
-        )
-        pi05_compile_group.add_argument(
-            "--pi05-no-compile-model",
-            dest="pi05_compile_model",
-            action="store_false",
-            help="Disable torch.compile for pi05.",
-        )
-        parser.set_defaults(pi05_compile_model=defaults.get("compile_model", False))
-        parser.add_argument(
-            "--pi05-compile-mode",
-            type=str,
-            default=defaults.get("compile_mode", "max-autotune"),
-            help="torch.compile mode used when pi05 compilation is enabled.",
-        )
-        parser.add_argument(
-            "--pi05-time-sampling-beta-alpha",
-            type=float,
-            default=defaults.get("time_sampling_beta_alpha", 1.5),
-            help="pi05 flow-matching beta alpha for training time sampling.",
-        )
-        parser.add_argument(
-            "--pi05-time-sampling-beta-beta",
-            type=float,
-            default=defaults.get("time_sampling_beta_beta", 1.0),
-            help="pi05 flow-matching beta beta for training time sampling.",
-        )
-        parser.add_argument(
-            "--pi05-time-sampling-scale",
-            type=float,
-            default=defaults.get("time_sampling_scale", 0.999),
-            help="pi05 flow-matching time sampling scale.",
-        )
-        parser.add_argument(
-            "--pi05-time-sampling-offset",
-            type=float,
-            default=defaults.get("time_sampling_offset", 0.001),
-            help="pi05 flow-matching time sampling offset.",
-        )
-        parser.add_argument(
-            "--pi05-min-period",
-            type=float,
-            default=defaults.get("min_period", 0.004),
-            help="Minimum timestep period for pi05 positional encoding.",
-        )
-        parser.add_argument(
-            "--pi05-max-period",
-            type=float,
-            default=defaults.get("max_period", 4.0),
-            help="Maximum timestep period for pi05 positional encoding.",
-        )
-        parser.add_argument(
-            "--pi05-optimizer-lr",
-            type=float,
-            default=defaults.get("optimizer_lr", 2.5e-5),
-            help="pi05 AdamW learning rate.",
-        )
-        parser.add_argument(
-            "--pi05-optimizer-betas",
-            type=parse_pi05_optimizer_betas,
-            default=defaults.get("optimizer_betas", (0.9, 0.95)),
-            help="pi05 AdamW betas as beta1,beta2.",
-        )
-        parser.add_argument(
-            "--pi05-optimizer-eps",
-            type=float,
-            default=defaults.get("optimizer_eps", 1e-8),
-            help="pi05 AdamW epsilon.",
-        )
-        parser.add_argument(
-            "--pi05-optimizer-weight-decay",
-            type=float,
-            default=defaults.get("optimizer_weight_decay", 0.01),
-            help="pi05 AdamW weight decay.",
-        )
-        parser.add_argument(
-            "--pi05-optimizer-grad-clip-norm",
-            type=float,
-            default=defaults.get("optimizer_grad_clip_norm", 1.0),
-            help="pi05 optimizer gradient clipping norm.",
-        )
-        parser.add_argument(
-            "--pi05-scheduler-warmup-steps",
-            type=int,
-            default=defaults.get("scheduler_warmup_steps", 1000),
-            help="pi05 scheduler warmup steps.",
-        )
-        parser.add_argument(
-            "--pi05-scheduler-decay-steps",
-            type=int,
-            default=defaults.get("scheduler_decay_steps", 30000),
-            help="pi05 scheduler cosine-decay steps.",
-        )
-        parser.add_argument(
-            "--pi05-scheduler-decay-lr",
-            type=float,
-            default=defaults.get("scheduler_decay_lr", 2.5e-6),
-            help="pi05 scheduler final decay learning rate.",
-        )
     elif known_args.policy == "smolvla":
         parser.add_argument(
             "--policy-path",
@@ -4573,280 +3843,6 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=float,
             default=defaults.get("scheduler_decay_lr", 2.5e-6),
             help="SmolVLA scheduler final decay learning rate.",
-        )
-    elif known_args.policy == "groot":
-        parser.add_argument(
-            "--policy-path",
-            type=str,
-            default=defaults.get("policy_path", defaults.get("pretrained_path")),
-            help=(
-                "Optional trained LeRobot GR00T checkpoint to fine-tune. "
-                "Leave empty to initialize from --groot-base-model-path."
-            ),
-        )
-        parser.add_argument(
-            "--groot-max-state-dim",
-            type=int,
-            default=defaults.get("max_state_dim", 64),
-            help="State vectors shorter than this are padded before GR00T.",
-        )
-        parser.add_argument(
-            "--groot-max-action-dim",
-            type=int,
-            default=defaults.get("max_action_dim", 32),
-            help="Action vectors shorter than this are padded before GR00T.",
-        )
-        parser.add_argument(
-            "--groot-image-size",
-            type=parse_groot_image_size,
-            default=defaults.get("image_size", (224, 224)),
-            help="GR00T image size as WIDTH,HEIGHT, e.g. 224,224.",
-        )
-        parser.add_argument(
-            "--groot-base-model-path",
-            type=str,
-            default=defaults.get("base_model_path", GROOT_DEFAULT_BASE_MODEL_PATH),
-            help="Base GR00T N1.5 model path or Hugging Face repo id.",
-        )
-        parser.add_argument(
-            "--groot-tokenizer-assets-repo",
-            type=str,
-            default=defaults.get(
-                "tokenizer_assets_repo",
-                GROOT_DEFAULT_TOKENIZER_ASSETS_REPO,
-            ),
-            help="Repo or path containing Eagle tokenizer assets for GR00T.",
-        )
-        parser.add_argument(
-            "--groot-attn-implementation",
-            type=str,
-            choices=["eager", "sdpa", "flash_attention_2"],
-            default=defaults.get(
-                "attn_implementation",
-                GROOT_DEFAULT_ATTN_IMPLEMENTATION,
-            ),
-            help=(
-                "Transformers attention implementation for the GR00T Eagle "
-                "backbone. `eager` avoids the current Eagle/Flash Attention 2 "
-                "compatibility failure."
-            ),
-        )
-        parser.add_argument(
-            "--groot-embodiment-tag",
-            type=str,
-            default=defaults.get("embodiment_tag", "new_embodiment"),
-            help="GR00T embodiment tag, e.g. new_embodiment, gr1, so100.",
-        )
-        groot_ignore_signature_group = parser.add_mutually_exclusive_group()
-        groot_ignore_signature_group.add_argument(
-            "--groot-ignore-signature",
-            dest="groot_ignore_signature_features",
-            action="store_true",
-            help="Exclude path/delta signature features from GR00T training.",
-        )
-        groot_ignore_signature_group.add_argument(
-            "--groot-keep-signature",
-            dest="groot_ignore_signature_features",
-            action="store_false",
-            help="Keep signature features visible to the GR00T data loader.",
-        )
-        parser.set_defaults(
-            groot_ignore_signature_features=defaults.get("ignore_signature", True),
-        )
-        groot_llm_group = parser.add_mutually_exclusive_group()
-        groot_llm_group.add_argument(
-            "--groot-tune-llm",
-            dest="groot_tune_llm",
-            action="store_true",
-            help="Fine-tune the GR00T language backbone.",
-        )
-        groot_llm_group.add_argument(
-            "--groot-freeze-llm",
-            dest="groot_tune_llm",
-            action="store_false",
-            help="Freeze the GR00T language backbone.",
-        )
-        parser.set_defaults(groot_tune_llm=defaults.get("tune_llm", False))
-        groot_visual_group = parser.add_mutually_exclusive_group()
-        groot_visual_group.add_argument(
-            "--groot-tune-visual",
-            dest="groot_tune_visual",
-            action="store_true",
-            help="Fine-tune the GR00T visual tower.",
-        )
-        groot_visual_group.add_argument(
-            "--groot-freeze-visual",
-            dest="groot_tune_visual",
-            action="store_false",
-            help="Freeze the GR00T visual tower.",
-        )
-        parser.set_defaults(groot_tune_visual=defaults.get("tune_visual", False))
-        groot_projector_group = parser.add_mutually_exclusive_group()
-        groot_projector_group.add_argument(
-            "--groot-tune-projector",
-            dest="groot_tune_projector",
-            action="store_true",
-            help="Fine-tune the GR00T projector.",
-        )
-        groot_projector_group.add_argument(
-            "--groot-freeze-projector",
-            dest="groot_tune_projector",
-            action="store_false",
-            help="Freeze the GR00T projector.",
-        )
-        parser.set_defaults(
-            groot_tune_projector=defaults.get("tune_projector", True),
-        )
-        groot_diffusion_group = parser.add_mutually_exclusive_group()
-        groot_diffusion_group.add_argument(
-            "--groot-tune-diffusion-model",
-            dest="groot_tune_diffusion_model",
-            action="store_true",
-            help="Fine-tune the GR00T diffusion/action model.",
-        )
-        groot_diffusion_group.add_argument(
-            "--groot-freeze-diffusion-model",
-            dest="groot_tune_diffusion_model",
-            action="store_false",
-            help="Freeze the GR00T diffusion/action model.",
-        )
-        parser.set_defaults(
-            groot_tune_diffusion_model=defaults.get("tune_diffusion_model", True),
-        )
-        parser.add_argument(
-            "--groot-lora-rank",
-            type=int,
-            default=defaults.get("lora_rank", 0),
-            help="GR00T LoRA rank. Use 0 to disable LoRA.",
-        )
-        parser.add_argument(
-            "--groot-lora-alpha",
-            type=int,
-            default=defaults.get("lora_alpha", 16),
-            help="GR00T LoRA alpha.",
-        )
-        parser.add_argument(
-            "--groot-lora-dropout",
-            type=float,
-            default=defaults.get("lora_dropout", 0.1),
-            help="GR00T LoRA dropout.",
-        )
-        groot_lora_full_group = parser.add_mutually_exclusive_group()
-        groot_lora_full_group.add_argument(
-            "--groot-lora-full-model",
-            dest="groot_lora_full_model",
-            action="store_true",
-            help="Apply LoRA to the full GR00T model.",
-        )
-        groot_lora_full_group.add_argument(
-            "--groot-lora-adapters-only",
-            dest="groot_lora_full_model",
-            action="store_false",
-            help="Apply LoRA only to the default GR00T adapter set.",
-        )
-        parser.set_defaults(
-            groot_lora_full_model=defaults.get("lora_full_model", False),
-        )
-        parser.add_argument(
-            "--groot-optimizer-lr",
-            type=float,
-            default=defaults.get("optimizer_lr", 1e-4),
-            help="GR00T AdamW learning rate.",
-        )
-        parser.add_argument(
-            "--groot-optimizer-betas",
-            type=parse_groot_optimizer_betas,
-            default=defaults.get("optimizer_betas", (0.95, 0.999)),
-            help="GR00T AdamW betas as beta1,beta2.",
-        )
-        parser.add_argument(
-            "--groot-optimizer-eps",
-            type=float,
-            default=defaults.get("optimizer_eps", 1e-8),
-            help="GR00T AdamW epsilon.",
-        )
-        parser.add_argument(
-            "--groot-optimizer-weight-decay",
-            type=float,
-            default=defaults.get("optimizer_weight_decay", 1e-5),
-            help="GR00T AdamW weight decay.",
-        )
-        parser.add_argument(
-            "--groot-optimizer-grad-clip-norm",
-            type=float,
-            default=defaults.get("optimizer_grad_clip_norm", 10),
-            help="GR00T optimizer gradient clipping norm.",
-        )
-        parser.add_argument(
-            "--groot-warmup-ratio",
-            type=float,
-            default=defaults.get("warmup_ratio", 0.05),
-            help="GR00T cosine schedule warmup ratio.",
-        )
-        parser.add_argument(
-            "--groot-scheduler-decay-lr",
-            type=float,
-            default=defaults.get("scheduler_decay_lr"),
-            help="Optional GR00T scheduler final learning rate.",
-        )
-        groot_bf16_group = parser.add_mutually_exclusive_group()
-        groot_bf16_group.add_argument(
-            "--groot-use-bf16",
-            dest="groot_use_bf16",
-            action="store_true",
-            help="Use bfloat16 autocast inside the GR00T model.",
-        )
-        groot_bf16_group.add_argument(
-            "--groot-disable-bf16",
-            dest="groot_use_bf16",
-            action="store_false",
-            help="Disable GR00T-internal bfloat16 autocast.",
-        )
-        parser.set_defaults(groot_use_bf16=defaults.get("use_bf16", True))
-        parser.add_argument(
-            "--groot-video-backend",
-            type=str,
-            default=defaults.get(
-                "groot_video_backend",
-                defaults.get("video_backend", "decord"),
-            ),
-            help="Video backend recorded in GrootConfig.",
-        )
-        groot_balance_dataset_group = parser.add_mutually_exclusive_group()
-        groot_balance_dataset_group.add_argument(
-            "--groot-balance-dataset-weights",
-            dest="groot_balance_dataset_weights",
-            action="store_true",
-            help="Balance GR00T mixture dataset weights.",
-        )
-        groot_balance_dataset_group.add_argument(
-            "--groot-no-balance-dataset-weights",
-            dest="groot_balance_dataset_weights",
-            action="store_false",
-            help="Disable GR00T mixture dataset balancing.",
-        )
-        parser.set_defaults(
-            groot_balance_dataset_weights=defaults.get(
-                "balance_dataset_weights", True
-            ),
-        )
-        groot_balance_trajectory_group = parser.add_mutually_exclusive_group()
-        groot_balance_trajectory_group.add_argument(
-            "--groot-balance-trajectory-weights",
-            dest="groot_balance_trajectory_weights",
-            action="store_true",
-            help="Weight GR00T trajectories by length.",
-        )
-        groot_balance_trajectory_group.add_argument(
-            "--groot-no-balance-trajectory-weights",
-            dest="groot_balance_trajectory_weights",
-            action="store_false",
-            help="Disable GR00T trajectory-length weighting.",
-        )
-        parser.set_defaults(
-            groot_balance_trajectory_weights=defaults.get(
-                "balance_trajectory_weights", True
-            ),
         )
     elif known_args.policy == "prism_diffusion":
         path_signature_group = parser.add_mutually_exclusive_group()
@@ -5175,14 +4171,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.local_data_root = Path(args.local_data_root)
     if not isinstance(args.output_root, Path):
         args.output_root = Path(args.output_root)
-    if getattr(args, "signature_cache_root", None) is not None and not isinstance(
-        args.signature_cache_root, Path
-    ):
-        args.signature_cache_root = Path(args.signature_cache_root)
-    if getattr(args, "prefix_image_cache_root", None) is not None and not isinstance(
-        args.prefix_image_cache_root, Path
-    ):
-        args.prefix_image_cache_root = Path(args.prefix_image_cache_root)
+    if hasattr(args, "signature_cache_root"):
+        if args.signature_cache_root is not None and not isinstance(
+            args.signature_cache_root, Path
+        ):
+            args.signature_cache_root = Path(args.signature_cache_root)
+    else:
+        args.signature_cache_root = None
+    if hasattr(args, "prefix_image_cache_root"):
+        if args.prefix_image_cache_root is not None and not isinstance(
+            args.prefix_image_cache_root, Path
+        ):
+            args.prefix_image_cache_root = Path(args.prefix_image_cache_root)
+    else:
+        args.prefix_image_cache_root = None
     if int(args.local_sgd_sync_every) < 1:
         parser.error("--local-sgd-sync-every must be >= 1")
     if int(args.local_sgd_warmup_steps) < 0:
@@ -5200,15 +4202,15 @@ def main(argv: list[str] | None = None) -> None:
         ensure_prism_diffusion_importable(PROJECT_ROOT)
         ensure_streaming_act_importable(PROJECT_ROOT)
 
+    ensure_lerobot_policy_imports(args.policy)
+
     os.environ["WANDB_CONSOLE"] = str(args.wandb_console)
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
 
     try:
         # LeRobot 0.5.x eagerly imports `lerobot.policies` during package import,
-        # which can trip the GR00T dataclass bug on Python 3.12 before pi05 even
-        # reaches its own policy-specific setup. Install the compatibility shim
-        # before importing any LeRobot modules.
-        install_groot_transformers_loading_compatibility_patch()
+        # which can trip a dataclass bug on Python 3.12 before policy setup
+        # even starts.
 
         from lerobot.configs.default import DatasetConfig, WandBConfig
         from lerobot.configs.train import TrainPipelineConfig
@@ -5220,6 +4222,11 @@ def main(argv: list[str] | None = None) -> None:
             "your platform."
         ) from exc
     train = lerobot_train_module.train
+
+    # Make sure the custom dataset shims are active before the training loop
+    # constructs the dataset and dataloader.
+    install_lerobot_dataset_load_patch()
+    install_prefix_sequence_dataset_patch()
 
     defaults_dataset_root = getattr(args, "_policy_defaults_dataset_root", None)
     source_dataset_root = resolve_training_dataset_root(
@@ -5261,54 +4268,114 @@ def main(argv: list[str] | None = None) -> None:
             split_seed=int(args.split_seed),
             split_shuffle=bool(args.split_shuffle),
         )
+    dataset_cfg = DatasetConfig(
+        repo_id=dataset_repo_id,
+        root=str(dataset_root),
+        episodes=split_spec.train_episode_indices,
+        use_imagenet_stats=False,
+        video_backend=args.video_backend,
+    )
     visual_storage_modes = summarize_visual_storage_modes(dataset_root)
+    use_path_signature = bool(getattr(args, "use_path_signature", False))
+    use_delta_signature = bool(getattr(args, "use_delta_signature", False))
+    use_prefix_sequence_training = bool(
+        getattr(args, "use_prefix_sequence_training", False)
+    )
+    use_visual_prefix_memory = bool(
+        getattr(args, "use_visual_prefix_memory", False)
+    )
+    use_signature_conditioned_visual_prefix_memory = bool(
+        getattr(args, "use_signature_conditioned_visual_prefix_memory", False)
+    )
+    use_signature_indexed_slot_memory = bool(
+        getattr(args, "use_signature_indexed_slot_memory", False)
+    )
+    use_memory_conditioned_encoder_film = bool(
+        getattr(args, "use_memory_conditioned_encoder_film", False)
+    )
+    num_memory_slots = int(getattr(args, "num_memory_slots", 1))
+    slot_memory_num_slots = int(getattr(args, "slot_memory_num_slots", 4))
+    slot_memory_routing_hidden_dim = int(
+        getattr(args, "slot_memory_routing_hidden_dim", 512)
+    )
+    slot_memory_identity_scale = float(
+        getattr(args, "slot_memory_identity_scale", 0.1)
+    )
+    slot_memory_routing_temperature = float(
+        getattr(args, "slot_memory_routing_temperature", 1.0)
+    )
+    slot_memory_use_delta_routing = bool(
+        getattr(args, "slot_memory_use_delta_routing", False)
+    )
+    slot_memory_use_softmax_routing = bool(
+        getattr(args, "slot_memory_use_softmax_routing", True)
+    )
+    slot_memory_use_readout_pooling = bool(
+        getattr(args, "slot_memory_use_readout_pooling", True)
+    )
+    slot_memory_balance_loss_coef = float(
+        getattr(args, "slot_memory_balance_loss_coef", 0.0)
+    )
+    slot_memory_entropy_loss_coef = float(
+        getattr(args, "slot_memory_entropy_loss_coef", 0.0)
+    )
+    slot_memory_consistency_loss_coef = float(
+        getattr(args, "slot_memory_consistency_loss_coef", 0.0)
+    )
+    resolved_history_length = int(getattr(args, "history_length", 0))
+    resolved_signature_dim = int(getattr(args, "signature_dim", 0))
+    signature_depth = int(getattr(args, "signature_depth", 3))
+    signature_hidden_dim = int(getattr(args, "signature_hidden_dim", 512))
+    signature_dropout = float(getattr(args, "signature_dropout", 0.1))
+    resolved_diffusion_drop_n_last_frames = 0
+    if args.policy in {"streaming_act", "prism_diffusion"}:
+        resolved_history_length = resolve_history_length(
+            dataset_root, resolved_history_length
+        )
+        resolved_signature_dim = resolve_signature_dim(
+            dataset_root,
+            dataset_repo_id=dataset_repo_id,
+            signature_cache_root=args.signature_cache_root,
+            use_path_signature=use_path_signature,
+            signature_dim=resolved_signature_dim,
+        )
+    if args.policy in {"diffusion", "prism_diffusion"}:
+        resolved_diffusion_drop_n_last_frames = resolve_diffusion_drop_n_last_frames(
+            horizon=int(args.horizon),
+            n_obs_steps=int(args.n_obs_steps),
+            n_action_steps=int(args.n_action_steps),
+            drop_n_last_frames=getattr(args, "drop_n_last_frames", None),
+        )
 
-    from lerobot.policies.act.configuration_act import ACTConfig
-    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    input_features_override, output_features_override = build_policy_feature_overrides(
+        dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        signature_cache_root=args.signature_cache_root,
+        use_prefix_sequence_training=use_prefix_sequence_training,
+        prefix_train_max_steps=int(getattr(args, "prefix_train_max_steps", 32)),
+        use_path_signature=use_path_signature,
+        use_delta_signature=use_delta_signature,
+    )
 
-    PrismDiffusionConfig = None
-    PI05Config = None
-    SmolVLAConfig = None
-    GrootConfig = None
-    if args.policy == "pi05":
-        try:
-            from lerobot.policies.pi05.configuration_pi05 import PI05Config
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "pi05 support is missing from this LeRobot "
-                "installation. Install a LeRobot version that provides "
-                "`lerobot.policies.pi05`."
-            ) from exc
-    elif args.policy == "smolvla":
-        try:
-            from lerobot.policies.smolvla.configuration_smolvla import (
-                SmolVLAConfig,
-            )
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "SmolVLA support is missing from this LeRobot installation. "
-                "Install LeRobot with the SmolVLA extras, for example "
-                '`pip install -e ".[smolvla]"` in the LeRobot checkout.'
-            ) from exc
-    elif args.policy == "groot":
-        try:
-            from lerobot.policies.groot.configuration_groot import GrootConfig
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "GR00T support is missing from this LeRobot installation. "
-                "Install a LeRobot version that provides "
-                "`lerobot.policies.groot`, plus the GR00T CUDA dependencies "
-                "such as flash-attn."
-            ) from exc
-        install_groot_attention_implementation_patch(args.groot_attn_implementation)
-        install_groot_meta_tensor_compatibility_patch()
-        install_groot_transformers_loading_compatibility_patch()
-        install_groot_action_input_batch_feature_compatibility_patch()
-        install_groot_processor_tensor_compatibility_patch()
-        install_groot_state_dict_compatibility_patch()
-    elif args.policy == "pi05":
-        install_pi05_state_dict_compatibility_patch()
-    if policy_supports_signature_features(args.policy):
+    prism_use_path_signature = use_path_signature
+    prism_use_delta_signature = use_delta_signature
+    prism_use_prefix_sequence_training = use_prefix_sequence_training
+    prism_use_visual_prefix_memory = use_visual_prefix_memory
+    prism_history_length = resolved_history_length
+    prism_signature_dim = resolved_signature_dim
+    prism_required_signature_parquet_keys = tuple(
+        key
+        for key, enabled in (
+            ("observation.path_signature", prism_use_path_signature),
+            ("observation.delta_signature", prism_use_delta_signature),
+        )
+        if enabled
+    )
+
+    if args.policy == "streaming_act":
+        from lerobot_policy_streaming_act.configuration_streaming_act import (
+            StreamingACTConfig,
+        )
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
             configure_prefix_image_cache_runtime,
@@ -5320,291 +4387,45 @@ def main(argv: list[str] | None = None) -> None:
             prepare_signature_cache_runtime,
         )
 
-    if args.policy == "streaming_act":
-        from lerobot_policy_streaming_act.configuration_streaming_act import (
-            DELTA_SIGNATURE_KEY,
-            PATH_SIGNATURE_KEY,
-            StreamingACTConfig,
-        )
-    elif args.policy == "prism_diffusion":
-        from lerobot_policy_prism_diffusion.configuration_diffusion import (
-            PrismDiffusionConfig,
-        )
-    else:
-        configure_prefix_image_cache_runtime = None
-        prepare_prefix_image_cache_runtime = None
-        configure_signature_cache_runtime = None
-        prepare_signature_cache_runtime = None
-    ignore_signature_for_policy = bool(
-        (
-            args.policy == "pi05"
-            and bool(getattr(args, "pi05_ignore_signature_features", True))
-        )
-        or (
-            args.policy == "groot"
-            and bool(getattr(args, "groot_ignore_signature_features", True))
-        )
-    )
-    configure_ignored_dataset_feature_keys(
-        tuple(SIGNATURE_FEATURE_KEYS) if ignore_signature_for_policy else ()
-    )
-    install_torch_dataloader_patch(
-        persistent_workers=bool(args.dataloader_persistent_workers),
-        prefetch_factor=int(args.dataloader_prefetch_factor),
-    )
-    install_lerobot_dataset_load_patch()
-    install_episode_aware_sampler_patch()
-
-    prism_use_path_signature = False
-    prism_use_delta_signature = False
-    prism_use_prefix_sequence_training = False
-    prism_use_visual_prefix_memory = False
-    prism_history_length = 0
-    prism_signature_dim = 0
-    prism_required_signature_parquet_keys: list[str] = []
-    required_signature_parquet_keys: list[str] = []
-
-    if args.policy == "streaming_act":
-        use_path_signature = args.use_path_signature
-        use_delta_signature = bool(args.use_delta_signature)
-        use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
-        use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
-        use_imagenet_stats = False
-        required_signature_parquet_keys = [
-            key
-            for key, enabled in (
-                ("observation.path_signature", bool(use_path_signature)),
-                ("observation.delta_signature", bool(use_delta_signature)),
-            )
-            if enabled
-        ]
-        validate_prefix_sequence_support(
-            policy_name=args.policy,
-            use_prefix_sequence_training=use_prefix_sequence_training,
-            context="training",
-        )
-        resolved_history_length = resolve_history_length(
-            dataset_root=dataset_root,
-            history_length=args.history_length,
-        )
-        signature_dim = resolve_signature_dim(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_path_signature=use_path_signature,
-            signature_dim=args.signature_dim,
-        )
-        validate_delta_signature_dataset(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_delta_signature=use_delta_signature,
-        )
-        validate_prefix_sequence_dataset(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_prefix_sequence_training=use_prefix_sequence_training,
-            use_imagenet_stats=use_imagenet_stats,
-            use_path_signature=use_path_signature,
-            use_delta_signature=use_delta_signature,
-        )
-        validate_visual_prefix_memory_support(
-            use_visual_prefix_memory=use_visual_prefix_memory,
-            use_prefix_sequence_training=use_prefix_sequence_training,
-        )
-        if (
-            required_signature_parquet_keys
-            and str(args.signature_cache_mode) == "off"
-            and not parquet_has_columns(dataset_root, required_signature_parquet_keys)
-        ):
-            raise ValueError(
-                "This dataset does not store the requested signature features as parquet columns. "
-                "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
-                "so the training loader materializes signatures from the dataset cache."
-            )
-    elif args.policy == "prism_diffusion":
-        use_path_signature = False
-        use_delta_signature = False
-        use_prefix_sequence_training = False
-        use_visual_prefix_memory = False
-        resolved_history_length = 0
-        signature_dim = 0
-
-        prism_use_path_signature = bool(args.use_path_signature)
-        prism_use_delta_signature = bool(args.use_delta_signature)
-        prism_use_prefix_sequence_training = bool(args.use_prefix_sequence_training)
-        prism_use_visual_prefix_memory = bool(args.use_visual_prefix_memory)
-        prism_required_signature_parquet_keys = [
-            key
-            for key, enabled in (
-                ("observation.path_signature", bool(prism_use_path_signature)),
-                ("observation.delta_signature", bool(prism_use_delta_signature)),
-            )
-            if enabled
-        ]
-        validate_prefix_sequence_support(
-            policy_name=args.policy,
-            use_prefix_sequence_training=prism_use_prefix_sequence_training,
-            context="training",
-        )
-        prism_history_length = (
-            resolve_history_length(
-                dataset_root=dataset_root,
-                history_length=args.history_length,
-            )
-            if prism_use_path_signature
-            else int(args.history_length)
-        )
-        prism_signature_dim = resolve_signature_dim(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_path_signature=prism_use_path_signature,
-            signature_dim=args.signature_dim,
-        )
-        validate_delta_signature_dataset(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_delta_signature=prism_use_delta_signature,
-        )
-        validate_prefix_sequence_dataset(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=args.signature_cache_root,
-            use_prefix_sequence_training=prism_use_prefix_sequence_training,
-            use_imagenet_stats=False,
-            use_path_signature=prism_use_path_signature,
-            use_delta_signature=prism_use_delta_signature,
-        )
-        if (
-            prism_required_signature_parquet_keys
-            and str(args.signature_cache_mode) == "off"
-            and not parquet_has_columns(dataset_root, prism_required_signature_parquet_keys)
-        ):
-            raise ValueError(
-                "This dataset does not store the requested signature features as parquet columns. "
-                "Enable `--signature-cache-mode memmap` or `--signature-cache-mode ram` "
-                "so the training loader materializes signatures from the dataset cache."
-            )
-    else:
-        use_path_signature = False
-        use_delta_signature = False
-        use_prefix_sequence_training = False
-        use_visual_prefix_memory = False
-        resolved_history_length = 0
-        signature_dim = 0
-
-    active_use_prefix_sequence_training = bool(
-        use_prefix_sequence_training
-        if args.policy == "streaming_act"
-        else prism_use_prefix_sequence_training
-    )
-    active_use_path_signature = bool(
-        use_path_signature if args.policy == "streaming_act" else prism_use_path_signature
-    )
-    active_use_delta_signature = bool(
-        use_delta_signature if args.policy == "streaming_act" else prism_use_delta_signature
-    )
-
-    resolved_diffusion_drop_n_last_frames = None
-    if args.policy in {"diffusion", "prism_diffusion"}:
-        resolved_diffusion_drop_n_last_frames = resolve_diffusion_drop_n_last_frames(
-            n_obs_steps=int(args.n_obs_steps),
-            horizon=int(args.horizon),
-            n_action_steps=int(args.n_action_steps),
-            drop_n_last_frames=args.drop_n_last_frames,
-        )
-
-    input_features_override = None
-    output_features_override = None
-    ignored_input_feature_keys = (
-        tuple(SIGNATURE_FEATURE_KEYS) if ignore_signature_for_policy else ()
-    )
-    if active_use_prefix_sequence_training:
-        install_prefix_sequence_dataset_patch()
-    if active_use_prefix_sequence_training or ignored_input_feature_keys:
-        input_features_override, output_features_override = build_policy_feature_overrides(
-            dataset_root=dataset_root,
-            dataset_repo_id=dataset_repo_id,
-            signature_cache_root=getattr(args, "signature_cache_root", None),
-            use_prefix_sequence_training=active_use_prefix_sequence_training,
-            prefix_train_max_steps=int(getattr(args, "prefix_train_max_steps", 32)),
-            use_path_signature=active_use_path_signature,
-            use_delta_signature=active_use_delta_signature,
-            ignored_input_feature_keys=ignored_input_feature_keys,
-        )
-
-    dataset_cfg = DatasetConfig(
-        repo_id=dataset_repo_id,
-        root=str(dataset_root),
-        episodes=split_spec.train_episode_indices,
-        use_imagenet_stats=False,
-        video_backend=args.video_backend,
-    )
-
-    if args.policy == "streaming_act":
         policy_cfg = StreamingACTConfig(
             device=args.device,
             use_amp=bool(args.use_amp),
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
-            chunk_size=args.chunk_size,
-            n_action_steps=args.n_action_steps,
-            use_path_signature=bool(use_path_signature),
-            use_delta_signature=bool(use_delta_signature),
-            history_length=int(resolved_history_length),
-            signature_dim=int(signature_dim),
-            signature_depth=int(args.signature_depth),
-            signature_hidden_dim=int(args.signature_hidden_dim),
-            signature_dropout=float(args.signature_dropout),
-            use_prefix_sequence_training=bool(use_prefix_sequence_training),
-            prefix_train_max_steps=(
-                int(args.prefix_train_max_steps) if use_prefix_sequence_training else 32
-            ),
-            prefix_frame_stride=(
-                int(args.prefix_frame_stride) if use_prefix_sequence_training else 1
-            ),
-            prefix_pad_value=(
-                float(args.prefix_pad_value) if use_prefix_sequence_training else 0.0
-            ),
-            use_visual_prefix_memory=bool(use_visual_prefix_memory),
-            use_signature_conditioned_visual_prefix_memory=bool(
-                args.use_signature_conditioned_visual_prefix_memory
-            ),
-            use_signature_indexed_slot_memory=bool(
-                args.use_signature_indexed_slot_memory
-            ),
-            use_memory_conditioned_encoder_film=bool(
-                args.use_memory_conditioned_encoder_film
-            ),
-            num_memory_slots=int(args.num_memory_slots),
-            slot_memory_num_slots=int(args.slot_memory_num_slots),
-            slot_memory_routing_hidden_dim=int(args.slot_memory_routing_hidden_dim),
-            slot_memory_identity_scale=float(args.slot_memory_identity_scale),
-            slot_memory_routing_temperature=float(
-                args.slot_memory_routing_temperature
-            ),
-            slot_memory_use_delta_routing=bool(args.slot_memory_use_delta_routing),
-            slot_memory_use_softmax_routing=bool(args.slot_memory_use_softmax_routing),
-            slot_memory_use_readout_pooling=bool(args.slot_memory_use_readout_pooling),
-            slot_memory_balance_loss_coef=float(args.slot_memory_balance_loss_coef),
-            slot_memory_entropy_loss_coef=float(args.slot_memory_entropy_loss_coef),
-            slot_memory_consistency_loss_coef=float(
-                args.slot_memory_consistency_loss_coef
-            ),
+            chunk_size=int(args.chunk_size),
+            n_action_steps=int(args.n_action_steps),
             input_features=input_features_override,
             output_features=output_features_override,
+            use_path_signature=use_path_signature,
+            history_length=resolved_history_length,
+            signature_dim=resolved_signature_dim,
+            signature_depth=signature_depth,
+            signature_hidden_dim=signature_hidden_dim,
+            signature_dropout=signature_dropout,
+            use_prefix_sequence_training=use_prefix_sequence_training,
+            prefix_train_max_steps=int(args.prefix_train_max_steps),
+            prefix_frame_stride=int(args.prefix_frame_stride),
+            prefix_pad_value=float(args.prefix_pad_value),
+            use_visual_prefix_memory=use_visual_prefix_memory,
+            use_delta_signature=use_delta_signature,
+            use_signature_conditioned_visual_prefix_memory=(
+                use_signature_conditioned_visual_prefix_memory
+            ),
+            use_signature_indexed_slot_memory=use_signature_indexed_slot_memory,
+            use_memory_conditioned_encoder_film=use_memory_conditioned_encoder_film,
+            num_memory_slots=num_memory_slots,
+            slot_memory_num_slots=slot_memory_num_slots,
+            slot_memory_routing_hidden_dim=slot_memory_routing_hidden_dim,
+            slot_memory_identity_scale=slot_memory_identity_scale,
+            slot_memory_routing_temperature=slot_memory_routing_temperature,
+            slot_memory_use_delta_routing=slot_memory_use_delta_routing,
+            slot_memory_use_softmax_routing=slot_memory_use_softmax_routing,
+            slot_memory_use_readout_pooling=slot_memory_use_readout_pooling,
+            slot_memory_balance_loss_coef=slot_memory_balance_loss_coef,
+            slot_memory_entropy_loss_coef=slot_memory_entropy_loss_coef,
+            slot_memory_consistency_loss_coef=slot_memory_consistency_loss_coef,
         )
-        active_signature_keys = tuple(
-            key
-            for key, enabled in (
-                (PATH_SIGNATURE_KEY, bool(use_path_signature)),
-                (DELTA_SIGNATURE_KEY, bool(use_delta_signature)),
-            )
-            if enabled
-        )
+        active_signature_keys = prism_required_signature_parquet_keys
         configure_signature_cache_runtime(
             SignatureCacheRuntimeConfig(
                 dataset_root=dataset_root,
@@ -5634,13 +4455,18 @@ def main(argv: list[str] | None = None) -> None:
             prepare_prefix_image_cache_runtime()
         elif configure_prefix_image_cache_runtime is not None:
             configure_prefix_image_cache_runtime(None)
-        if signature_cache_reader is None and required_signature_parquet_keys and not parquet_has_columns(
-            dataset_root,
-            required_signature_parquet_keys,
+        if (
+            signature_cache_reader is None
+            and prism_required_signature_parquet_keys
+            and not parquet_has_columns(
+                dataset_root,
+                list(prism_required_signature_parquet_keys),
+            )
         ):
             raise RuntimeError(
-                "Signature cache is required for this dataset because the parquet files "
-                "do not contain the requested signature columns, but the cache could not be prepared."
+                "Signature cache is required for this dataset because the parquet "
+                "files do not contain the requested signature columns, but the "
+                "cache could not be prepared."
             )
         policy_cfg.pre_normalized_observation_keys = (
             resolve_pre_normalized_signature_observation_keys(
@@ -5651,222 +4477,53 @@ def main(argv: list[str] | None = None) -> None:
                     signature_cache_reader is not None
                     and signature_cache_reader.pre_normalized
                 ),
-                use_prefix_sequence_training=bool(use_prefix_sequence_training),
+                use_prefix_sequence_training=bool(
+                    use_prefix_sequence_training
+                ),
                 use_path_signature=bool(use_path_signature),
                 use_delta_signature=bool(use_delta_signature),
             )
         )
-    elif args.policy == "pi05":
-        if PI05Config is None:
-            raise RuntimeError("PI05Config failed to import.")
-        if configure_signature_cache_runtime is not None:
-            configure_signature_cache_runtime(None)
-        if configure_prefix_image_cache_runtime is not None:
-            configure_prefix_image_cache_runtime(None)
-        policy_cfg = PI05Config(
-            device=args.device,
-            use_amp=bool(args.use_amp),
-            push_to_hub=False,
-            pretrained_path=optional_pretrained_path(args.policy_path),
-            n_obs_steps=int(args.n_obs_steps),
-            chunk_size=int(args.chunk_size),
-            n_action_steps=int(args.n_action_steps),
-            input_features=input_features_override,
-            output_features=output_features_override,
-            max_state_dim=int(args.pi05_max_state_dim),
-            max_action_dim=int(args.pi05_max_action_dim),
-            image_resolution=coerce_numeric_pair(
-                args.pi05_image_resolution,
-                option_name="--pi05-image-resolution",
-                item_type=int,
-            ),
-            empty_cameras=int(args.pi05_empty_cameras),
-            tokenizer_max_length=int(args.pi05_tokenizer_max_length),
-            num_inference_steps=int(args.pi05_num_inference_steps),
-            paligemma_variant=str(args.pi05_paligemma_variant),
-            action_expert_variant=str(args.pi05_action_expert_variant),
-            dtype=str(args.pi05_dtype),
-            freeze_vision_encoder=bool(args.pi05_freeze_vision_encoder),
-            train_expert_only=bool(args.pi05_train_expert_only),
-            gradient_checkpointing=bool(args.pi05_gradient_checkpointing),
-            compile_model=bool(args.pi05_compile_model),
-            compile_mode=str(args.pi05_compile_mode),
-            time_sampling_beta_alpha=float(args.pi05_time_sampling_beta_alpha),
-            time_sampling_beta_beta=float(args.pi05_time_sampling_beta_beta),
-            time_sampling_scale=float(args.pi05_time_sampling_scale),
-            time_sampling_offset=float(args.pi05_time_sampling_offset),
-            min_period=float(args.pi05_min_period),
-            max_period=float(args.pi05_max_period),
-            optimizer_lr=float(args.pi05_optimizer_lr),
-            optimizer_betas=coerce_numeric_pair(
-                args.pi05_optimizer_betas,
-                option_name="--pi05-optimizer-betas",
-                item_type=float,
-            ),
-            optimizer_eps=float(args.pi05_optimizer_eps),
-            optimizer_weight_decay=float(args.pi05_optimizer_weight_decay),
-            optimizer_grad_clip_norm=float(args.pi05_optimizer_grad_clip_norm),
-            scheduler_warmup_steps=int(args.pi05_scheduler_warmup_steps),
-            scheduler_decay_steps=int(args.pi05_scheduler_decay_steps),
-            scheduler_decay_lr=float(args.pi05_scheduler_decay_lr),
+    elif args.policy == "prism_diffusion":
+        from lerobot_policy_prism_diffusion.configuration_diffusion import (
+            PrismDiffusionConfig,
         )
-    elif args.policy == "smolvla":
-        if SmolVLAConfig is None:
-            raise RuntimeError("SmolVLAConfig failed to import.")
-        if configure_signature_cache_runtime is not None:
-            configure_signature_cache_runtime(None)
-        if configure_prefix_image_cache_runtime is not None:
-            configure_prefix_image_cache_runtime(None)
-        policy_cfg = SmolVLAConfig(
-            device=args.device,
-            use_amp=bool(args.use_amp),
-            push_to_hub=False,
-            pretrained_path=optional_pretrained_path(args.policy_path),
-            n_obs_steps=int(args.n_obs_steps),
-            chunk_size=int(args.chunk_size),
-            n_action_steps=int(args.n_action_steps),
-            max_state_dim=int(args.smolvla_max_state_dim),
-            max_action_dim=int(args.smolvla_max_action_dim),
-            resize_imgs_with_padding=coerce_numeric_pair(
-                args.smolvla_resize_imgs_with_padding,
-                option_name="--smolvla-resize-imgs-with-padding",
-                item_type=int,
-            ),
-            empty_cameras=int(args.smolvla_empty_cameras),
-            tokenizer_max_length=int(args.smolvla_tokenizer_max_length),
-            num_steps=int(args.smolvla_num_steps),
-            use_cache=bool(args.smolvla_use_cache),
-            freeze_vision_encoder=bool(args.smolvla_freeze_vision_encoder),
-            train_expert_only=bool(args.smolvla_train_expert_only),
-            train_state_proj=bool(args.smolvla_train_state_proj),
-            optimizer_lr=float(args.smolvla_optimizer_lr),
-            optimizer_betas=coerce_numeric_pair(
-                args.smolvla_optimizer_betas,
-                option_name="--smolvla-optimizer-betas",
-                item_type=float,
-            ),
-            optimizer_eps=float(args.smolvla_optimizer_eps),
-            optimizer_weight_decay=float(args.smolvla_optimizer_weight_decay),
-            optimizer_grad_clip_norm=float(args.smolvla_optimizer_grad_clip_norm),
-            scheduler_warmup_steps=int(args.smolvla_scheduler_warmup_steps),
-            scheduler_decay_steps=int(args.smolvla_scheduler_decay_steps),
-            scheduler_decay_lr=float(args.smolvla_scheduler_decay_lr),
-            vlm_model_name=str(args.smolvla_vlm_model_name),
-            load_vlm_weights=bool(args.smolvla_load_vlm_weights),
-            attention_mode=str(args.smolvla_attention_mode),
-            prefix_length=int(args.smolvla_prefix_length),
-            pad_language_to=str(args.smolvla_pad_language_to),
-            num_expert_layers=int(args.smolvla_num_expert_layers),
-            num_vlm_layers=int(args.smolvla_num_vlm_layers),
-            self_attn_every_n_layers=int(args.smolvla_self_attn_every_n_layers),
-            expert_width_multiplier=float(args.smolvla_expert_width_multiplier),
-            min_period=float(args.smolvla_min_period),
-            max_period=float(args.smolvla_max_period),
-            compile_model=bool(args.smolvla_compile_model),
-            compile_mode=str(args.smolvla_compile_mode),
+        from lerobot_policy_streaming_act.prefix_image_cache import (
+            PrefixImageCacheRuntimeConfig,
+            configure_prefix_image_cache_runtime,
+            prepare_prefix_image_cache_runtime,
         )
-    elif args.policy == "groot":
-        if GrootConfig is None:
-            raise RuntimeError("GrootConfig failed to import.")
-        if configure_signature_cache_runtime is not None:
-            configure_signature_cache_runtime(None)
-        if configure_prefix_image_cache_runtime is not None:
-            configure_prefix_image_cache_runtime(None)
-        policy_cfg = GrootConfig(
-            device=args.device,
-            use_amp=bool(args.use_amp),
-            push_to_hub=False,
-            pretrained_path=optional_pretrained_path(args.policy_path),
-            n_obs_steps=int(args.n_obs_steps),
-            chunk_size=int(args.chunk_size),
-            n_action_steps=int(args.n_action_steps),
-            input_features=input_features_override,
-            output_features=output_features_override,
-            max_state_dim=int(args.groot_max_state_dim),
-            max_action_dim=int(args.groot_max_action_dim),
-            image_size=coerce_numeric_pair(
-                args.groot_image_size,
-                option_name="--groot-image-size",
-                item_type=int,
-            ),
-            base_model_path=str(args.groot_base_model_path),
-            tokenizer_assets_repo=str(args.groot_tokenizer_assets_repo),
-            embodiment_tag=str(args.groot_embodiment_tag),
-            tune_llm=bool(args.groot_tune_llm),
-            tune_visual=bool(args.groot_tune_visual),
-            tune_projector=bool(args.groot_tune_projector),
-            tune_diffusion_model=bool(args.groot_tune_diffusion_model),
-            lora_rank=int(args.groot_lora_rank),
-            lora_alpha=int(args.groot_lora_alpha),
-            lora_dropout=float(args.groot_lora_dropout),
-            lora_full_model=bool(args.groot_lora_full_model),
-            optimizer_lr=float(args.groot_optimizer_lr),
-            optimizer_betas=coerce_numeric_pair(
-                args.groot_optimizer_betas,
-                option_name="--groot-optimizer-betas",
-                item_type=float,
-            ),
-            optimizer_eps=float(args.groot_optimizer_eps),
-            optimizer_weight_decay=float(args.groot_optimizer_weight_decay),
-            warmup_ratio=float(args.groot_warmup_ratio),
-            use_bf16=bool(args.groot_use_bf16),
-            video_backend=str(args.groot_video_backend),
-            balance_dataset_weights=bool(args.groot_balance_dataset_weights),
-            balance_trajectory_weights=bool(args.groot_balance_trajectory_weights),
-            dataset_paths=[str(dataset_root)],
-            output_dir=str(args.output_root),
-            save_steps=int(args.save_freq),
-            max_steps=int(args.steps),
-            batch_size=int(args.batch_size),
-            dataloader_num_workers=int(args.num_workers),
-            report_to="wandb" if bool(args.enable_wandb) else "none",
-            resume=bool(resume_run_state is not None),
+        from lerobot_policy_streaming_act.signature_cache import (
+            SignatureCacheRuntimeConfig,
+            configure_signature_cache_runtime,
+            prepare_signature_cache_runtime,
         )
-    elif args.policy in {"diffusion", "prism_diffusion"}:
-        diffusion_config_cls = (
-            PrismDiffusionConfig if args.policy == "prism_diffusion" else DiffusionConfig
-        )
-        prism_config_kwargs = {}
-        if args.policy == "prism_diffusion":
-            prism_config_kwargs = {
-                "use_path_signature": prism_use_path_signature,
-                "use_delta_signature": prism_use_delta_signature,
-                "history_length": prism_history_length,
-                "signature_dim": prism_signature_dim,
-                "signature_depth": int(args.signature_depth),
-                "signature_hidden_dim": int(args.signature_hidden_dim),
-                "signature_dropout": float(args.signature_dropout),
-                "use_prefix_sequence_training": prism_use_prefix_sequence_training,
-                "prefix_train_max_steps": int(args.prefix_train_max_steps),
-                "prefix_frame_stride": int(args.prefix_frame_stride),
-                "prefix_pad_value": float(args.prefix_pad_value),
-                "use_visual_prefix_memory": prism_use_visual_prefix_memory,
-                "use_signature_indexed_slot_memory": bool(
-                    args.use_signature_indexed_slot_memory
-                ),
-                "slot_memory_num_slots": int(args.slot_memory_num_slots),
-                "slot_memory_routing_hidden_dim": int(
-                    args.slot_memory_routing_hidden_dim
-                ),
-                "slot_memory_use_delta_routing": bool(
-                    args.slot_memory_use_delta_routing
-                ),
-                "slot_memory_use_softmax_routing": bool(
-                    args.slot_memory_use_softmax_routing
-                ),
-                "slot_memory_use_readout_pooling": bool(
-                    args.slot_memory_use_readout_pooling
-                ),
-                "slot_memory_balance_loss_coef": float(
-                    args.slot_memory_balance_loss_coef
-                ),
-                "slot_memory_consistency_loss_coef": float(
-                    args.slot_memory_consistency_loss_coef
-                ),
-                "prism_adapter_hidden_dim": int(args.prism_adapter_hidden_dim),
-                "prism_adapter_zero_init": bool(args.prism_adapter_zero_init),
-            }
-        policy_cfg = diffusion_config_cls(
+
+        prism_config_kwargs = {
+            "use_path_signature": prism_use_path_signature,
+            "use_delta_signature": prism_use_delta_signature,
+            "history_length": prism_history_length,
+            "signature_dim": prism_signature_dim,
+            "signature_depth": signature_depth,
+            "signature_hidden_dim": signature_hidden_dim,
+            "signature_dropout": signature_dropout,
+            "use_prefix_sequence_training": prism_use_prefix_sequence_training,
+            "prefix_train_max_steps": int(args.prefix_train_max_steps),
+            "prefix_frame_stride": int(args.prefix_frame_stride),
+            "prefix_pad_value": float(args.prefix_pad_value),
+            "use_visual_prefix_memory": prism_use_visual_prefix_memory,
+            "use_signature_indexed_slot_memory": use_signature_indexed_slot_memory,
+            "slot_memory_num_slots": slot_memory_num_slots,
+            "slot_memory_routing_hidden_dim": slot_memory_routing_hidden_dim,
+            "slot_memory_use_delta_routing": slot_memory_use_delta_routing,
+            "slot_memory_use_softmax_routing": slot_memory_use_softmax_routing,
+            "slot_memory_use_readout_pooling": slot_memory_use_readout_pooling,
+            "slot_memory_balance_loss_coef": slot_memory_balance_loss_coef,
+            "slot_memory_consistency_loss_coef": slot_memory_consistency_loss_coef,
+            "prism_adapter_hidden_dim": int(args.prism_adapter_hidden_dim),
+            "prism_adapter_zero_init": bool(args.prism_adapter_zero_init),
+        }
+        policy_cfg = PrismDiffusionConfig(
             device=args.device,
             use_amp=bool(args.use_amp),
             push_to_hub=False,
@@ -5878,85 +4535,96 @@ def main(argv: list[str] | None = None) -> None:
             output_features=output_features_override,
             **prism_config_kwargs,
         )
-        if args.policy == "prism_diffusion":
-            active_signature_keys = tuple(
-                key
-                for key, enabled in (
-                    ("observation.path_signature", bool(prism_use_path_signature)),
-                    ("observation.delta_signature", bool(prism_use_delta_signature)),
-                )
-                if enabled
+
+        active_signature_keys = prism_required_signature_parquet_keys
+        configure_signature_cache_runtime(
+            SignatureCacheRuntimeConfig(
+                dataset_root=dataset_root,
+                dataset_repo_id=dataset_repo_id,
+                mode=str(args.signature_cache_mode),
+                cache_dtype=str(args.signature_cache_dtype),
+                feature_keys=active_signature_keys,
+                normalization_mode=policy_cfg.normalization_mapping.get(
+                    "STATE", "mean_std"
+                ),
+                refresh=bool(args.refresh_signature_cache),
+                cache_root=args.signature_cache_root,
             )
-            configure_signature_cache_runtime(
-                SignatureCacheRuntimeConfig(
+        )
+        signature_cache_reader = prepare_signature_cache_runtime()
+        if prism_use_prefix_sequence_training:
+            configure_prefix_image_cache_runtime(
+                PrefixImageCacheRuntimeConfig(
                     dataset_root=dataset_root,
                     dataset_repo_id=dataset_repo_id,
-                    mode=str(args.signature_cache_mode),
-                    cache_dtype=str(args.signature_cache_dtype),
-                    feature_keys=active_signature_keys,
-                    normalization_mode=policy_cfg.normalization_mapping.get(
-                        "STATE", "mean_std"
-                    ),
-                    refresh=bool(args.refresh_signature_cache),
-                    cache_root=args.signature_cache_root,
+                    mode=str(args.prefix_image_cache_mode),
+                    cache_dtype=str(args.prefix_image_cache_dtype),
+                    refresh=bool(args.refresh_prefix_image_cache),
+                    cache_root=args.prefix_image_cache_root,
                 )
             )
-            signature_cache_reader = prepare_signature_cache_runtime()
-            if prism_use_prefix_sequence_training:
-                configure_prefix_image_cache_runtime(
-                    PrefixImageCacheRuntimeConfig(
-                        dataset_root=dataset_root,
-                        dataset_repo_id=dataset_repo_id,
-                        mode=str(args.prefix_image_cache_mode),
-                        cache_dtype=str(args.prefix_image_cache_dtype),
-                        refresh=bool(args.refresh_prefix_image_cache),
-                        cache_root=args.prefix_image_cache_root,
-                    )
-                )
-                prepare_prefix_image_cache_runtime()
-            elif configure_prefix_image_cache_runtime is not None:
-                configure_prefix_image_cache_runtime(None)
-            if (
-                signature_cache_reader is None
-                and prism_required_signature_parquet_keys
-                and not parquet_has_columns(
-                    dataset_root,
-                    prism_required_signature_parquet_keys,
-                )
-            ):
-                raise RuntimeError(
-                    "Signature cache is required for this dataset because the parquet "
-                    "files do not contain the requested signature columns, but the "
-                    "cache could not be prepared."
-                )
-            policy_cfg.pre_normalized_observation_keys = (
-                resolve_pre_normalized_signature_observation_keys(
-                    feature_keys=tuple(signature_cache_reader.feature_keys)
-                    if signature_cache_reader is not None
-                    else (),
-                    reader_pre_normalized=bool(
-                        signature_cache_reader is not None
-                        and signature_cache_reader.pre_normalized
-                    ),
-                    use_prefix_sequence_training=bool(
-                        prism_use_prefix_sequence_training
-                    ),
-                    use_path_signature=bool(prism_use_path_signature),
-                    use_delta_signature=bool(prism_use_delta_signature),
-                )
-            )
-    else:
-        if configure_signature_cache_runtime is not None:
-            configure_signature_cache_runtime(None)
-        if configure_prefix_image_cache_runtime is not None:
+            prepare_prefix_image_cache_runtime()
+        elif configure_prefix_image_cache_runtime is not None:
             configure_prefix_image_cache_runtime(None)
+        if (
+            signature_cache_reader is None
+            and prism_required_signature_parquet_keys
+            and not parquet_has_columns(
+                dataset_root,
+                list(prism_required_signature_parquet_keys),
+            )
+        ):
+            raise RuntimeError(
+                "Signature cache is required for this dataset because the parquet "
+                "files do not contain the requested signature columns, but the "
+                "cache could not be prepared."
+            )
+        policy_cfg.pre_normalized_observation_keys = (
+            resolve_pre_normalized_signature_observation_keys(
+                feature_keys=tuple(signature_cache_reader.feature_keys)
+                if signature_cache_reader is not None
+                else (),
+                reader_pre_normalized=bool(
+                    signature_cache_reader is not None
+                    and signature_cache_reader.pre_normalized
+                ),
+                use_prefix_sequence_training=bool(
+                    prism_use_prefix_sequence_training
+                ),
+                use_path_signature=bool(prism_use_path_signature),
+                use_delta_signature=bool(prism_use_delta_signature),
+            )
+        )
+    elif args.policy == "diffusion":
+        DiffusionConfig = import_lerobot_policy_config_class("diffusion")
+        policy_cfg = DiffusionConfig(
+            device=args.device,
+            use_amp=bool(args.use_amp),
+            push_to_hub=False,
+            n_obs_steps=int(args.n_obs_steps),
+            horizon=int(args.horizon),
+            n_action_steps=int(args.n_action_steps),
+            drop_n_last_frames=int(resolved_diffusion_drop_n_last_frames),
+            input_features=input_features_override,
+            output_features=output_features_override,
+        )
+    elif args.policy == "smolvla":
+        policy_cfg = build_smolvla_policy_config(
+            args,
+            input_features_override=input_features_override,
+            output_features_override=output_features_override,
+        )
+    else:
+        ACTConfig = import_lerobot_policy_config_class("act")
         policy_cfg = ACTConfig(
             device=args.device,
             use_amp=bool(args.use_amp),
             push_to_hub=False,
             pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
-            chunk_size=args.chunk_size,
-            n_action_steps=args.n_action_steps,
+            chunk_size=int(args.chunk_size),
+            n_action_steps=int(args.n_action_steps),
+            input_features=input_features_override,
+            output_features=output_features_override,
         )
 
     resume_saved_train_cfg = None
@@ -6056,35 +4724,6 @@ def main(argv: list[str] | None = None) -> None:
         amp_dtype=str(args.amp_dtype),
     )
     use_policy_training_preset = True
-    if args.policy == "groot" and resume_run_state is None:
-        from lerobot.optim.optimizers import AdamWConfig
-        from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
-
-        groot_optimizer_lr = float(args.groot_optimizer_lr)
-        groot_warmup_ratio = max(0.0, float(args.groot_warmup_ratio))
-        groot_decay_lr = (
-            float(args.groot_scheduler_decay_lr)
-            if args.groot_scheduler_decay_lr is not None
-            else groot_optimizer_lr * 0.1
-        )
-        resume_optimizer_cfg = AdamWConfig(
-            lr=groot_optimizer_lr,
-            betas=coerce_numeric_pair(
-                args.groot_optimizer_betas,
-                option_name="--groot-optimizer-betas",
-                item_type=float,
-            ),
-            eps=float(args.groot_optimizer_eps),
-            weight_decay=float(args.groot_optimizer_weight_decay),
-            grad_clip_norm=float(args.groot_optimizer_grad_clip_norm),
-        )
-        resume_scheduler_cfg = CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(max(0, int(args.steps)) * groot_warmup_ratio),
-            num_decay_steps=max(1, int(args.steps)),
-            peak_lr=groot_optimizer_lr,
-            decay_lr=groot_decay_lr,
-        )
-        use_policy_training_preset = False
 
     effective_eval_freq = -1
     if int(args.eval_freq) > 0:
@@ -6185,7 +4824,7 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
-    elif args.policy in {"pi05", "smolvla", "groot"}:
+    elif args.policy == "smolvla":
         print(
             "- action_execution: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -6201,7 +4840,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"- use_path_signature: {use_path_signature}")
         if use_path_signature:
             print(
-                f"- signature: dim={signature_dim}, depth={args.signature_depth}, "
+                f"- signature: dim={resolved_signature_dim}, depth={args.signature_depth}, "
                 f"history={resolved_history_length}, hidden={args.signature_hidden_dim}, "
                 f"dropout={args.signature_dropout}"
             )
@@ -6261,39 +4900,6 @@ def main(argv: list[str] | None = None) -> None:
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
         )
-    elif args.policy == "pi05":
-        pi05_image_resolution = tuple(
-            coerce_numeric_pair(
-                args.pi05_image_resolution,
-                option_name="--pi05-image-resolution",
-                item_type=int,
-            )
-        )
-        ignored_pi05_features = (
-            sorted(SIGNATURE_FEATURE_KEYS)
-            if bool(args.pi05_ignore_signature_features)
-            else []
-        )
-        print(
-            "- pi05: "
-            f"policy_path={args.policy_path or '<scratch>'}, "
-            f"max_state_dim={int(args.pi05_max_state_dim)}, "
-            f"max_action_dim={int(args.pi05_max_action_dim)}, "
-            f"image_resolution={pi05_image_resolution}, "
-            f"tokenizer_max_length={int(args.pi05_tokenizer_max_length)}, "
-            f"num_inference_steps={int(args.pi05_num_inference_steps)}, "
-            f"dtype={args.pi05_dtype}"
-        )
-        print(
-            "- pi05_finetune: "
-            f"freeze_vision_encoder={bool(args.pi05_freeze_vision_encoder)}, "
-            f"train_expert_only={bool(args.pi05_train_expert_only)}, "
-            f"gradient_checkpointing={bool(args.pi05_gradient_checkpointing)}, "
-            f"optimizer_lr={float(args.pi05_optimizer_lr)}, "
-            f"scheduler_warmup_steps={int(args.pi05_scheduler_warmup_steps)}, "
-            f"scheduler_decay_steps={int(args.pi05_scheduler_decay_steps)}"
-        )
-        print(f"- ignored_features: {ignored_pi05_features}")
     elif args.policy == "smolvla":
         smolvla_resize = tuple(
             coerce_numeric_pair(
@@ -6320,53 +4926,6 @@ def main(argv: list[str] | None = None) -> None:
             f"scheduler_warmup_steps={int(args.smolvla_scheduler_warmup_steps)}, "
             f"scheduler_decay_steps={int(args.smolvla_scheduler_decay_steps)}"
         )
-    elif args.policy == "groot":
-        groot_image_size = tuple(
-            coerce_numeric_pair(
-                args.groot_image_size,
-                option_name="--groot-image-size",
-                item_type=int,
-            )
-        )
-        ignored_groot_features = (
-            sorted(SIGNATURE_FEATURE_KEYS)
-            if bool(args.groot_ignore_signature_features)
-            else []
-        )
-        groot_decay_lr = (
-            float(args.groot_scheduler_decay_lr)
-            if args.groot_scheduler_decay_lr is not None
-            else float(args.groot_optimizer_lr) * 0.1
-        )
-        print(
-            "- groot: "
-            f"policy_path={args.policy_path or '<base-model>'}, "
-            f"base_model_path={args.groot_base_model_path}, "
-            f"tokenizer_assets_repo={args.groot_tokenizer_assets_repo}, "
-            f"attn_implementation={args.groot_attn_implementation}, "
-            f"embodiment_tag={args.groot_embodiment_tag}, "
-            f"image_size={groot_image_size}, "
-            f"max_state_dim={int(args.groot_max_state_dim)}, "
-            f"max_action_dim={int(args.groot_max_action_dim)}"
-        )
-        print(
-            "- groot_finetune: "
-            f"tune_llm={bool(args.groot_tune_llm)}, "
-            f"tune_visual={bool(args.groot_tune_visual)}, "
-            f"tune_projector={bool(args.groot_tune_projector)}, "
-            f"tune_diffusion_model={bool(args.groot_tune_diffusion_model)}, "
-            f"lora_rank={int(args.groot_lora_rank)}, "
-            f"use_bf16={bool(args.groot_use_bf16)}"
-        )
-        print(
-            "- groot_optimizer: "
-            f"lr={float(args.groot_optimizer_lr)}, "
-            f"weight_decay={float(args.groot_optimizer_weight_decay)}, "
-            f"grad_clip_norm={float(args.groot_optimizer_grad_clip_norm)}, "
-            f"warmup_ratio={float(args.groot_warmup_ratio)}, "
-            f"decay_lr={groot_decay_lr}"
-        )
-        print(f"- ignored_features: {ignored_groot_features}")
     elif args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- diffusion: "
@@ -6545,8 +5104,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.argv.append(resume_config_arg)
 
     try:
-        with temporarily_use_official_hf_endpoint_for_pi05(args.policy):
-            train(cfg, accelerator=accelerator)
+        train(cfg, accelerator=accelerator)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             saved_split_path = save_dataset_split(output_dir, split_spec)

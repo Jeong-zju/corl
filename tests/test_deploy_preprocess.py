@@ -54,7 +54,7 @@ def test_select_visual_observation_keys_falls_back_to_input_features() -> None:
     assert select_visual_observation_keys(cfg) == ["observation.images.front"]
 
 
-def test_finalize_preprocessed_observation_accepts_groot_packed_state() -> None:
+def test_finalize_preprocessed_observation_accepts_packed_state() -> None:
     class FakeTensor:
         device = "cpu"
         dtype = "float32"

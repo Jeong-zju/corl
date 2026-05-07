@@ -49,6 +49,28 @@ from policy_defaults import (
     load_policy_mode_defaults,
     load_policy_mode_defaults_for_dataset,
 )
+from policy_imports import (
+    ensure_lerobot_policy_imports,
+    import_lerobot_policy_config_class,
+    make_standard_pre_post_processors,
+)
+
+
+def make_pre_post_processors(
+    *,
+    policy_cfg,
+    pretrained_path=None,
+    preprocessor_overrides=None,
+    postprocessor_overrides=None,
+    dataset_stats=None,
+):
+    del pretrained_path
+    return make_standard_pre_post_processors(
+        policy_cfg,
+        dataset_stats=dataset_stats,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
 
 
 DEFAULT_PATH_SIGNATURE_KEY = "observation.path_signature"
@@ -2347,17 +2369,10 @@ def main(argv: list[str] | None = None) -> None:
         ensure_prism_diffusion_importable(PROJECT_ROOT)
         ensure_streaming_act_importable(PROJECT_ROOT)
 
-    try:
-        from lerobot.configs.policies import PreTrainedConfig
-        from lerobot.policies.factory import make_pre_post_processors
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Missing LeRobot evaluation dependencies. Install the pip package first, "
-            "for example `pip install lerobot`, and ensure torch is installed for "
-            "your platform."
-        ) from exc
+    ensure_lerobot_policy_imports(args.policy)
 
     if args.policy == "streaming_act":
+        policy_config_cls = None
         policy_cls = import_local_streaming_act_policy_class(repo_root=PROJECT_ROOT)
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
@@ -2368,19 +2383,23 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         policy_cls = PrismDiffusionPolicy
+        policy_config_cls = PrismDiffusionConfig
     elif args.policy == "diffusion":
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
         policy_cls = DiffusionPolicy
+        policy_config_cls = import_lerobot_policy_config_class(args.policy)
     elif args.policy == "smolvla":
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         policy_cls = SmolVLAPolicy
+        policy_config_cls = import_lerobot_policy_config_class(args.policy)
     else:
         from lerobot.policies.act.configuration_act import ACTConfig
         from lerobot.policies.act.modeling_act import ACTPolicy
 
         policy_cls = ACTPolicy
+        policy_config_cls = ACTConfig
 
     policy_dir = resolve_eval_policy_path(
         policy_path=args.policy_path,
@@ -2401,7 +2420,7 @@ def main(argv: list[str] | None = None) -> None:
             repo_root=PROJECT_ROOT,
         )
     else:
-        cfg = PreTrainedConfig.from_pretrained(
+        cfg = policy_config_cls.from_pretrained(
             policy_dir,
             local_files_only=local_files_only,
         )
@@ -2469,17 +2488,9 @@ def main(argv: list[str] | None = None) -> None:
     if runtime_reconfigured and hasattr(policy, "reset"):
         policy.reset()
 
-    preprocessor_overrides = {
-        "device_processor": {"device": args.device},
-        "rename_observations_processor": {"rename_map": {}},
-    }
     processor_load_start_s = time.perf_counter()
     print("[load] Initializing pre/post processors...")
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg,
-        pretrained_path=policy_dir,
-        preprocessor_overrides=preprocessor_overrides,
-    )
+    preprocessor, postprocessor = make_standard_pre_post_processors(cfg)
     print(
         "[timing] Pre/post processors initialized in "
         f"{format_elapsed_s(time.perf_counter() - processor_load_start_s)}"

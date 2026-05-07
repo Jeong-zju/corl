@@ -33,6 +33,14 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+try:
+    from policy_imports import install_lerobot_policies_namespace_shim
+except ModuleNotFoundError:
+    def install_lerobot_policies_namespace_shim() -> None:
+        return None
+
+install_lerobot_policies_namespace_shim()
+
 from .configuration_streaming_act import FIRST_FRAME_ANCHOR_KEY, StreamingACTConfig
 from .prefix_sequence import (
     DELTA_SIGNATURE_KEY,

@@ -29,6 +29,10 @@ sys.path.insert(
     ),
 )
 
+from policy_imports import ensure_lerobot_policy_imports
+
+ensure_lerobot_policy_imports("prism_diffusion")
+
 from eval_policy import build_parser as build_eval_parser
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_STATE

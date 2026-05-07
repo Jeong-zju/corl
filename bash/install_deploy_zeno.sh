@@ -18,8 +18,6 @@ DOWNLOAD_TOOL="aria2c"
 DOWNLOAD_THREADS=4
 DOWNLOAD_JOBS=5
 POLICY="streaming_act"
-HF_MIRROR_ENDPOINT="https://hf-mirror.com"
-HF_OFFICIAL_ENDPOINT="https://huggingface.co"
 INSTALL_SYSTEM_DEPS=1
 INSTALL_PYTHON_DEPS=1
 DOWNLOAD_DATASETS=1
@@ -66,7 +64,7 @@ Options:
                                 Defaults to the zeno-ai datasets in README.
   --policy POLICY               Policy name passed to bash/train_policy.sh.
                                 Supports the same policies as train_policy.sh,
-                                including streaming_act, pi05, smolvla, and groot.
+                                including streaming_act and smolvla.
                                 Default: streaming_act
   --python-bin PATH             Python executable. Default: python3
   --download-tool aria2c|wget   Downloader for data/hfd.sh. Default: aria2c
@@ -92,7 +90,6 @@ Options:
 Examples:
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --skip-train
-  bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --policy pi05
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --dataset zeno-ai/DailyLaundryOrganization --policy streaming_act
   bash bash/install_deploy_zeno.sh --hf-token hf_xxx --wandb-token wandb_xxx --dataset zeno-ai/BookOriginRelocation -- --steps 1000
 EOF
@@ -141,20 +138,6 @@ format_cmd() {
     fi
   done
   printf "%q " "${display[@]}"
-}
-
-resolve_policy_hf_endpoint() {
-  POLICY_HF_ENDPOINT=""
-  if [[ "${POLICY}" != "pi05" ]]; then
-    return 0
-  fi
-
-  local current_endpoint="${HF_ENDPOINT:-}"
-  current_endpoint="${current_endpoint%/}"
-  if [[ "${current_endpoint}" == "${HF_MIRROR_ENDPOINT}" ]]; then
-    POLICY_HF_ENDPOINT="${HF_OFFICIAL_ENDPOINT}"
-    log "Policy pi05 will use ${HF_OFFICIAL_ENDPOINT} for model/tokenizer access during training and checkpoint upload."
-  fi
 }
 
 run_cmd() {
@@ -703,7 +686,6 @@ main() {
   parse_args "$@"
   validate_args
   configure_tokens
-  resolve_policy_hf_endpoint
 
   if [[ -z "${LOG_ROOT}" ]]; then
     LOG_ROOT="outputs/deploy_logs/$(date +%Y%m%d_%H%M%S)"

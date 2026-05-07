@@ -17,10 +17,7 @@ from policy_defaults import (
 )
 from train_policy import (
     DELTA_SIGNATURE_FEATURE_KEY,
-    GROOT_DEFAULT_ATTN_IMPLEMENTATION,
     PATH_SIGNATURE_FEATURE_KEY,
-    PI05_DEFAULT_POLICY_PATH,
-    _ensure_groot_transformers_loading_attrs,
     drop_dataset_features_from_metadata,
     parse_args,
     resolve_training_dataset_root,
@@ -78,25 +75,6 @@ def test_drop_dataset_features_from_metadata_can_exclude_signature_inputs() -> N
     assert "delta_signature" not in updated_info
 
 
-def test_ensure_groot_transformers_loading_attrs_adds_missing_post_init_attrs() -> None:
-    class DummyGroot:
-        def get_expanded_tied_weights_keys(self, all_submodels: bool = False) -> dict:
-            assert all_submodels is False
-            return {}
-
-    model = DummyGroot()
-
-    _ensure_groot_transformers_loading_attrs(model)
-
-    assert model.all_tied_weights_keys == {}
-    assert model._tp_plan == {}
-    assert model._ep_plan == {}
-    assert model._pp_plan == {}
-    assert model._keep_in_fp32_modules == set()
-    assert model._keep_in_fp32_modules_strict == set()
-    assert model._no_split_modules == set()
-
-
 def test_resolve_dataset_defaults_path_prefers_exact_robocasa_task_defaults() -> None:
     path = resolve_dataset_defaults_path(
         dataset_selector="robocasa/composite/ArrangeBreadBasket",
@@ -133,19 +111,9 @@ def test_resolve_dataset_defaults_path_prefers_exact_robocasa_task_defaults() ->
             "robocasa/atomic/CloseFridge/prism-diffusion",
         ),
         (
-            "pi05",
-            "main/bash/defaults/robocasa/atomic/CloseFridge/pi05.yaml",
-            "robocasa/atomic/CloseFridge/pi05",
-        ),
-        (
             "smolvla",
             "main/bash/defaults/robocasa/atomic/CloseFridge/smolvla.yaml",
             "robocasa/atomic/CloseFridge/smolvla",
-        ),
-        (
-            "groot",
-            "main/bash/defaults/robocasa/atomic/CloseFridge/groot.yaml",
-            "robocasa/atomic/CloseFridge/groot",
         ),
     ),
 )
@@ -187,55 +155,6 @@ def test_train_parse_args_uses_smolvla_defaults() -> None:
     assert args.chunk_size == 50
     assert args.n_action_steps == 50
     assert args.smolvla_freeze_vision_encoder is True
-
-
-def test_train_parse_args_uses_pi05_defaults_and_ignores_signature() -> None:
-    args = parse_args(
-        [
-            "--dataset",
-            "robocasa/atomic/CloseFridge",
-            "--policy",
-            "pi05",
-        ]
-    )
-
-    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
-    assert args._policy_defaults_dataset_repo_id == "robocasa/atomic/CloseFridge"
-    assert args.output_root.as_posix() == (
-        "outputs/train/robocasa/atomic/CloseFridge/pi05"
-    )
-    assert args.policy_path == PI05_DEFAULT_POLICY_PATH
-    assert args.n_obs_steps == 1
-    assert args.chunk_size == 50
-    assert args.n_action_steps == 50
-    assert args.pi05_ignore_signature_features is True
-    assert args.pi05_freeze_vision_encoder is True
-    assert args.pi05_train_expert_only is True
-
-
-def test_train_parse_args_uses_groot_defaults_and_ignores_signature() -> None:
-    args = parse_args(
-        [
-            "--dataset",
-            "robocasa/atomic/CloseFridge",
-            "--policy",
-            "groot",
-        ]
-    )
-
-    assert args._policy_defaults_dataset_root == "data/robocasa/atomic/CloseFridge"
-    assert args._policy_defaults_dataset_repo_id == "robocasa/atomic/CloseFridge"
-    assert args.output_root.as_posix() == (
-        "outputs/train/robocasa/atomic/CloseFridge/groot"
-    )
-    assert args.policy_path is None
-    assert args.groot_base_model_path == "nvidia/GR00T-N1.5-3B"
-    assert args.groot_tokenizer_assets_repo == "lerobot/eagle2hg-processor-groot-n1p5"
-    assert args.groot_attn_implementation == GROOT_DEFAULT_ATTN_IMPLEMENTATION
-    assert args.n_obs_steps == 1
-    assert args.chunk_size == 50
-    assert args.n_action_steps == 50
-    assert args.groot_ignore_signature_features is True
 
 
 def test_close_fridge_diffusion_eval_defaults_enable_robocasa_horizon_inference() -> None:
@@ -340,9 +259,7 @@ def test_train_parse_args_uses_task_specific_streaming_act_defaults_with_broad_r
         ("act", "robocasa/composite/OrganizeVegetables/act"),
         ("diffusion", "robocasa/composite/OrganizeVegetables/diffusion"),
         ("streaming_act", "robocasa/composite/OrganizeVegetables/streaming-act-prism"),
-        ("pi05", "robocasa/composite/OrganizeVegetables/pi05"),
         ("smolvla", "robocasa/composite/OrganizeVegetables/smolvla"),
-        ("groot", "robocasa/composite/OrganizeVegetables/groot"),
     ),
 )
 def test_resolve_dataset_defaults_path_supports_organize_vegetables_policy_defaults(

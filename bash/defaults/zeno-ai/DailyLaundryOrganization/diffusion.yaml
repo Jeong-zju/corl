@@ -22,7 +22,7 @@ train:
   # 60 episodes / 133,188 frames is a compact but long-horizon dataset.
   # Keep the standard diffusion recipe with a moderate step count so the
   # denoiser sees enough repeated passes without overshooting the small corpus.
-  steps: 100000
+  steps: 180000
   batch_size: 8
   num_workers: 8
   dataloader_persistent_workers: true
@@ -32,8 +32,8 @@ train:
   torchcodec_decoder_cache_size: 32
   enable_filtered_hf_cache: true
   seed: 42
-  log_freq: 500
-  save_freq: 10000
+  log_freq: 200
+  save_freq: 20000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42

@@ -29,6 +29,10 @@ sys.path.insert(
     ),
 )
 
+from policy_imports import ensure_lerobot_policy_imports
+
+ensure_lerobot_policy_imports("streaming_act")
+
 from process_dataset import build_parser, process_dataset, resolve_dataset_arg
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot_policy_streaming_act.configuration_streaming_act import (

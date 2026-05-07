@@ -272,6 +272,28 @@ def _ensure_prefix_image_sequence(camera_key: str, tensor: Tensor) -> Tensor:
     return tensor
 
 
+def _split_prefetched_video_sequence(
+    camera_key: str,
+    tensor: Tensor | Any,
+) -> tuple[Tensor | None, Tensor]:
+    """Return history frames and the current frame from a prefetched video query."""
+    tensor = torch.as_tensor(tensor)
+    if tensor.ndim == 3:
+        return None, tensor
+    if tensor.ndim != 4:
+        raise ValueError(
+            f"Prefetched video for `{camera_key}` must have shape (T, C, H, W) or "
+            f"(C, H, W). Got shape={tuple(tensor.shape)}."
+        )
+    if int(tensor.shape[0]) <= 0:
+        raise ValueError(
+            f"Prefetched video for `{camera_key}` must contain at least one frame."
+        )
+    if int(tensor.shape[0]) == 1:
+        return None, tensor[0]
+    return tensor[:-1], tensor[-1]
+
+
 def _ensure_prefix_vector_sequence(feature_key: str, tensor: Tensor) -> Tensor:
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
@@ -380,7 +402,9 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
         if not required_keys:
             return
 
-        missing_keys = [key for key in required_keys if key not in item]
+        missing_keys = [
+            key for key in required_keys if key not in item or item[key] is None
+        ]
         if not missing_keys:
             return
         if "index" not in item:
@@ -396,7 +420,9 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             if signature_cache_reader is not None and signature_cache_reader.has_key(key):
                 item[key] = signature_cache_reader.get(key, absolute_index)
 
-        remaining_keys = [key for key in required_keys if key not in item]
+        remaining_keys = [
+            key for key in required_keys if key not in item or item[key] is None
+        ]
         if not remaining_keys:
             return
 
@@ -601,8 +627,11 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
                     full_image_tensor = video_result.get(camera_key)
                     history_image_tensor = (
                         None
-                        if full_image_tensor is None or int(full_image_tensor.shape[0]) <= 1
-                        else full_image_tensor[:-1]
+                        if full_image_tensor is None
+                        else _split_prefetched_video_sequence(
+                            camera_key,
+                            full_image_tensor,
+                        )[0]
                     )
                 else:
                     history_image_tensor = video_result.get(camera_key)
@@ -684,7 +713,10 @@ class PrefixSequenceDataset(torch.utils.data.Dataset):
             for camera_key in self.camera_keys:
                 if camera_key not in self.base_dataset.meta.video_keys:
                     continue
-                current_frame = prefetched_video_result[camera_key][-1]
+                _, current_frame = _split_prefetched_video_sequence(
+                    camera_key,
+                    prefetched_video_result[camera_key],
+                )
                 if self.base_dataset.image_transforms is not None:
                     current_frame = self.base_dataset.image_transforms(current_frame)
                 item[camera_key] = current_frame
