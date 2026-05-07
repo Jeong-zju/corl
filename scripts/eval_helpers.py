@@ -8,10 +8,35 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from contextlib import contextmanager
 
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def quiet_transformers_loading():
+    """Temporarily silence noisy Transformers model-loading warnings.
+
+    Some deploy/eval checkpoints emit extremely verbose incompatible-key
+    warnings while loading through `from_pretrained`. Those logs are useful for
+    debugging but can bury the actual exception, so we temporarily drop the
+    Transformers logger to ERROR while loading and restore the previous level
+    afterwards.
+    """
+    try:
+        from transformers.utils import logging as transformers_logging
+    except ModuleNotFoundError:
+        yield
+        return
+
+    previous_verbosity = transformers_logging.get_verbosity()
+    transformers_logging.set_verbosity_error()
+    try:
+        yield
+    finally:
+        transformers_logging.set_verbosity(previous_verbosity)
 
 
 def _iter_repo_root_candidates(preferred_root: Path | None = None) -> list[Path]:
