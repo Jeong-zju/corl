@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -152,3 +153,101 @@ def test_remap_groot_legacy_vision_model_state_dict_keys_prefers_canonical_keys(
         not in remapped_state_dict
     )
     assert remapped_state_dict["something_else"] is other_value
+
+
+def test_main_installs_groot_compatibility_before_importing_lerobot_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import train_policy
+
+    events: list[str] = []
+    patch_called = False
+
+    def fake_install_groot_transformers_loading_compatibility_patch() -> None:
+        nonlocal patch_called
+        patch_called = True
+        events.append("patch")
+
+    monkeypatch.setattr(
+        train_policy,
+        "install_groot_transformers_loading_compatibility_patch",
+        fake_install_groot_transformers_loading_compatibility_patch,
+    )
+
+    def register_module(name: str, *, package: bool = False, **attrs) -> ModuleType:
+        module = ModuleType(name)
+        if package:
+            module.__path__ = []  # type: ignore[attr-defined]
+        for attr_name, attr_value in attrs.items():
+            setattr(module, attr_name, attr_value)
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", 1)
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, child_name, module)
+        return module
+
+    register_module("lerobot", package=True)
+    register_module("lerobot.configs", package=True)
+    register_module(
+        "lerobot.configs.default",
+        DatasetConfig=type("DatasetConfig", (), {}),
+        WandBConfig=type("WandBConfig", (), {}),
+    )
+    register_module(
+        "lerobot.configs.train",
+        TrainPipelineConfig=type("TrainPipelineConfig", (), {}),
+    )
+    register_module("lerobot.scripts", package=True)
+    register_module("lerobot.scripts.lerobot_train", train=object())
+    register_module("lerobot.policies", package=True)
+    register_module("lerobot.policies.act", package=True)
+    register_module(
+        "lerobot.policies.act.configuration_act",
+        ACTConfig=type("ACTConfig", (), {}),
+    )
+    register_module("lerobot.policies.diffusion", package=True)
+    register_module(
+        "lerobot.policies.diffusion.configuration_diffusion",
+        DiffusionConfig=type("DiffusionConfig", (), {}),
+    )
+    register_module("lerobot.policies.pi05", package=True)
+    register_module(
+        "lerobot.policies.pi05.configuration_pi05",
+        PI05Config=type("PI05Config", (), {}),
+    )
+
+    class StopAfterImports(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        train_policy,
+        "resolve_training_dataset_root",
+        lambda *args, **kwargs: (_ for _ in ()).throw(StopAfterImports()),
+    )
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name.split(".", 1)[0] == "lerobot" and not patch_called:
+            raise AssertionError(f"lerobot imported before Groot patch: {name}")
+        if level == 0 and name.split(".", 1)[0] == "lerobot":
+            events.append(f"import:{name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    with pytest.raises(StopAfterImports):
+        train_policy.main(
+            [
+                "--dataset",
+                "zeno-ai/BookOriginRelocation",
+                "--policy",
+                "pi05",
+            ]
+        )
+
+    assert patch_called is True
+    assert events[0] == "patch"
+    assert any(event.startswith("import:lerobot") for event in events[1:])

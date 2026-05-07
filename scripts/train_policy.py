@@ -5108,6 +5108,12 @@ def main(argv: list[str] | None = None) -> None:
     os.environ["WANDB__SERVICE_WAIT"] = str(args.wandb_service_wait)
 
     try:
+        # LeRobot 0.5.x eagerly imports `lerobot.policies` during package import,
+        # which can trip the GR00T dataclass bug on Python 3.12 before pi05 even
+        # reaches its own policy-specific setup. Install the compatibility shim
+        # before importing any LeRobot modules.
+        install_groot_transformers_loading_compatibility_patch()
+
         from lerobot.configs.default import DatasetConfig, WandBConfig
         from lerobot.configs.train import TrainPipelineConfig
         from lerobot.scripts import lerobot_train as lerobot_train_module

@@ -6,11 +6,11 @@
 train:
   dataset_root: data/zeno-ai/BookOriginRelocation
   dataset_repo_id: zeno-ai/BookOriginRelocation
-  output_root: outputs/train/zeno-ai/BookOriginRelocation/pi05-h200-fast
+  output_root: outputs/train/zeno-ai/BookOriginRelocation/pi05
   resume: false
   job_name: pi05-h200-fast
   wandb_project: BookOriginRelocation
-  wandb_mode: offline
+  wandb_mode: online
   device: cuda
   use_amp: true
   amp_dtype: bf16
@@ -33,7 +33,7 @@ train:
   torch_sharing_strategy: file_system
   torchcodec_decoder_cache_size: 32
   seed: 42
-  log_freq: 1000
+  log_freq: 200
   save_freq: 30000
   eval_freq: -1
   test_ratio: 0
