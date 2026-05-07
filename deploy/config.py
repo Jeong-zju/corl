@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import math
 
 from common import load_yaml_mapping, resolve_path
 from gripper_hysteresis import (
     GripperHysteresisConfig,
+    parse_int_sequence,
     parse_gripper_hysteresis_config,
 )
 
@@ -91,6 +93,26 @@ class CommandConfig:
     max_linear_x: float
     max_linear_y: float
     max_angular_z: float
+    deadzone_linear_x: float = 0.0
+    deadzone_linear_y: float = 0.0
+    deadzone_angular_z: float = 0.0
+    mutual_exclusion: "CommandMutualExclusionConfig" = field(
+        default_factory=lambda: CommandMutualExclusionConfig()
+    )
+
+
+@dataclass(frozen=True)
+class CommandMutualExclusionRuleConfig:
+    source_index: int
+    threshold: float
+    target_indices: tuple[int, ...]
+    mask_value: float = 0.0
+
+
+@dataclass(frozen=True)
+class CommandMutualExclusionConfig:
+    enabled: bool = False
+    rules: tuple[CommandMutualExclusionRuleConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,6 +151,110 @@ def _parse_joint_name_config(value: object, *, key: str) -> JointNameConfig:
             f"Expected `{key}` to be a mapping or list, got {type(value).__name__}."
         )
     return JointNameConfig(name=[str(item) for item in list(names)])
+
+
+def _parse_non_negative_float(
+    data: dict[str, object],
+    *,
+    key: str,
+    default: float = 0.0,
+) -> float:
+    raw_value = data.get(key, default)
+    value = float(default if raw_value is None or raw_value == "" else raw_value)
+    if value < 0.0:
+        raise ValueError(f"`{key}` must be >= 0, got {value}.")
+    return value
+
+
+def _parse_finite_float(data: dict[str, object], *, key: str) -> float:
+    if key not in data or data[key] in {None, ""}:
+        raise ValueError(f"`{key}` is required.")
+    value = float(data[key])
+    if not math.isfinite(value):
+        raise ValueError(f"`{key}` must be finite, got {value}.")
+    return value
+
+
+def _parse_non_negative_int(data: dict[str, object], *, key: str) -> int:
+    if key not in data or data[key] in {None, ""}:
+        raise ValueError(f"`{key}` is required.")
+    value = int(data[key])
+    if value < 0:
+        raise ValueError(f"`{key}` must be >= 0, got {value}.")
+    return value
+
+
+def parse_command_mutual_exclusion_config(
+    raw: dict[str, object] | None,
+) -> CommandMutualExclusionConfig:
+    data = dict(raw or {})
+    enabled = bool(data.get("enabled", False))
+    rules_raw = data.get("rules", ())
+    if rules_raw is None:
+        rules_raw = ()
+    if not isinstance(rules_raw, (list, tuple)):
+        raise TypeError(
+            "Expected `command.mutual_exclusion.rules` to be a list of mappings."
+        )
+
+    rules: list[CommandMutualExclusionRuleConfig] = []
+    for rule_index, rule_raw in enumerate(rules_raw):
+        if not isinstance(rule_raw, dict):
+            raise TypeError(
+                "Expected each `command.mutual_exclusion.rules` entry to be a mapping."
+            )
+        source_index = _parse_non_negative_int(rule_raw, key="source_index")
+        target_indices = parse_int_sequence(
+            rule_raw.get("target_indices"),
+            key="command.mutual_exclusion.rules[].target_indices",
+        )
+        if not target_indices:
+            raise ValueError(
+                f"`command.mutual_exclusion.rules[{rule_index}].target_indices` "
+                "must not be empty."
+            )
+        if any(target_index < 0 for target_index in target_indices):
+            raise ValueError(
+                f"`command.mutual_exclusion.rules[{rule_index}].target_indices` "
+                "must contain non-negative indices."
+            )
+        mask_value_raw = rule_raw.get("mask_value", 0.0)
+        mask_value = 0.0 if mask_value_raw in {None, ""} else float(mask_value_raw)
+        if not math.isfinite(mask_value):
+            raise ValueError(
+                f"`command.mutual_exclusion.rules[{rule_index}].mask_value` must be finite."
+            )
+        rules.append(
+            CommandMutualExclusionRuleConfig(
+                source_index=source_index,
+                threshold=_parse_finite_float(rule_raw, key="threshold"),
+                target_indices=tuple(target_indices),
+                mask_value=mask_value,
+            )
+        )
+
+    return CommandMutualExclusionConfig(enabled=enabled, rules=tuple(rules))
+
+
+def _validate_command_mutual_exclusion_config(
+    config: CommandMutualExclusionConfig,
+    *,
+    action_dim: int,
+) -> None:
+    if not config.enabled:
+        return
+    for rule_index, rule in enumerate(config.rules):
+        if rule.source_index >= action_dim:
+            raise ValueError(
+                f"`command.mutual_exclusion.rules[{rule_index}].source_index` "
+                f"must be < action_dim ({action_dim}), got {rule.source_index}."
+            )
+        for target_offset, target_index in enumerate(rule.target_indices):
+            if target_index >= action_dim:
+                raise ValueError(
+                    f"`command.mutual_exclusion.rules[{rule_index}].target_indices[{target_offset}]` "
+                    f"must be < action_dim ({action_dim}), got {target_index}."
+                )
 
 
 def load_deploy_config(config_path: str | Path) -> DeployConfig:
@@ -284,12 +410,33 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
         ),
     )
 
+    command_mutual_exclusion = parse_command_mutual_exclusion_config(
+        _as_mapping(command_raw, "mutual_exclusion")
+    )
+    _validate_command_mutual_exclusion_config(
+        command_mutual_exclusion,
+        action_dim=int(policy.action_dim),
+    )
+
     command = CommandConfig(
         publish_base=bool(command_raw.get("publish_base", True)),
         publish_arms=bool(command_raw.get("publish_arms", True)),
         max_linear_x=float(command_raw.get("max_linear_x", 0.3)),
         max_linear_y=float(command_raw.get("max_linear_y", 0.3)),
         max_angular_z=float(command_raw.get("max_angular_z", 0.5)),
+        deadzone_linear_x=_parse_non_negative_float(
+            command_raw,
+            key="deadzone_linear_x",
+        ),
+        deadzone_linear_y=_parse_non_negative_float(
+            command_raw,
+            key="deadzone_linear_y",
+        ),
+        deadzone_angular_z=_parse_non_negative_float(
+            command_raw,
+            key="deadzone_angular_z",
+        ),
+        mutual_exclusion=command_mutual_exclusion,
     )
 
     missing_image_keys = {"left", "right", "top"} - set(policy.image_keys)

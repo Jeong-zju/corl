@@ -1,11 +1,11 @@
 policy:
-  type: act
-  # path: ../../outputs/train/zeno-ai/CleanTableTopDelayedToolChoice/act/20260420_143315/checkpoints/150000
-  path: ../../outputs/train/zeno-ai/BookOriginRelocation/act/20260503_014752/checkpoints/090000
+  type: pi05
+  path: ../../outputs/train/zeno-ai/BookOriginRelocation/pi05
+  task: Return the book to its original location.
   device: cuda
   load_device: null
-  n_action_steps: 50
-  temporal_ensemble_coeff: 0.0075
+  n_action_steps: 16
+  temporal_ensemble_coeff: 0.0
   state_dim: 17
   action_dim: 17
   arm_dof: 7
@@ -20,13 +20,25 @@ policy:
 runtime:
   control_hz: 30.0
 
+gripper_hysteresis:
+  enabled: false
+
+debug:
+  enabled: false
+  publish_hz: 5.0
+  attention_topic: /deploy/debug/attention
+  slot_memory_topic: /deploy/debug/slot_memory
+  signature_topic: /deploy/debug/signature
+  overlay_alpha: 0.45
+  attention_query_step: 0
+
 image:
   width: 224
   height: 224
   color_order: rgb
 
 ros:
-  node_name: zeno_act_deploy
+  node_name: zeno_pi05_deploy
   queue_size: 1
   topics:
     image_left: /realsense_left/color/image_raw/compressed

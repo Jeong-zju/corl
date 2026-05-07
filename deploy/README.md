@@ -4,7 +4,7 @@
 
 - 一个 ROS1 node 直接订阅图像、双臂 joint state 和 odom
 - 在 node 内部拼成一帧 observation
-- 直接加载 ACT / Streaming ACT / SmolVLA / GROOT checkpoint 做推理
+- 直接加载 ACT / Streaming ACT / pi05 / SmolVLA / GROOT checkpoint 做推理
 - 直接发布 `Twist` 和左右臂 `JointState`
 
 启动方式：
@@ -17,8 +17,8 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 主要可调项都在 YAML 里：
 
 - `policy.path`：checkpoint 路径，按当前 YAML 文件的相对路径解析；也可以直接写训练输出根目录，deploy 会自动解析最新 run
-- `policy.type`：支持 `act`、`streaming_act`、`smolvla`、`groot`
-- `policy.task`：SmolVLA / GROOT 的语言指令；部署 VLA policy 时必须填写
+- `policy.type`：支持 `act`、`streaming_act`、`pi05`、`smolvla`、`groot`
+- `policy.task`：pi05 / SmolVLA / GROOT 的语言指令；部署 VLA policy 时必须填写
 - `policy.device`：推理设备
 - `policy.groot_attn_implementation`：GROOT 加载时注入到 Transformers 的 attention 实现，默认 `eager`
 - `policy.temporal_ensemble_coeff`：`0` 表示按 `n_action_steps` 开环执行；非 `0` 表示每步推理一次，并按该系数做 temporal ensemble（deploy 会强制按单步执行，即 `n_action_steps=1`）
@@ -27,6 +27,13 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - `ros.joint_names_left.name` / `ros.joint_names_right.name`
 - `image.width` / `image.height` / `image.color_order`
 - `command.max_linear_x` / `max_linear_y` / `max_angular_z`
+- `command.deadzone_linear_x` / `deadzone_linear_y` / `deadzone_angular_z`：
+  底盘 `Twist` 的三个维度分别做 deadzone，命中阈值内会被压成 0
+- `command.mutual_exclusion.enabled` / `command.mutual_exclusion.rules`：
+  批量互斥屏蔽规则，作用在 action 向量维度上。每条 rule 写
+  `source_index`、`threshold`、`target_indices`，当
+  `action[source_index] > threshold` 时，将这些 target 维度置为
+  `mask_value`（默认 `0`）
 - `debug.enabled` / `debug.publish_hz`：开启实机视觉调试图发布
 
 说明：
@@ -36,7 +43,7 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - 如果你的 checkpoint 依赖 `path_signature` / `delta_signature`，node 现在会优先按 checkpoint 真实配置自动开启在线 signature 计算，不再要求你在 deploy YAML 里手工保持一致。
 - 如果 checkpoint 把 signature 特征标记成 `pre_normalized_observation_keys`，deploy 会自动从训练 run 关联的数据集 `meta/stats.json` 读取统计量，对在线 `path_signature` / `delta_signature` 做同样的归一化；为了抑制真实机器人噪声在零方差维度上的放大，归一化前还会先裁到训练数据的 `min/max` 支持范围内。
 - 对 `streaming_act` 的 PRISM 变体，在线部署走的是“当前帧 + 在线 visual prefix memory / slot memory 更新”路径，不需要每步重建显式 prefix sequence tensor。
-- 对 `smolvla` / `groot`，deploy 会把 YAML 里的 `policy.task` 随每帧 observation 送入 LeRobot processor；`policy.temporal_ensemble_coeff` 应保持 `0`，由策略预测 action chunk 后按 `n_action_steps` 开环消费。
+- 对 `pi05` / `smolvla` / `groot`，deploy 会把 YAML 里的 `policy.task` 随每帧 observation 送入 LeRobot processor；`policy.temporal_ensemble_coeff` 应保持 `0`，由策略预测 action chunk 后按 `n_action_steps` 开环消费。
 - 如果图像颜色和训练时不一致，优先改 YAML 里的 `image.color_order`。
 - `policy.temporal_ensemble_coeff=0` 时，deploy 会缓存一段 action chunk 并开环消费；`!=0` 时，每个控制周期都会重新推理，并使用 temporal ensemble 输出当前动作。
 

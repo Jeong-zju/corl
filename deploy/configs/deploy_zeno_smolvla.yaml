@@ -75,3 +75,9 @@ command:
   max_linear_x: 5.0
   max_linear_y: 5.0
   max_angular_z: 6.28
+  deadzone_linear_x: 0.0
+  deadzone_linear_y: 0.0
+  deadzone_angular_z: 0.0
+  mutual_exclusion:
+    enabled: false
+    rules: []

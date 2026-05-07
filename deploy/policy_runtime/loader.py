@@ -40,28 +40,32 @@ from eval_helpers import (  # noqa: E402
 from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
 
-VLA_POLICY_TYPES = {"smolvla", "groot"}
+VLA_POLICY_TYPES = {"pi05", "smolvla", "groot"}
 
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
     "diffusion": "diffusion",
     "groot": "groot",
+    "pi05": "pi05",
     "smolvla": "smolvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
+    "pi05": ("rtc",),
     "smolvla": ("rtc",),
 }
 
 _LEROBOT_CONFIG_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.configuration_act",
     "groot": "lerobot.policies.groot.configuration_groot",
+    "pi05": "lerobot.policies.pi05.configuration_pi05",
     "smolvla": "lerobot.policies.smolvla.configuration_smolvla",
 }
 
 _LEROBOT_PROCESSOR_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.processor_act",
     "groot": "lerobot.policies.groot.processor_groot",
+    "pi05": "lerobot.policies.pi05.processor_pi05",
     "smolvla": "lerobot.policies.smolvla.processor_smolvla",
 }
 
@@ -304,6 +308,19 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
     _install_lerobot_policies_namespace_shim()
     if policy_type == "streaming_act":
         return import_local_streaming_act_policy_class()
+    if policy_type == "pi05":
+        try:
+            module = _import_lerobot_policy_submodule(
+                policy_type,
+                "lerobot.policies.pi05.modeling_pi05",
+            )
+        except ModuleNotFoundError as exc:
+            raise _missing_dependency_error(
+                policy_name="PI05",
+                extra_name="pi",
+                exc=exc,
+            ) from exc
+        return module.PI05Policy
     if policy_type == "smolvla":
         try:
             module = _import_lerobot_policy_submodule(
@@ -370,7 +387,7 @@ class PolicyRuntime:
             raise ValueError(
                 "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
                 "The current deploy runtime supports 'act', 'streaming_act', "
-                "'smolvla', and 'groot'. "
+                "'pi05', 'smolvla', and 'groot'. "
                 "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
                 "until deploy support is added."
             )

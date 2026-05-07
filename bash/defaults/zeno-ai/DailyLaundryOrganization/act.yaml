@@ -33,7 +33,7 @@ train:
   torchcodec_decoder_cache_size: 32
   seed: 42
   log_freq: 1000
-  save_freq: 20000
+  save_freq: 30000
   eval_freq: -1
   test_ratio: 0
   split_seed: 42
