@@ -9,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
 from train_policy import _import_groot_n1_with_kw_only_dataclass_compatibility
+from train_policy import _remap_groot_legacy_vision_model_state_dict_keys
 
 
 def test_import_groot_n1_with_kw_only_dataclass_compatibility_recovers_from_bug(
@@ -51,3 +52,32 @@ def test_import_groot_n1_with_kw_only_dataclass_compatibility_recovers_from_bug(
             if name == "lerobot" or name.startswith("lerobot."):
                 sys.modules.pop(name, None)
         sys.modules.update(original_modules)
+
+
+def test_remap_groot_legacy_vision_model_state_dict_keys_prefers_canonical_keys(
+) -> None:
+    canonical_value = object()
+    legacy_value = object()
+    other_value = object()
+    state_dict = {
+        "_groot_model.backbone.eagle_model.vision_model.embeddings.patch_embedding.weight": canonical_value,
+        "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight": legacy_value,
+        "something_else": other_value,
+    }
+
+    remapped_state_dict, changed = _remap_groot_legacy_vision_model_state_dict_keys(
+        state_dict
+    )
+
+    assert changed is True
+    assert (
+        remapped_state_dict[
+            "_groot_model.backbone.eagle_model.vision_model.embeddings.patch_embedding.weight"
+        ]
+        is canonical_value
+    )
+    assert (
+        "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight"
+        not in remapped_state_dict
+    )
+    assert remapped_state_dict["something_else"] is other_value
