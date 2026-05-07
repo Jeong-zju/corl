@@ -8,23 +8,21 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
-from train_policy import _remap_pi05_legacy_vision_tower_state_dict_keys
+from train_policy import _remap_pi05_state_dict_keys
 from train_policy import should_log_dataset_feature_filtering
 
 
-def test_remap_pi05_legacy_vision_tower_state_dict_keys_prefers_canonical_keys() -> None:
+def test_remap_pi05_state_dict_keys_adds_model_prefix_and_prefers_canonical_keys() -> None:
     canonical_value = object()
     legacy_value = object()
     other_value = object()
     state_dict = {
-        "model.paligemma_with_expert.paligemma.model.vision_tower.embeddings.patch_embedding.weight": canonical_value,
-        "model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight": legacy_value,
+        "paligemma_with_expert.paligemma.model.vision_tower.embeddings.patch_embedding.weight": canonical_value,
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight": legacy_value,
         "something_else": other_value,
     }
 
-    remapped_state_dict, changed = _remap_pi05_legacy_vision_tower_state_dict_keys(
-        state_dict
-    )
+    remapped_state_dict, changed = _remap_pi05_state_dict_keys(state_dict)
 
     assert changed is True
     assert (
@@ -37,7 +35,24 @@ def test_remap_pi05_legacy_vision_tower_state_dict_keys_prefers_canonical_keys()
         "model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.patch_embedding.weight"
         not in remapped_state_dict
     )
-    assert remapped_state_dict["something_else"] is other_value
+    assert remapped_state_dict["model.something_else"] is other_value
+
+
+def test_remap_pi05_state_dict_keys_leaves_prefixed_keys_alone() -> None:
+    value = object()
+    state_dict = {
+        "model.paligemma_with_expert.paligemma.model.vision_tower.embeddings.patch_embedding.weight": value,
+    }
+
+    remapped_state_dict, changed = _remap_pi05_state_dict_keys(state_dict)
+
+    assert changed is False
+    assert (
+        remapped_state_dict[
+            "model.paligemma_with_expert.paligemma.model.vision_tower.embeddings.patch_embedding.weight"
+        ]
+        is value
+    )
 
 
 def test_should_log_dataset_feature_filtering_is_disabled_by_default(

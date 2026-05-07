@@ -886,23 +886,27 @@ def _remap_groot_legacy_vision_model_state_dict_keys(
     return remapped_state_dict, changed
 
 
-def _remap_pi05_legacy_vision_tower_state_dict_keys(
+def _remap_pi05_state_dict_keys(
     state_dict: dict[str, object],
 ) -> tuple[dict[str, object], bool]:
-    legacy_substring = ".vision_tower.vision_model."
-    if not any(legacy_substring in key for key in state_dict):
-        return state_dict, False
-
-    remapped_state_dict = {
-        key: value for key, value in state_dict.items() if legacy_substring not in key
-    }
+    legacy_vision_substring = ".vision_tower.vision_model."
+    remapped_state_dict: dict[str, object] = {}
     changed = False
+
     for key, value in state_dict.items():
-        if legacy_substring not in key:
-            continue
-        changed = True
-        remapped_key = key.replace(legacy_substring, ".vision_tower.", 1)
+        remapped_key = key
+        if not remapped_key.startswith("model."):
+            remapped_key = f"model.{remapped_key}"
+            changed = True
+        if legacy_vision_substring in remapped_key:
+            remapped_key = remapped_key.replace(
+                legacy_vision_substring,
+                ".vision_tower.",
+                1,
+            )
+            changed = True
         remapped_state_dict.setdefault(remapped_key, value)
+
     return remapped_state_dict, changed
 
 
@@ -982,9 +986,9 @@ def install_pi05_state_dict_compatibility_patch() -> None:
     ):
         state_dict = load_file(filename, device=device)
         if type(model).__name__ == "PI05Policy":
-            state_dict, _changed = _remap_pi05_legacy_vision_tower_state_dict_keys(
-                state_dict
-            )
+            state_dict, changed = _remap_pi05_state_dict_keys(state_dict)
+            if changed:
+                print("[PI05] Remapped legacy checkpoint keys for compatibility")
 
         model_state_dict = model.state_dict()
         to_removes = _remove_duplicate_names(
