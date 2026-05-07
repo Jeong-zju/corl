@@ -146,6 +146,15 @@ class LocalSGDRuntime:
 _FRESH_DISTRIBUTED_OUTPUT_RESERVATIONS: dict[Path, str] = {}
 
 
+def should_log_dataset_feature_filtering() -> bool:
+    return str(os.environ.get("CORL_VERBOSE_DATASET_FEATURE_FILTERS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def configure_ignored_dataset_feature_keys(feature_keys: tuple[str, ...]) -> None:
     global _IGNORED_DATASET_FEATURE_KEYS
     _IGNORED_DATASET_FEATURE_KEYS = tuple(
@@ -877,6 +886,26 @@ def _remap_groot_legacy_vision_model_state_dict_keys(
     return remapped_state_dict, changed
 
 
+def _remap_pi05_legacy_vision_tower_state_dict_keys(
+    state_dict: dict[str, object],
+) -> tuple[dict[str, object], bool]:
+    legacy_substring = ".vision_tower.vision_model."
+    if not any(legacy_substring in key for key in state_dict):
+        return state_dict, False
+
+    remapped_state_dict = {
+        key: value for key, value in state_dict.items() if legacy_substring not in key
+    }
+    changed = False
+    for key, value in state_dict.items():
+        if legacy_substring not in key:
+            continue
+        changed = True
+        remapped_key = key.replace(legacy_substring, ".vision_tower.", 1)
+        remapped_state_dict.setdefault(remapped_key, value)
+    return remapped_state_dict, changed
+
+
 def install_groot_state_dict_compatibility_patch() -> None:
     """Accept Groot checkpoints saved with an older Eagle vision prefix layout."""
     import lerobot.policies.pretrained as pretrained
@@ -932,6 +961,59 @@ def install_groot_state_dict_compatibility_patch() -> None:
         original_load_model_as_safetensor
     )
     pretrained._corl_groot_state_dict_patch_installed = True
+
+
+def install_pi05_state_dict_compatibility_patch() -> None:
+    """Accept PI05 checkpoints that still use the legacy vision_tower prefix."""
+    import lerobot.policies.pretrained as pretrained
+
+    if getattr(pretrained, "_corl_pi05_state_dict_patch_installed", False):
+        return
+
+    from safetensors.torch import _remove_duplicate_names, load_file
+
+    original_load_model_as_safetensor = pretrained.load_model_as_safetensor
+
+    def load_model_as_safetensor_with_pi05_compat(
+        model,
+        filename,
+        strict: bool = True,
+        device: str | int = "cpu",
+    ):
+        state_dict = load_file(filename, device=device)
+        if type(model).__name__ == "PI05Policy":
+            state_dict, _changed = _remap_pi05_legacy_vision_tower_state_dict_keys(
+                state_dict
+            )
+
+        model_state_dict = model.state_dict()
+        to_removes = _remove_duplicate_names(
+            model_state_dict, preferred_names=state_dict.keys()
+        )
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing = set(missing)
+        for to_remove_group in to_removes.values():
+            for to_remove in to_remove_group:
+                if to_remove not in missing:
+                    unexpected.append(to_remove)
+                else:
+                    missing.remove(to_remove)
+        if strict and (missing or unexpected):
+            missing_keys = ", ".join([f'"{k}"' for k in sorted(missing)])
+            unexpected_keys = ", ".join([f'"{k}"' for k in sorted(unexpected)])
+            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
+            if missing:
+                error += f"\n    Missing key(s) in state_dict: {missing_keys}"
+            if unexpected:
+                error += f"\n    Unexpected key(s) in state_dict: {unexpected_keys}"
+            raise RuntimeError(error)
+        return missing, unexpected
+
+    pretrained.load_model_as_safetensor = load_model_as_safetensor_with_pi05_compat
+    pretrained._corl_pi05_original_load_model_as_safetensor = (
+        original_load_model_as_safetensor
+    )
+    pretrained._corl_pi05_state_dict_patch_installed = True
 
 
 def install_groot_attention_implementation_patch(attn_implementation: str) -> None:
@@ -2140,11 +2222,12 @@ def install_lerobot_dataset_load_patch() -> None:
             )
         )
         if removed_signature_keys:
-            print(
-                "[INFO] dataset.load_metadata: ignoring signature-cache-only "
-                "features for this policy: "
-                f"{list(removed_signature_keys)}"
-            )
+            if should_log_dataset_feature_filtering():
+                print(
+                    "[INFO] dataset.load_metadata: ignoring signature-cache-only "
+                    "features for this policy: "
+                    f"{list(removed_signature_keys)}"
+                )
         self.info, self.stats, removed_ignored_keys = (
             drop_dataset_features_from_metadata(
                 info=self.info,
@@ -2153,10 +2236,11 @@ def install_lerobot_dataset_load_patch() -> None:
             )
         )
         if removed_ignored_keys:
-            print(
-                "[INFO] dataset.load_metadata: ignoring policy-excluded features: "
-                f"{list(removed_ignored_keys)}"
-            )
+            if should_log_dataset_feature_filtering():
+                print(
+                    "[INFO] dataset.load_metadata: ignoring policy-excluded "
+                    f"features: {list(removed_ignored_keys)}"
+                )
         elapsed_s = time.perf_counter() - start_s
         print(
             f"[INFO] dataset.load_metadata: {elapsed_s:.1f}s "
@@ -2182,21 +2266,23 @@ def install_lerobot_dataset_load_patch() -> None:
             for key, feature_spec in self.features.items()
             if key not in cached_feature_keys
         }
-        if metadata_cached_feature_keys:
-            print(
-                "[INFO] dataset.load_hf_dataset: excluding signature-cache-only "
-                f"features from parquet load: {sorted(metadata_cached_feature_keys)}"
-            )
-        if runtime_cached_feature_keys:
-            print(
-                "[INFO] signature_cache: excluding cached parquet columns from HF load: "
-                f"{sorted(runtime_cached_feature_keys)}"
-            )
-        if ignored_feature_keys:
-            print(
-                "[INFO] dataset.load_hf_dataset: excluding policy-excluded "
-                f"features from parquet load: {sorted(ignored_feature_keys)}"
-            )
+        if should_log_dataset_feature_filtering():
+            if metadata_cached_feature_keys:
+                print(
+                    "[INFO] dataset.load_hf_dataset: excluding "
+                    "signature-cache-only features from parquet load: "
+                    f"{sorted(metadata_cached_feature_keys)}"
+                )
+            if runtime_cached_feature_keys:
+                print(
+                    "[INFO] signature_cache: excluding cached parquet columns "
+                    f"from HF load: {sorted(runtime_cached_feature_keys)}"
+                )
+            if ignored_feature_keys:
+                print(
+                    "[INFO] dataset.load_hf_dataset: excluding policy-excluded "
+                    f"features from parquet load: {sorted(ignored_feature_keys)}"
+                )
         hf_transform = build_hf_transform_to_torch(load_feature_specs)
         parquet_paths = sorted((self.root / "data").glob("*/*.parquet"))
         if not parquet_paths:
@@ -5216,6 +5302,8 @@ def main(argv: list[str] | None = None) -> None:
         install_groot_action_input_batch_feature_compatibility_patch()
         install_groot_processor_tensor_compatibility_patch()
         install_groot_state_dict_compatibility_patch()
+    elif args.policy == "pi05":
+        install_pi05_state_dict_compatibility_patch()
     if policy_supports_signature_features(args.policy):
         from lerobot_policy_streaming_act.prefix_image_cache import (
             PrefixImageCacheRuntimeConfig,
