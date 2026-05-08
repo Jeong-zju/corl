@@ -123,6 +123,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self._visual_prefix_memory_state = None
+        self._visual_prefix_anchor_embedding = None
         self._visual_prefix_memory_update_count = 0
         self._visual_prefix_memory_last_state_norm = 0.0
         self.model.reset_deploy_debug()
@@ -137,11 +138,19 @@ class StreamingACTPolicy(PreTrainedPolicy):
     def _update_online_visual_prefix_memory(self, batch: dict[str, Tensor]) -> Tensor | None:
         if not self.config.use_visual_prefix_memory:
             return None
-        memory_token, memory_state = self.model.compute_online_visual_prefix_memory_token(
+        (
+            memory_token,
+            memory_state,
+            anchor_embedding,
+        ) = self.model.compute_online_visual_prefix_memory_token(
             batch,
             previous_state=self._visual_prefix_memory_state,
+            first_frame_anchor_embedding=self._visual_prefix_anchor_embedding,
         )
         self._visual_prefix_memory_state = memory_state.detach()
+        self._visual_prefix_anchor_embedding = (
+            None if anchor_embedding is None else anchor_embedding.detach()
+        )
         self._visual_prefix_memory_update_count += 1
         self._visual_prefix_memory_last_state_norm = float(
             self._visual_prefix_memory_state.norm(dim=-1).mean().detach().cpu().item()
@@ -161,7 +170,11 @@ class StreamingACTPolicy(PreTrainedPolicy):
         memory_token = self._update_online_visual_prefix_memory(batch)
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch, visual_prefix_memory_token=memory_token)
+            actions = self.predict_action_chunk(
+                batch,
+                visual_prefix_memory_token=memory_token,
+                visual_prefix_anchor_embedding=self._visual_prefix_anchor_embedding,
+            )
             action = self.temporal_ensembler.update(actions)
             return action
 
@@ -171,6 +184,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
             actions = self.predict_action_chunk(
                 batch,
                 visual_prefix_memory_token=memory_token,
+                visual_prefix_anchor_embedding=self._visual_prefix_anchor_embedding,
             )[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
@@ -184,6 +198,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         *,
         visual_prefix_memory_token: Tensor | None = None,
+        visual_prefix_anchor_embedding: Tensor | None = None,
     ) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
@@ -192,9 +207,11 @@ class StreamingACTPolicy(PreTrainedPolicy):
         if self.config.use_visual_prefix_memory:
             if visual_prefix_memory_token is None:
                 visual_prefix_memory_token = self._update_online_visual_prefix_memory(batch)
+                visual_prefix_anchor_embedding = self._visual_prefix_anchor_embedding
             actions = self.model(
                 batch,
                 visual_prefix_memory_token=visual_prefix_memory_token,
+                visual_prefix_anchor_embedding=visual_prefix_anchor_embedding,
                 skip_prefix_sequence_validation=True,
             )[0]
         else:
@@ -203,6 +220,7 @@ class StreamingACTPolicy(PreTrainedPolicy):
 
     def get_visual_prefix_memory_debug_stats(self) -> dict[str, float | int | bool]:
         state = self._visual_prefix_memory_state
+        anchor = self._visual_prefix_anchor_embedding
         return {
             "enabled": bool(self.config.use_visual_prefix_memory),
             "initialized": state is not None,
@@ -214,6 +232,15 @@ class StreamingACTPolicy(PreTrainedPolicy):
                 getattr(self.config, "use_signature_conditioned_visual_prefix_memory", False)
             ),
             "uses_delta_signature": bool(getattr(self.config, "use_delta_signature", False)),
+            "uses_first_frame_anchor_routing": bool(
+                getattr(self.config, "use_first_frame_anchor_in_slot_routing", False)
+            ),
+            "anchor_initialized": anchor is not None,
+            "anchor_norm": (
+                0.0
+                if anchor is None
+                else float(anchor.norm(dim=-1).mean().detach().cpu().item())
+            ),
             "update_count": int(self._visual_prefix_memory_update_count),
             "state_norm": float(self._visual_prefix_memory_last_state_norm),
         }
@@ -421,6 +448,9 @@ class StreamingACT(nn.Module):
         self.use_path_signature = config.use_path_signature
         self.use_delta_signature = config.use_delta_signature
         self.use_first_frame_anchor = config.use_first_frame_anchor
+        self.use_first_frame_anchor_in_slot_routing = (
+            config.use_first_frame_anchor_in_slot_routing
+        )
         self.use_visual_prefix_memory = config.use_visual_prefix_memory
         self.use_signature_conditioned_visual_prefix_memory = (
             config.use_signature_conditioned_visual_prefix_memory
@@ -521,11 +551,14 @@ class StreamingACT(nn.Module):
         if self.use_visual_prefix_memory:
             self.visual_prefix_memory_pool = nn.AdaptiveAvgPool2d((1, 1))
             if self.use_signature_indexed_slot_memory:
-                slot_route_input_dim = config.dim_model * (
-                    1 + int(config.slot_memory_use_delta_routing)
+                slot_route_component_count = (
+                    1
+                    + int(config.slot_memory_use_delta_routing)
+                    + int(config.use_first_frame_anchor_in_slot_routing)
                 )
+                slot_route_input_dim = config.dim_model * slot_route_component_count
                 slot_write_input_dim = config.dim_model * (
-                    3 + int(config.slot_memory_use_delta_routing)
+                    2 + slot_route_component_count
                 )
                 slot_state_input_dim = (
                     config.dim_model * 2 + config.slot_memory_routing_hidden_dim
@@ -925,6 +958,30 @@ class StreamingACT(nn.Module):
             )
         return hidden.to(device=device, dtype=dtype)
 
+    def _normalize_first_frame_anchor_embedding(
+        self,
+        anchor_embedding: Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        context: str,
+    ) -> Tensor:
+        if anchor_embedding is None:
+            raise ValueError(
+                f"{context} requires a first-frame visual anchor embedding when "
+                "`use_first_frame_anchor_in_slot_routing=True`."
+            )
+        if anchor_embedding.ndim == 3 and anchor_embedding.shape[1] == 1:
+            anchor_embedding = anchor_embedding.squeeze(1)
+        expected_shape = (batch_size, self.config.dim_model)
+        if anchor_embedding.ndim != 2 or tuple(anchor_embedding.shape) != expected_shape:
+            raise ValueError(
+                f"{context} first-frame visual anchor embedding must have shape "
+                f"{expected_shape}. Got {tuple(anchor_embedding.shape)}."
+            )
+        return anchor_embedding.to(device=device, dtype=dtype)
+
     def _iter_visual_prefix_memory_updates(self) -> list[nn.GRUCell]:
         if self.use_signature_indexed_slot_memory:
             raise RuntimeError(
@@ -1290,6 +1347,7 @@ class StreamingACT(nn.Module):
         *,
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
+        first_frame_anchor_t: Tensor | None,
         context: str,
     ) -> Tensor:
         if not self.use_signature_indexed_slot_memory:
@@ -1307,9 +1365,23 @@ class StreamingACT(nn.Module):
                     "`slot_memory_use_delta_routing=True`."
                 )
             route_features.append(delta_signature_t)
+        if self.config.use_first_frame_anchor_in_slot_routing:
+            if first_frame_anchor_t is None:
+                raise ValueError(
+                    f"{context} requires `first_frame_anchor_t` when "
+                    "`use_first_frame_anchor_in_slot_routing=True`."
+                )
+            route_features.append(
+                first_frame_anchor_t.to(
+                    device=signature_t.device,
+                    dtype=signature_t.dtype,
+                )
+            )
         route_features = torch.cat(route_features, dim=-1)
         expected_dim = self.config.dim_model * (
-            1 + int(self.config.slot_memory_use_delta_routing)
+            1
+            + int(self.config.slot_memory_use_delta_routing)
+            + int(self.config.use_first_frame_anchor_in_slot_routing)
         )
         if route_features.ndim != 2 or route_features.shape[1] != expected_dim:
             raise ValueError(
@@ -1358,6 +1430,7 @@ class StreamingACT(nn.Module):
         state_t: Tensor,
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
+        first_frame_anchor_t: Tensor | None,
         step_stats: dict[str, Tensor],
     ) -> None:
         memory_prev_norm = memory_prev.detach().float().norm(dim=-1)
@@ -1382,6 +1455,7 @@ class StreamingACT(nn.Module):
             "state_embedding_norm": self._debug_norm(state_t),
             "signature_embedding_norm": self._debug_norm(signature_t),
             "delta_signature_embedding_norm": self._debug_norm(delta_signature_t),
+            "first_frame_anchor_embedding_norm": self._debug_norm(first_frame_anchor_t),
             "memory_prev_norm": self._debug_tensor(memory_prev_norm),
             "memory_next_norm": self._debug_tensor(memory_next_norm),
             "memory_delta_norm": self._debug_tensor(memory_delta_norm),
@@ -1409,12 +1483,14 @@ class StreamingACT(nn.Module):
         state_t: Tensor,
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
+        first_frame_anchor_t: Tensor | None,
         route_hidden: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if route_hidden is None:
             route_features = self._build_slot_memory_route_features(
                 signature_t=signature_t,
                 delta_signature_t=delta_signature_t,
+                first_frame_anchor_t=first_frame_anchor_t,
                 context="Signature-indexed slot memory readout",
             )
             route_hidden = self.slot_memory_route_proj(route_features)
@@ -1439,12 +1515,14 @@ class StreamingACT(nn.Module):
         state_t: Tensor,
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
+        first_frame_anchor_t: Tensor | None,
         valid_t: Tensor | None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         batch_size, num_slots, hidden_dim = memory_prev.shape
         route_features = self._build_slot_memory_route_features(
             signature_t=signature_t,
             delta_signature_t=delta_signature_t,
+            first_frame_anchor_t=first_frame_anchor_t,
             context="Signature-indexed slot memory update",
         )
         route_hidden, routing_logits, routing_weights, routing_distribution = (
@@ -1495,6 +1573,7 @@ class StreamingACT(nn.Module):
                 state_t=state_t,
                 signature_t=signature_t,
                 delta_signature_t=delta_signature_t,
+                first_frame_anchor_t=first_frame_anchor_t,
                 route_hidden=route_hidden,
             )
         )
@@ -1521,6 +1600,7 @@ class StreamingACT(nn.Module):
         state_t: Tensor,
         signature_t: Tensor | None,
         delta_signature_t: Tensor | None,
+        first_frame_anchor_t: Tensor | None,
         valid_t: Tensor | None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         if self.use_signature_indexed_slot_memory:
@@ -1530,6 +1610,7 @@ class StreamingACT(nn.Module):
                 state_t=state_t,
                 signature_t=signature_t,
                 delta_signature_t=delta_signature_t,
+                first_frame_anchor_t=first_frame_anchor_t,
                 valid_t=valid_t,
             )
         batch_size = memory_prev.shape[0]
@@ -1627,6 +1708,7 @@ class StreamingACT(nn.Module):
         state_embeddings: Tensor,
         signature_embeddings: Tensor | None,
         delta_signature_embeddings: Tensor | None,
+        first_frame_anchor_embedding: Tensor | None,
         prefix_mask: Tensor,
         initial_state: Tensor | None = None,
     ) -> Tensor:
@@ -1651,6 +1733,19 @@ class StreamingACT(nn.Module):
                 "Visual prefix memory delta-signature embeddings must match visual embeddings. "
                 f"Got delta_signature={tuple(delta_signature_embeddings.shape)} vs "
                 f"visual={tuple(visual_embeddings.shape)}."
+            )
+        if self.config.use_first_frame_anchor_in_slot_routing:
+            first_frame_anchor_embedding = self._normalize_first_frame_anchor_embedding(
+                first_frame_anchor_embedding,
+                batch_size=batch_size,
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
+                context="Visual prefix memory scan",
+            )
+        elif first_frame_anchor_embedding is not None:
+            first_frame_anchor_embedding = first_frame_anchor_embedding.to(
+                device=visual_embeddings.device,
+                dtype=visual_embeddings.dtype,
             )
 
         if initial_state is None:
@@ -1736,6 +1831,7 @@ class StreamingACT(nn.Module):
                     if delta_signature_embeddings is None
                     else delta_signature_embeddings[:, step_idx]
                 ),
+                first_frame_anchor_t=first_frame_anchor_embedding,
                 valid_t=prefix_mask[:, step_idx],
             )
             if need_balance_loss:
@@ -1867,6 +1963,10 @@ class StreamingACT(nn.Module):
                 ),
                 "slot_memory/memory_final_slot_std": self._debug_slot_std(hidden),
             }
+            if self.config.use_first_frame_anchor_in_slot_routing:
+                log_stats["slot_memory/first_frame_anchor_norm"] = self._debug_norm(
+                    first_frame_anchor_embedding
+                )
             if max_entropy > 0.0:
                 log_stats["slot_memory/routing_entropy_normalized"] = float(
                     (routing_entropy / max_entropy).detach().cpu().item()
@@ -1903,6 +2003,7 @@ class StreamingACT(nn.Module):
         state_embedding: Tensor,
         signature_embedding: Tensor | None,
         delta_signature_embedding: Tensor | None,
+        first_frame_anchor_embedding: Tensor | None,
     ) -> Tensor:
         if memory_state.ndim != 3:
             raise ValueError(
@@ -1919,6 +2020,7 @@ class StreamingACT(nn.Module):
             state_t=state_embedding,
             signature_t=signature_embedding,
             delta_signature_t=delta_signature_embedding,
+            first_frame_anchor_t=first_frame_anchor_embedding,
         )
         return readout_context
 
@@ -1973,7 +2075,7 @@ class StreamingACT(nn.Module):
     def _compute_visual_prefix_memory_token_from_prefix_sequence(
         self,
         batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, Tensor], tuple[Tensor, Tensor] | None]:
+    ) -> tuple[Tensor, dict[str, Tensor], tuple[Tensor, Tensor] | None, Tensor | None]:
         assert PREFIX_STATE_KEY in batch, (
             f"`{PREFIX_STATE_KEY}` is required to reconstruct visual prefix memory during training."
         )
@@ -1995,6 +2097,18 @@ class StreamingACT(nn.Module):
             ),
         )
         state_embeddings = self._project_prefix_states_for_visual_prefix_memory(batch[PREFIX_STATE_KEY])
+        first_frame_anchor_embedding = None
+        if self.config.use_first_frame_anchor_in_slot_routing:
+            prefix_mask = batch[PREFIX_MASK_KEY].to(
+                device=visual_embeddings.device,
+                dtype=torch.bool,
+            )
+            if not torch.all(prefix_mask[:, 0]):
+                raise ValueError(
+                    "First-frame anchor slot routing expects the first prefix "
+                    "position to be valid for every batch row."
+                )
+            first_frame_anchor_embedding = visual_embeddings[:, 0]
         signature_embeddings = None
         delta_signature_embeddings = None
         uses_signature_routed_memory = (
@@ -2031,16 +2145,23 @@ class StreamingACT(nn.Module):
             state_embeddings=state_embeddings,
             signature_embeddings=signature_embeddings,
             delta_signature_embeddings=delta_signature_embeddings,
+            first_frame_anchor_embedding=first_frame_anchor_embedding,
             prefix_mask=batch[PREFIX_MASK_KEY],
         )
-        return memory_state, aux_losses, current_observation_tokens
+        return (
+            memory_state,
+            aux_losses,
+            current_observation_tokens,
+            first_frame_anchor_embedding,
+        )
 
     def compute_online_visual_prefix_memory_token(
         self,
         batch: dict[str, Tensor],
         *,
         previous_state: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        first_frame_anchor_embedding: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         if not self.use_visual_prefix_memory:
             raise RuntimeError(
                 "`compute_online_visual_prefix_memory_token` requires "
@@ -2056,6 +2177,16 @@ class StreamingACT(nn.Module):
         visual_embedding = self._encode_multi_camera_images_for_visual_prefix_memory(
             batch[OBS_IMAGES]
         )
+        if self.config.use_first_frame_anchor_in_slot_routing:
+            if first_frame_anchor_embedding is None:
+                first_frame_anchor_embedding = visual_embedding.detach()
+            first_frame_anchor_embedding = self._normalize_first_frame_anchor_embedding(
+                first_frame_anchor_embedding,
+                batch_size=visual_embedding.shape[0],
+                device=visual_embedding.device,
+                dtype=visual_embedding.dtype,
+                context="Online visual prefix memory update",
+            )
         state_embedding = self.encoder_robot_state_input_proj(batch[OBS_STATE])
         if previous_state is None:
             hidden = self._build_zero_visual_prefix_memory_state(
@@ -2108,6 +2239,7 @@ class StreamingACT(nn.Module):
             state_t=state_embedding,
             signature_t=signature_embedding,
             delta_signature_t=delta_signature_embedding,
+            first_frame_anchor_t=first_frame_anchor_embedding,
             valid_t=torch.ones(
                 (visual_embedding.shape[0],),
                 dtype=torch.bool,
@@ -2121,9 +2253,10 @@ class StreamingACT(nn.Module):
             state_t=state_embedding,
             signature_t=signature_embedding,
             delta_signature_t=delta_signature_embedding,
+            first_frame_anchor_t=first_frame_anchor_embedding,
             step_stats=step_stats,
         )
-        return next_state, next_state
+        return next_state, next_state, first_frame_anchor_embedding
 
     def get_deploy_debug_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {
@@ -2146,6 +2279,7 @@ class StreamingACT(nn.Module):
         batch: dict[str, Tensor],
         *,
         visual_prefix_memory_token: Tensor | None = None,
+        visual_prefix_anchor_embedding: Tensor | None = None,
         skip_prefix_sequence_validation: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
@@ -2242,6 +2376,7 @@ class StreamingACT(nn.Module):
             )
             delta_signature_embed = delta_signature_step_embed.unsqueeze(1)  # (B, 1, D)
 
+        anchor_embed = None
         if self.use_first_frame_anchor:
             assert FIRST_FRAME_ANCHOR_KEY in batch, (
                 f"`{FIRST_FRAME_ANCHOR_KEY}` is required when `use_first_frame_anchor=True`."
@@ -2266,6 +2401,7 @@ class StreamingACT(nn.Module):
             anchor_embed = anchor_embed.unsqueeze(1)  # (B, 1, D)
 
         visual_prefix_memory_embed = None
+        first_frame_anchor_step_embed = None
         cached_observation_image_tokens = None
         if self.use_visual_prefix_memory:
             if visual_prefix_memory_token is None:
@@ -2273,6 +2409,7 @@ class StreamingACT(nn.Module):
                     visual_prefix_memory_embed,
                     self._last_visual_prefix_memory_aux_losses,
                     cached_observation_image_tokens,
+                    first_frame_anchor_step_embed,
                 ) = self._compute_visual_prefix_memory_token_from_prefix_sequence(batch)
             else:
                 if visual_prefix_memory_token.ndim != 3:
@@ -2295,6 +2432,16 @@ class StreamingACT(nn.Module):
                     dtype=self.encoder_latent_input_proj.weight.dtype,
                 )
                 self._last_visual_prefix_memory_aux_losses = {}
+                if self.config.use_first_frame_anchor_in_slot_routing:
+                    first_frame_anchor_step_embed = (
+                        self._normalize_first_frame_anchor_embedding(
+                            visual_prefix_anchor_embedding,
+                            batch_size=batch_size,
+                            device=visual_prefix_memory_embed.device,
+                            dtype=visual_prefix_memory_embed.dtype,
+                            context="Visual prefix memory token override",
+                        )
+                    )
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -2398,6 +2545,7 @@ class StreamingACT(nn.Module):
                 state_embedding=current_robot_state_embed,
                 signature_embedding=signature_step_embed,
                 delta_signature_embedding=delta_signature_step_embed,
+                first_frame_anchor_embedding=first_frame_anchor_step_embed,
             )
             # Keep the latent token untouched and modulate the current-step observation tokens.
             encoder_in_tokens = self._apply_visual_prefix_memory_encoder_film(

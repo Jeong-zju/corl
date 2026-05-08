@@ -59,6 +59,7 @@ train:
   slot_memory_identity_scale: 0.5
   slot_memory_routing_temperature: 1.0
   slot_memory_use_delta_routing: true
+  use_first_frame_anchor_in_slot_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
   slot_memory_balance_loss_coef: 0.02

@@ -106,6 +106,12 @@ class StreamingACTConfig(PreTrainedConfig):
             path.
         use_first_frame_anchor: Whether to consume an episode-constant first-frame anchor image
             from `observation.anchor_image` and inject it as one extra encoder memory token.
+        use_first_frame_anchor_in_slot_routing: Whether Signature-Indexed Slot Memory
+            should append an episode-constant first-frame visual anchor embedding to
+            the explicit slot-routing input. During prefix-sequence training this
+            anchor is derived from the first valid prefix image embedding; during
+            online deployment it is cached from the first current-frame image
+            embedding after policy reset.
         use_prefix_sequence_training: Whether to expose episode-prefix sequence tensors
             alongside the current-step observation for future streaming prefix memory updates.
         prefix_train_max_steps: Fixed prefix length budget used by the prefix-sequence
@@ -202,6 +208,7 @@ class StreamingACTConfig(PreTrainedConfig):
 
     # Extra conditioning inputs.
     use_first_frame_anchor: bool = False
+    use_first_frame_anchor_in_slot_routing: bool = False
     use_path_signature: bool = False
     use_prefix_sequence_training: bool = False
     prefix_train_max_steps: int = 32
@@ -373,6 +380,19 @@ class StreamingACTConfig(PreTrainedConfig):
                 raise ValueError(
                     "`slot_memory_consistency_loss_coef` must be >= 0.0. "
                     f"Got {self.slot_memory_consistency_loss_coef}."
+                )
+        if self.use_first_frame_anchor_in_slot_routing:
+            if not self.use_signature_indexed_slot_memory:
+                raise ValueError(
+                    "`use_first_frame_anchor_in_slot_routing=True` requires "
+                    "`use_signature_indexed_slot_memory=True` because the anchor "
+                    "is part of the SISM routing input."
+                )
+            if not self.use_visual_prefix_memory:
+                raise ValueError(
+                    "`use_first_frame_anchor_in_slot_routing=True` requires "
+                    "`use_visual_prefix_memory=True` so the model can derive and "
+                    "cache the first-frame visual anchor."
                 )
         if self.use_signature_conditioned_visual_prefix_memory:
             if not self.use_visual_prefix_memory:

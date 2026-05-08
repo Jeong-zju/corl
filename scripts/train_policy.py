@@ -3677,6 +3677,27 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "slot_memory_use_delta_routing", False
             ),
         )
+        first_frame_anchor_routing_group = parser.add_mutually_exclusive_group()
+        first_frame_anchor_routing_group.add_argument(
+            "--enable-first-frame-anchor-slot-routing",
+            dest="use_first_frame_anchor_in_slot_routing",
+            action="store_true",
+            help=(
+                "Append the episode first-frame visual anchor embedding to the "
+                "SISM routing input."
+            ),
+        )
+        first_frame_anchor_routing_group.add_argument(
+            "--disable-first-frame-anchor-slot-routing",
+            dest="use_first_frame_anchor_in_slot_routing",
+            action="store_false",
+            help="Route SISM slots without the first-frame visual anchor embedding.",
+        )
+        parser.set_defaults(
+            use_first_frame_anchor_in_slot_routing=defaults.get(
+                "use_first_frame_anchor_in_slot_routing", False
+            ),
+        )
         slot_memory_softmax_group = parser.add_mutually_exclusive_group()
         slot_memory_softmax_group.add_argument(
             "--enable-slot-memory-softmax-routing",
@@ -4805,6 +4826,9 @@ def main(argv: list[str] | None = None) -> None:
     slot_memory_use_delta_routing = bool(
         getattr(args, "slot_memory_use_delta_routing", False)
     )
+    use_first_frame_anchor_in_slot_routing = bool(
+        getattr(args, "use_first_frame_anchor_in_slot_routing", False)
+    )
     slot_memory_use_softmax_routing = bool(
         getattr(args, "slot_memory_use_softmax_routing", True)
     )
@@ -4928,6 +4952,9 @@ def main(argv: list[str] | None = None) -> None:
                 use_signature_conditioned_visual_prefix_memory
             ),
             use_signature_indexed_slot_memory=use_signature_indexed_slot_memory,
+            use_first_frame_anchor_in_slot_routing=(
+                use_first_frame_anchor_in_slot_routing
+            ),
             use_memory_conditioned_encoder_film=use_memory_conditioned_encoder_film,
             num_memory_slots=num_memory_slots,
             slot_memory_num_slots=slot_memory_num_slots,
@@ -5396,6 +5423,8 @@ def main(argv: list[str] | None = None) -> None:
                     f"{float(args.slot_memory_routing_temperature)}, "
                     "delta_routing="
                     f"{bool(args.slot_memory_use_delta_routing)}, "
+                    "first_frame_anchor_routing="
+                    f"{bool(args.use_first_frame_anchor_in_slot_routing)}, "
                     "softmax_routing="
                     f"{bool(args.slot_memory_use_softmax_routing)}, "
                     "readout_pooling="

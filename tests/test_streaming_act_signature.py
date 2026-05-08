@@ -204,6 +204,7 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
         prefix_frame_stride=1,
         use_visual_prefix_memory=True,
         use_signature_indexed_slot_memory=True,
+        use_first_frame_anchor_in_slot_routing=True,
         use_memory_conditioned_encoder_film=True,
         slot_memory_num_slots=2,
         slot_memory_use_delta_routing=True,
@@ -260,6 +261,7 @@ def test_streaming_act_signature_indexed_slot_memory_forward_smoke() -> None:
     assert "slot_memory/routing_weight/slot_0" in log_stats
     assert "slot_memory/routing_weight/slot_1" in log_stats
     assert "slot_memory/routing_entropy_normalized" in log_stats
+    assert "slot_memory/first_frame_anchor_norm" in log_stats
 
 
 def _make_minimal_slot_memory_model(
@@ -267,6 +269,7 @@ def _make_minimal_slot_memory_model(
     slot_memory_entropy_loss_coef: float = 0.0,
     slot_memory_consistency_loss_coef: float = 0.0,
     use_memory_conditioned_encoder_film: bool = False,
+    use_first_frame_anchor_in_slot_routing: bool = False,
 ) -> StreamingACT:
     input_features = build_prefix_sequence_input_features(
         base_input_features={
@@ -293,6 +296,7 @@ def _make_minimal_slot_memory_model(
         prefix_train_max_steps=2,
         use_visual_prefix_memory=True,
         use_signature_indexed_slot_memory=True,
+        use_first_frame_anchor_in_slot_routing=use_first_frame_anchor_in_slot_routing,
         slot_memory_num_slots=3,
         slot_memory_use_delta_routing=True,
         slot_memory_entropy_loss_coef=slot_memory_entropy_loss_coef,
@@ -353,6 +357,7 @@ def test_streaming_act_slot_memory_entropy_loss_handles_fp16_zero_routes() -> No
         state_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
         signature_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
         delta_signature_embeddings=torch.zeros(2, 2, 8, dtype=torch.float16),
+        first_frame_anchor_embedding=None,
         prefix_mask=torch.ones(2, 2, dtype=torch.bool),
     )
 
@@ -375,11 +380,38 @@ def test_streaming_act_slot_memory_candidate_update_is_bounded() -> None:
         state_t=torch.zeros(2, 8),
         signature_t=torch.zeros(2, 8),
         delta_signature_t=torch.zeros(2, 8),
+        first_frame_anchor_t=None,
         valid_t=None,
     )
 
     assert step_stats["candidate"].abs().max().item() <= 1.0
     assert next_state.abs().max().item() <= 1.0
+
+
+def test_streaming_act_slot_memory_route_features_include_first_frame_anchor() -> None:
+    model = _make_minimal_slot_memory_model(
+        use_first_frame_anchor_in_slot_routing=True,
+    )
+
+    route_features = model._build_slot_memory_route_features(
+        signature_t=torch.ones(2, 8),
+        delta_signature_t=torch.zeros(2, 8),
+        first_frame_anchor_t=torch.full((2, 8), 2.0),
+        context="test",
+    )
+
+    assert route_features.shape == (2, 24)
+    assert torch.allclose(route_features[:, :8], torch.ones(2, 8))
+    assert torch.allclose(route_features[:, 8:16], torch.zeros(2, 8))
+    assert torch.allclose(route_features[:, 16:], torch.full((2, 8), 2.0))
+
+    with pytest.raises(ValueError, match="first_frame_anchor_t"):
+        model._build_slot_memory_route_features(
+            signature_t=torch.ones(2, 8),
+            delta_signature_t=torch.zeros(2, 8),
+            first_frame_anchor_t=None,
+            context="test",
+        )
 
 
 def test_streaming_act_slot_memory_consistency_loss_is_scale_bounded() -> None:
