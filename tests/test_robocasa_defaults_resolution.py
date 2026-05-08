@@ -21,6 +21,7 @@ from train_policy import (
     drop_dataset_features_from_metadata,
     parse_args,
     resolve_training_dataset_root,
+    validate_pi05_action_quantile_normalization,
 )
 
 
@@ -180,6 +181,51 @@ def test_train_parse_args_uses_pi05_defaults() -> None:
     assert args.pi05_dtype == "bfloat16"
     assert args.pi05_gradient_checkpointing is True
     assert args.pi05_train_expert_only is True
+    assert args.pi05_normalization_mapping == {
+        "VISUAL": "IDENTITY",
+        "STATE": "MEAN_STD",
+        "ACTION": "MEAN_STD",
+    }
+
+
+def test_pi05_quantile_guard_rejects_near_zero_action_quantile_span(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    (dataset_root / "meta").mkdir(parents=True)
+    (dataset_root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "action": {
+                        "dtype": "float32",
+                        "shape": [2],
+                        "names": ["steady_joint", "moving_joint"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (dataset_root / "meta" / "stats.json").write_text(
+        json.dumps(
+            {
+                "action": {
+                    "min": [-0.25, -1.0],
+                    "max": [0.25, 1.0],
+                    "q01": [0.0, -1.0],
+                    "q99": [0.0, 1.0],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class PolicyConfig:
+        normalization_mapping = {"ACTION": "QUANTILES"}
+
+    with pytest.raises(ValueError, match="ACTION QUANTILES normalization is unsafe"):
+        validate_pi05_action_quantile_normalization(dataset_root, PolicyConfig())
 
 
 def test_close_fridge_diffusion_eval_defaults_enable_robocasa_horizon_inference() -> None:

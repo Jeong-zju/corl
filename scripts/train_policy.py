@@ -5,6 +5,7 @@ import bisect
 import datetime as dt
 import inspect
 import json
+import math
 import os
 import re
 import sys
@@ -72,6 +73,7 @@ POLICY_CHOICES = (
 )
 PI05_DEFAULT_POLICY_PATH = "lerobot/pi05_base"
 SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
+PI05_QUANTILE_ACTION_MAX_ABS_NORMALIZED = 10_000.0
 SIGNATURE_FEATURE_KEYS = (
     PATH_SIGNATURE_FEATURE_KEY,
     DELTA_SIGNATURE_FEATURE_KEY,
@@ -2767,6 +2769,129 @@ def coerce_policy_normalization_mapping(value):
     return normalized
 
 
+def _normalization_mapping_key_text(value: object) -> str:
+    enum_value = getattr(value, "value", value)
+    return str(enum_value).strip().upper()
+
+
+def _normalization_mapping_mode_text(value: object | None) -> str:
+    if value is None:
+        return ""
+    enum_name = getattr(value, "name", None)
+    if enum_name:
+        return str(enum_name).strip().upper()
+    enum_value = getattr(value, "value", value)
+    return str(enum_value).strip().upper()
+
+
+def _policy_normalization_mode_text(policy_cfg: object, feature_type: str) -> str:
+    mapping = getattr(policy_cfg, "normalization_mapping", None)
+    if not isinstance(mapping, dict):
+        return ""
+
+    requested_key = str(feature_type).strip().upper()
+    for raw_key, raw_mode in mapping.items():
+        if _normalization_mapping_key_text(raw_key) == requested_key:
+            return _normalization_mapping_mode_text(raw_mode)
+    return ""
+
+
+def _stat_vector(stats: dict, name: str) -> list[float]:
+    value = stats.get(name)
+    if not isinstance(value, list):
+        raise ValueError(f"Expected stats field `{name}` to be a list.")
+    return [float(item) for item in value]
+
+
+def _find_pi05_risky_action_quantile_dims(
+    *,
+    action_stats: dict,
+    action_names: list[str],
+    max_abs_normalized: float,
+) -> list[tuple[int, str, float, float, float, float]]:
+    q01 = _stat_vector(action_stats, "q01")
+    q99 = _stat_vector(action_stats, "q99")
+    min_values = _stat_vector(action_stats, "min")
+    max_values = _stat_vector(action_stats, "max")
+
+    dim_count = min(len(q01), len(q99), len(min_values), len(max_values))
+    risky_dims: list[tuple[int, str, float, float, float, float]] = []
+    for dim in range(dim_count):
+        low = q01[dim]
+        high = q99[dim]
+        span = high - low
+        denom = span if span != 0.0 else 1e-8
+        min_norm = 2.0 * (min_values[dim] - low) / denom - 1.0
+        max_norm = 2.0 * (max_values[dim] - low) / denom - 1.0
+        worst = max(abs(min_norm), abs(max_norm))
+        if not math.isfinite(worst) or worst > max_abs_normalized:
+            name = action_names[dim] if dim < len(action_names) else f"dim_{dim}"
+            risky_dims.append((dim, name, low, high, span, worst))
+    risky_dims.sort(key=lambda item: item[-1], reverse=True)
+    return risky_dims
+
+
+def validate_pi05_action_quantile_normalization(
+    dataset_root: Path,
+    policy_cfg: object,
+    *,
+    max_abs_normalized: float = PI05_QUANTILE_ACTION_MAX_ABS_NORMALIZED,
+) -> None:
+    """Fail early when Pi0.5 action quantile normalization would explode."""
+    if _policy_normalization_mode_text(policy_cfg, "ACTION") != "QUANTILES":
+        return
+
+    if str(os.environ.get("CORL_ALLOW_RISKY_PI05_QUANTILES", "")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+
+    info_path = dataset_root / "meta" / "info.json"
+    stats_path = dataset_root / "meta" / "stats.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+
+    action_stats = stats.get("action")
+    if not isinstance(action_stats, dict):
+        raise ValueError(f"Dataset stats missing `action` in {stats_path}.")
+
+    action_feature = info.get("features", {}).get("action", {})
+    action_names = action_feature.get("names", [])
+    if not isinstance(action_names, list):
+        action_names = []
+
+    risky_dims = _find_pi05_risky_action_quantile_dims(
+        action_stats=action_stats,
+        action_names=[str(name) for name in action_names],
+        max_abs_normalized=float(max_abs_normalized),
+    )
+    if not risky_dims:
+        return
+
+    preview = "\n".join(
+        "  - "
+        f"dim {dim} ({name}): q01={q01:.6g}, q99={q99:.6g}, "
+        f"span={span:.6g}, worst_normalized={worst:.6g}"
+        for dim, name, q01, q99, span, worst in risky_dims[:8]
+    )
+    raise ValueError(
+        "Pi0.5 ACTION QUANTILES normalization is unsafe for this dataset. "
+        "Some action q01/q99 spans are nearly zero, so LeRobot would divide by "
+        "1e-8 and create million-scale normalized actions, which can produce "
+        "1e12-scale flow-matching loss.\n"
+        f"{preview}\n"
+        "Use `normalization_mapping: {VISUAL: IDENTITY, STATE: MEAN_STD, "
+        "ACTION: MEAN_STD}` in the Pi0.5 defaults, or pass "
+        "`--pi05-normalization-mapping='{\"ACTION\":\"MEAN_STD\","
+        "\"STATE\":\"MEAN_STD\",\"VISUAL\":\"IDENTITY\"}'`. "
+        "Set CORL_ALLOW_RISKY_PI05_QUANTILES=1 only if you intentionally want "
+        "to bypass this guard."
+    )
+
+
 def build_pi05_policy_config(
     args: argparse.Namespace,
     *,
@@ -4881,6 +5006,7 @@ def main(argv: list[str] | None = None) -> None:
             input_features_override=input_features_override,
             output_features_override=output_features_override,
         )
+        validate_pi05_action_quantile_normalization(dataset_root, policy_cfg)
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
             PrismDiffusionConfig,
