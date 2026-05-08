@@ -15,6 +15,14 @@ policy:
     left: observation.images.realsense_left
     right: observation.images.realsense_right
     top: observation.images.realsense_top
+  rtc:
+    enabled: true
+    prefix_attention_schedule: linear
+    max_guidance_weight: 10.0
+    execution_horizon: 10
+    inference_delay_steps: null
+    debug: false
+    debug_maxlen: 100
 
 runtime:
   control_hz: 30.0

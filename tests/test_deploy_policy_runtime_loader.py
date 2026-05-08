@@ -18,6 +18,7 @@ from deploy.config import (
     ImageConfig,
     JointNameConfig,
     PolicyConfig,
+    PolicyRTCConfig,
     RosConfig,
     RuntimeConfig,
     TopicConfig,
@@ -58,6 +59,7 @@ def _make_policy_config(**overrides) -> PolicyConfig:
         signature_depth=1,
         signature_dim=None,
         signature_backend="simple",
+        rtc=PolicyRTCConfig(),
     )
     base.update(overrides)
     return PolicyConfig(**base)
@@ -275,6 +277,63 @@ command:
     cfg = load_deploy_config(config_path)
     assert cfg.policy.type == "pi05"
     assert cfg.policy.n_action_steps == 50
+    assert cfg.policy.rtc.enabled is False
+
+
+def test_load_deploy_config_accepts_pi05_rtc_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "deploy.yaml"
+    config_path.write_text(
+        """
+policy:
+  type: pi05
+  path: /tmp/pi05
+  device: cpu
+  load_device: null
+  task: return the book
+  n_action_steps: 50
+  state_dim: 17
+  action_dim: 17
+  arm_dof: 7
+  base_action_dim: 3
+  state_key: observation.state
+  action_key: action
+  image_keys:
+    left: observation.images.left
+    right: observation.images.right
+    top: observation.images.top
+  rtc:
+    enabled: true
+    prefix_attention_schedule: exp
+    max_guidance_weight: 8.0
+    execution_horizon: 12
+    inference_delay_steps: 2
+runtime:
+  control_hz: 30.0
+image:
+  width: 224
+  height: 224
+  color_order: rgb
+ros:
+  node_name: deploy_test
+  queue_size: 1
+command:
+  publish_base: true
+  publish_arms: true
+  max_linear_x: 1.0
+  max_linear_y: 1.0
+  max_angular_z: 1.0
+""",
+        encoding="utf-8",
+    )
+
+    cfg = load_deploy_config(config_path)
+    assert cfg.policy.rtc.enabled is True
+    assert cfg.policy.rtc.prefix_attention_schedule == "exp"
+    assert cfg.policy.rtc.max_guidance_weight == 8.0
+    assert cfg.policy.rtc.execution_horizon == 12
+    assert cfg.policy.rtc.inference_delay_steps == 2
 
 
 def test_missing_vla_dependency_error_names_nested_module() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 import importlib.util
+from collections import deque
 from types import ModuleType
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E
 RTC_POLICY_TYPES = {"pi0", "pi05", "smolvla"}
 VLA_POLICY_TYPES = RTC_POLICY_TYPES
 TEMPORAL_ENSEMBLE_POLICY_TYPES = {"act", "streaming_act"}
+DEPLOY_RTC_POLICY_TYPES = {"pi05", "smolvla"}
 
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
@@ -274,6 +276,42 @@ def apply_deploy_policy_overrides(
     return temporal_ensemble_coeff, temporal_ensemble_enabled
 
 
+def _coerce_rtc_attention_schedule(value: str):
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    normalized = str(value).strip().lower()
+    for member in RTCAttentionSchedule:
+        if member.name.lower() == normalized or str(member.value).lower() == normalized:
+            return member
+    raise ValueError(f"Unsupported RTC prefix attention schedule: {value!r}")
+
+
+def apply_deploy_rtc_overrides(policy_type: str, cfg: Any, deploy_policy: PolicyConfig) -> bool:
+    rtc = deploy_policy.rtc
+    if not rtc.enabled:
+        return False
+    if policy_type not in DEPLOY_RTC_POLICY_TYPES:
+        raise ValueError(
+            f"Deploy RTC is only supported for {sorted(DEPLOY_RTC_POLICY_TYPES)}, "
+            f"got {policy_type!r}."
+        )
+
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    cfg.rtc_config = RTCConfig(
+        enabled=True,
+        prefix_attention_schedule=_coerce_rtc_attention_schedule(
+            rtc.prefix_attention_schedule
+        ),
+        max_guidance_weight=float(rtc.max_guidance_weight),
+        execution_horizon=int(rtc.execution_horizon),
+        debug=bool(rtc.debug),
+        debug_maxlen=int(rtc.debug_maxlen),
+    )
+    cfg.n_action_steps = int(rtc.execution_horizon)
+    return True
+
+
 def _resolve_training_dataset_root(policy_dir: Path) -> Path | None:
     split_path = find_dataset_split_file(policy_dir)
     if split_path is None:
@@ -370,6 +408,10 @@ class PolicyRuntime:
         self.temporal_ensemble_enabled = self.temporal_ensemble_coeff != 0.0
         self.action_smoothing_enabled = False
         self._smoothed_action: np.ndarray | None = None
+        self.rtc_enabled = False
+        self._rtc_action_queue: deque[np.ndarray] = deque()
+        self._rtc_prev_chunk_left_over = None
+        self._rtc_last_inference_delay_steps = 0
 
     def load(self) -> None:
         policy_path = self.deploy_config.policy.path
@@ -424,6 +466,11 @@ class PolicyRuntime:
             cfg,
             self.deploy_config.policy,
         )
+        self.rtc_enabled = apply_deploy_rtc_overrides(
+            policy_type,
+            cfg,
+            self.deploy_config.policy,
+        )
 
         load_device = (
             self.deploy_config.policy.load_device or self.deploy_config.policy.device
@@ -446,6 +493,11 @@ class PolicyRuntime:
             cfg,
             self.deploy_config.policy,
         )
+        self.rtc_enabled = apply_deploy_rtc_overrides(
+            policy_type,
+            cfg,
+            self.deploy_config.policy,
+        )
         self.action_smoothing_enabled = False
 
         if hasattr(policy, "to"):
@@ -454,6 +506,7 @@ class PolicyRuntime:
         if hasattr(policy, "reset"):
             policy.reset()
         self._smoothed_action = None
+        self._reset_rtc_state()
 
         preprocessor_overrides = {
             "device_processor": {"device": self.deploy_config.policy.device},
@@ -498,6 +551,7 @@ class PolicyRuntime:
 
     def reset(self) -> None:
         self._smoothed_action = None
+        self._reset_rtc_state()
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
         if self.gripper_hysteresis is not None:
@@ -505,6 +559,15 @@ class PolicyRuntime:
 
     @property
     def execution_summary(self) -> str:
+        if self.rtc_enabled:
+            rtc = self.deploy_config.policy.rtc
+            return (
+                "rtc("
+                f"execution_horizon={rtc.execution_horizon}, "
+                f"schedule={rtc.prefix_attention_schedule}, "
+                f"max_guidance_weight={rtc.max_guidance_weight:g}"
+                ")"
+            )
         if self.temporal_ensemble_enabled:
             return f"temporal_ensemble(coeff={self.temporal_ensemble_coeff:g})"
         if self.action_smoothing_enabled:
@@ -515,6 +578,11 @@ class PolicyRuntime:
             else int(getattr(self.cfg, "n_action_steps", 1))
         )
         return f"open_loop(n_action_steps={n_action_steps})"
+
+    def _reset_rtc_state(self) -> None:
+        self._rtc_action_queue.clear()
+        self._rtc_prev_chunk_left_over = None
+        self._rtc_last_inference_delay_steps = 0
 
     @staticmethod
     def _debug_to_numpy(value: Any) -> Any:
@@ -587,6 +655,72 @@ class PolicyRuntime:
         action = predicted_action.detach().cpu().numpy().reshape(-1).astype(np.float32)
         return action, float(runtime_ms)
 
+    def _resolve_rtc_inference_delay_steps(self) -> int:
+        configured = self.deploy_config.policy.rtc.inference_delay_steps
+        if configured is not None:
+            return int(configured)
+        return int(max(0, self._rtc_last_inference_delay_steps))
+
+    def _record_rtc_runtime(self, runtime_ms: float) -> None:
+        period_ms = 1000.0 / float(self.deploy_config.runtime.control_hz)
+        if period_ms <= 0.0:
+            self._rtc_last_inference_delay_steps = 0
+            return
+        self._rtc_last_inference_delay_steps = int(max(0, np.ceil(runtime_ms / period_ms)))
+
+    def _run_rtc_predict_action(
+        self,
+        obs: dict[str, Any],
+    ) -> tuple[np.ndarray, float]:
+        if self._rtc_action_queue:
+            return self._rtc_action_queue.popleft(), 0.0
+
+        execution_horizon = int(self.deploy_config.policy.rtc.execution_horizon)
+        inference_delay = self._resolve_rtc_inference_delay_steps()
+
+        start_s = time.perf_counter()
+        normalized_chunk = self.policy.predict_action_chunk(
+            obs,
+            prev_chunk_left_over=self._rtc_prev_chunk_left_over,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+        )
+        runtime_ms = (time.perf_counter() - start_s) * 1000.0
+        self._record_rtc_runtime(runtime_ms)
+
+        if normalized_chunk.ndim != 3:
+            raise RuntimeError(
+                "RTC predict_action_chunk must return shape (B, T, action_dim), "
+                f"got {tuple(normalized_chunk.shape)}."
+            )
+
+        # Keep the still-normalized leftover for the next RTC planning call.
+        self._rtc_prev_chunk_left_over = normalized_chunk[
+            :,
+            min(execution_horizon, normalized_chunk.shape[1]) :,
+            :,
+        ].detach()
+
+        predicted_chunk = self.postprocessor(normalized_chunk)
+        chunk_np = (
+            predicted_chunk.detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+        if chunk_np.ndim == 3:
+            chunk_np = chunk_np[0]
+        elif chunk_np.ndim != 2:
+            raise RuntimeError(
+                "RTC postprocessed action chunk must have shape (T, action_dim) "
+                f"or (B, T, action_dim), got {chunk_np.shape}."
+            )
+
+        num_actions = min(execution_horizon, chunk_np.shape[0])
+        for action in chunk_np[:num_actions]:
+            self._rtc_action_queue.append(np.asarray(action, dtype=np.float32).reshape(-1))
+
+        if not self._rtc_action_queue:
+            raise RuntimeError("RTC action chunk was empty.")
+        return self._rtc_action_queue.popleft(), float(runtime_ms)
+
     def _build_inference_result(
         self,
         *,
@@ -621,13 +755,19 @@ class PolicyRuntime:
 
         obs_seq = int(observation_packet.get("seq", 0))
         obs = self._preprocess_observation(observation_packet)
-        action, runtime_ms = self._run_select_action(obs)
+        if self.rtc_enabled:
+            action, runtime_ms = self._run_rtc_predict_action(obs)
+        else:
+            action, runtime_ms = self._run_select_action(obs)
         return self._build_inference_result(
             action=action,
             observation_packet=observation_packet,
             runtime_ms=runtime_ms,
             obs_seq=obs_seq,
             message=(
+                "rtc"
+                if self.rtc_enabled
+                else
                 "temporal_ensemble"
                 if self.temporal_ensemble_enabled
                 else "policy_eval"

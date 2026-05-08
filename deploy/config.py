@@ -13,6 +13,17 @@ from gripper_hysteresis import (
 
 
 @dataclass(frozen=True)
+class PolicyRTCConfig:
+    enabled: bool = False
+    prefix_attention_schedule: str = "linear"
+    max_guidance_weight: float = 10.0
+    execution_horizon: int = 10
+    inference_delay_steps: int | None = None
+    debug: bool = False
+    debug_maxlen: int = 100
+
+
+@dataclass(frozen=True)
 class PolicyConfig:
     type: str
     path: Path | None
@@ -33,6 +44,7 @@ class PolicyConfig:
     signature_depth: int
     signature_dim: int | None
     signature_backend: str
+    rtc: PolicyRTCConfig = field(default_factory=PolicyRTCConfig)
 
 
 @dataclass(frozen=True)
@@ -156,8 +168,8 @@ _POLICY_ALLOWED_KEYS_BY_TYPE = {
     "act": _POLICY_COMMON_KEYS | {"temporal_ensemble_coeff"},
     "streaming_act": _POLICY_COMMON_KEYS | _POLICY_STREAMING_SIGNATURE_KEYS,
     "pi0": _POLICY_COMMON_KEYS,
-    "pi05": _POLICY_COMMON_KEYS,
-    "smolvla": _POLICY_COMMON_KEYS,
+    "pi05": _POLICY_COMMON_KEYS | {"rtc"},
+    "smolvla": _POLICY_COMMON_KEYS | {"rtc"},
 }
 
 
@@ -216,6 +228,68 @@ def _parse_non_negative_int(data: dict[str, object], *, key: str) -> int:
     if value < 0:
         raise ValueError(f"`{key}` must be >= 0, got {value}.")
     return value
+
+
+def _parse_optional_non_negative_int(
+    data: dict[str, object],
+    *,
+    key: str,
+) -> int | None:
+    if key not in data or data[key] in {None, "", "null"}:
+        return None
+    value = int(data[key])
+    if value < 0:
+        raise ValueError(f"`{key}` must be >= 0, got {value}.")
+    return value
+
+
+def parse_policy_rtc_config(
+    raw: dict[str, object] | None,
+    *,
+    policy_type: str,
+) -> PolicyRTCConfig:
+    data = dict(raw or {})
+    enabled = bool(data.get("enabled", False))
+    if enabled and policy_type not in {"pi05", "smolvla"}:
+        raise ValueError(
+            f"`policy.rtc.enabled` is only supported for 'pi05' and 'smolvla', got {policy_type!r}."
+        )
+
+    execution_horizon = int(data.get("execution_horizon", 10))
+    if execution_horizon <= 0:
+        raise ValueError(
+            f"`policy.rtc.execution_horizon` must be > 0, got {execution_horizon}."
+        )
+    max_guidance_weight = float(data.get("max_guidance_weight", 10.0))
+    if max_guidance_weight <= 0.0 or not math.isfinite(max_guidance_weight):
+        raise ValueError(
+            "`policy.rtc.max_guidance_weight` must be finite and > 0, "
+            f"got {max_guidance_weight}."
+        )
+    debug_maxlen = int(data.get("debug_maxlen", 100))
+    if debug_maxlen <= 0:
+        raise ValueError(f"`policy.rtc.debug_maxlen` must be > 0, got {debug_maxlen}.")
+
+    schedule = str(data.get("prefix_attention_schedule", "linear")).strip().lower()
+    if schedule not in {"linear", "exp", "zeros", "ones"}:
+        raise ValueError(
+            "`policy.rtc.prefix_attention_schedule` must be one of "
+            "`linear`, `exp`, `zeros`, `ones`, got "
+            f"{schedule!r}."
+        )
+
+    return PolicyRTCConfig(
+        enabled=enabled,
+        prefix_attention_schedule=schedule,
+        max_guidance_weight=max_guidance_weight,
+        execution_horizon=execution_horizon,
+        inference_delay_steps=_parse_optional_non_negative_int(
+            data,
+            key="inference_delay_steps",
+        ),
+        debug=bool(data.get("debug", False)),
+        debug_maxlen=debug_maxlen,
+    )
 
 
 def _validate_policy_config_keys(policy_type: str, policy_raw: dict[str, object]) -> None:
@@ -311,6 +385,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
     policy_raw = _as_mapping(raw, "policy")
     policy_type = str(policy_raw.get("type", "act"))
     _validate_policy_config_keys(policy_type, policy_raw)
+    rtc = parse_policy_rtc_config(_as_mapping(policy_raw, "rtc"), policy_type=policy_type)
     use_streaming_signatures = policy_type == "streaming_act"
     runtime_raw = _as_mapping(raw, "runtime")
     debug_raw = _as_mapping(raw, "debug")
@@ -374,6 +449,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
             if use_streaming_signatures
             else "disabled"
         ),
+        rtc=rtc,
     )
 
     runtime = RuntimeConfig(
