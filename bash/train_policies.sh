@@ -66,14 +66,6 @@ trim() {
   printf "%s" "${value}"
 }
 
-sanitize_component() {
-  local value="$1"
-  value="${value//\//_}"
-  value="${value//:/_}"
-  value="${value// /_}"
-  printf "%s" "${value}"
-}
-
 format_cmd() {
   local rendered
   rendered="$(printf "%q " "$@")"
@@ -182,14 +174,7 @@ run_one() {
   local target_value="$2"
   local policy="$3"
   local run_index="$4"
-  local batch_stamp="$5"
 
-  local target_slug
-  target_slug="$(sanitize_component "${target_value}")"
-  local policy_slug
-  policy_slug="$(sanitize_component "${policy}")"
-
-  local run_stamp="${batch_stamp}_${run_index}_${target_slug}_${policy_slug}"
   local cmd=(
     bash bash/train_policy.sh
     "--${target_kind}" "${target_value}"
@@ -201,14 +186,13 @@ run_one() {
   fi
 
   log "Run ${run_index}: ${target_kind}=${target_value}, policy=${policy}"
-  log "Run stamp: ${run_stamp}"
   log "Command: $(format_cmd "${cmd[@]}")"
 
   if ((DRY_RUN)); then
     return 0
   fi
 
-  if ! CORL_TRAIN_RUN_STAMP="${run_stamp}" "${cmd[@]}"; then
+  if ! "${cmd[@]}"; then
     die "Training failed for ${target_kind}=${target_value}, policy=${policy}."
   fi
 }
@@ -227,8 +211,6 @@ main() {
     warn "Dry run enabled; no training command will be executed."
   fi
 
-  local batch_stamp="${CORL_TRAIN_RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
-
   local targets=()
   if [[ "${TARGET_KIND}" == "dataset" ]]; then
     targets=("${DATASETS[@]}")
@@ -243,7 +225,7 @@ main() {
   for target in "${targets[@]}"; do
     for policy in "${POLICIES[@]}"; do
       ((++run_index))
-      run_one "${TARGET_KIND}" "${target}" "${policy}" "${run_index}" "${batch_stamp}"
+      run_one "${TARGET_KIND}" "${target}" "${policy}" "${run_index}"
     done
   done
 }
