@@ -17,10 +17,10 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 主要可调项都在 YAML 里：
 
 - `policy.path`：checkpoint 路径，按当前 YAML 文件的相对路径解析；也可以直接写训练输出根目录，deploy 会自动解析最新 run
-- `policy.type`：支持 `act`、`streaming_act`、`smolvla`
-- `policy.task`：SmolVLA 的语言指令；部署 VLA policy 时必须填写
+- `policy.type`：支持 `act`、`streaming_act`、`pi0`、`pi05`、`smolvla`
+- `policy.task`：Pi0 / Pi0.5 / SmolVLA 的语言指令；部署 VLA policy 时必须填写
 - `policy.device`：推理设备
-- `policy.temporal_ensemble_coeff`：`0` 表示按 `n_action_steps` 开环执行；非 `0` 时，如果策略 config 自带 `temporal_ensemble_coeff`，deploy 会每步推理并按该系数做 temporal ensemble，同时强制 `n_action_steps=1`
+- `policy.temporal_ensemble_coeff`：只对 `act` / `streaming_act` 生效。`0` 表示按 `n_action_steps` 开环执行；非 `0` 时，deploy 会每步推理并按该系数做 temporal ensemble，同时强制 `n_action_steps=1`
 - `ros.topics.*`：订阅/发布话题
 - `runtime.control_hz`：推理控制频率
 - `ros.joint_names_left.name` / `ros.joint_names_right.name`
@@ -42,9 +42,9 @@ python3 main/deploy/ros1_adapter/ros1_adapter_node.py \
 - 如果你的 checkpoint 依赖 `path_signature` / `delta_signature`，node 现在会优先按 checkpoint 真实配置自动开启在线 signature 计算，不再要求你在 deploy YAML 里手工保持一致。
 - 如果 checkpoint 把 signature 特征标记成 `pre_normalized_observation_keys`，deploy 会自动从训练 run 关联的数据集 `meta/stats.json` 读取统计量，对在线 `path_signature` / `delta_signature` 做同样的归一化；为了抑制真实机器人噪声在零方差维度上的放大，归一化前还会先裁到训练数据的 `min/max` 支持范围内。
 - 对 `streaming_act` 的 PRISM 变体，在线部署走的是“当前帧 + 在线 visual prefix memory / slot memory 更新”路径，不需要每步重建显式 prefix sequence tensor。
-- 对 `smolvla`，deploy 会把 YAML 里的 `policy.task` 随每帧 observation 送入 LeRobot processor；`policy.temporal_ensemble_coeff` 应保持 `0`，由策略预测 action chunk 后按 `n_action_steps` 开环消费。
+- 对 `pi0` / `pi05` / `smolvla`，deploy 走 Real-Time Chunking 路径：`policy.task` 会随每帧 observation 送入 LeRobot processor，动作按 `n_action_steps` 进行 chunk 消费，且不支持 `temporal_ensemble_coeff`。
 - 如果图像颜色和训练时不一致，优先改 YAML 里的 `image.color_order`。
-- `policy.temporal_ensemble_coeff=0` 时，deploy 会缓存一段 action chunk 并开环消费；`!=0` 时，ACT / Streaming ACT / SmolVLA 会每个控制周期重新推理并使用 temporal ensemble。
+- `policy.temporal_ensemble_coeff=0` 时，`act` / `streaming_act` 会缓存一段 action chunk 并开环消费；`!=0` 时，这两类 policy 会每个控制周期重新推理并使用 temporal ensemble。
 
 视觉调试：
 
