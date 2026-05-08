@@ -315,13 +315,14 @@ def _parse_config_with_class(
     return cfg, dropped_fields
 
 
-def load_streaming_act_config_from_pretrained_dir(
+def load_pretrained_config_from_pretrained_dir(
+    config_cls,
     policy_dir: Path,
     *,
-    repo_root: Path | None = None,
+    config_filename: str = "config.json",
+    policy_label: str = "policy",
 ):
-    config_cls, _ = _ensure_local_streaming_act_modules(repo_root=repo_root)
-    config_path = Path(policy_dir) / "config.json"
+    config_path = Path(policy_dir) / config_filename
     if not config_path.exists():
         raise FileNotFoundError(f"Policy config not found: {config_path}")
 
@@ -342,11 +343,25 @@ def load_streaming_act_config_from_pretrained_dir(
             raise exc
 
         LOGGER.warning(
-            "Ignored unsupported Streaming ACT config fields while loading %s: %s",
+            "Ignored unsupported %s config fields while loading %s: %s",
+            policy_label,
             config_path,
             ", ".join(dropped_fields),
         )
         return fallback_cfg
+
+
+def load_streaming_act_config_from_pretrained_dir(
+    policy_dir: Path,
+    *,
+    repo_root: Path | None = None,
+):
+    config_cls, _ = _ensure_local_streaming_act_modules(repo_root=repo_root)
+    return load_pretrained_config_from_pretrained_dir(
+        config_cls,
+        policy_dir,
+        policy_label="Streaming ACT",
+    )
 
 
 def find_latest_run_dir(train_root: Path) -> Path | None:

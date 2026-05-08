@@ -244,6 +244,11 @@ def test_policy_runtime_load_quiets_transformers_loading_warnings(
     )
     monkeypatch.setattr(
         loader,
+        "load_pretrained_config_from_pretrained_dir",
+        lambda config_cls, policy_dir, policy_label="policy": dummy_cfg,
+    )
+    monkeypatch.setattr(
+        loader,
         "resolve_policy_dir",
         lambda policy_path: Path("/tmp/fake_policy"),
     )

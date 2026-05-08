@@ -35,6 +35,7 @@ ensure_runtime_paths()
 from eval_helpers import (  # noqa: E402
     import_local_streaming_act_policy_class,
     load_streaming_act_config_from_pretrained_dir,
+    load_pretrained_config_from_pretrained_dir,
     resolve_policy_dir,
     quiet_transformers_loading,
 )
@@ -362,9 +363,11 @@ class PolicyRuntime:
         if policy_type == "streaming_act":
             cfg = load_streaming_act_config_from_pretrained_dir(self.policy_dir)
         else:
-            cfg = PreTrainedConfig.from_pretrained(
+            policy_label = "ACT" if policy_type == "act" else "SmolVLA"
+            cfg = load_pretrained_config_from_pretrained_dir(
+                PreTrainedConfig,
                 self.policy_dir,
-                local_files_only=local_files_only,
+                policy_label=policy_label,
             )
         (
             self.temporal_ensemble_coeff,
