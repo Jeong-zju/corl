@@ -4,10 +4,18 @@ import importlib
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 
 from policy_imports import ensure_lerobot_policy_imports
+
+
+def _clear_lerobot_modules() -> None:
+    for module_name in tuple(sys.modules):
+        if module_name == "lerobot" or module_name.startswith("lerobot."):
+            sys.modules.pop(module_name, None)
 
 
 def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
@@ -45,9 +53,7 @@ def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
         encoding="utf-8",
     )
 
-    for module_name in tuple(sys.modules):
-        if module_name == "lerobot" or module_name.startswith("lerobot."):
-            sys.modules.pop(module_name, None)
+    _clear_lerobot_modules()
     monkeypatch.syspath_prepend(str(tmp_path))
 
     try:
@@ -65,6 +71,101 @@ def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
         assert pi05_config.VALUE == "pi05_config"
         assert rtc_config.VALUE == "rtc_config"
     finally:
-        for module_name in tuple(sys.modules):
-            if module_name == "lerobot" or module_name.startswith("lerobot."):
-                sys.modules.pop(module_name, None)
+        _clear_lerobot_modules()
+
+
+def test_pi05_imports_register_processor_and_patch_checkpoint_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "lerobot" / "policies"
+    (package_root / "groot").mkdir(parents=True)
+    (package_root / "pi05").mkdir(parents=True)
+    (package_root / "rtc").mkdir(parents=True)
+    (tmp_path / "lerobot" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "lerobot" / "processor.py").write_text(
+        """
+class ProcessorStepRegistry:
+    _registry = {}
+
+    @classmethod
+    def register(cls, name):
+        def decorator(step_cls):
+            cls._registry[name] = step_cls
+            return step_cls
+        return decorator
+
+    @classmethod
+    def get(cls, name):
+        return cls._registry[name]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "groot" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "pi05" / "__init__.py").write_text(
+        "raise RuntimeError('pi05 package init imported')\n",
+        encoding="utf-8",
+    )
+    (package_root / "pi05" / "processor_pi05.py").write_text(
+        """
+from lerobot.processor import ProcessorStepRegistry
+
+@ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
+class Pi05PrepareStateTokenizerProcessorStep:
+    pass
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package_root / "pi05" / "modeling_pi05.py").write_text(
+        """
+import logging
+
+class PI05Policy:
+    def _fix_pytorch_state_dict_keys(self, state_dict, model_config):
+        for key in state_dict:
+            if "patch_embedding" in key:
+                logging.warning("Vision embedding key might need handling: %s", key)
+        return dict(state_dict)
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package_root / "rtc" / "__init__.py").write_text("", encoding="utf-8")
+
+    _clear_lerobot_modules()
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    try:
+        ensure_lerobot_policy_imports("pi05")
+
+        from lerobot.processor import ProcessorStepRegistry
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+        assert (
+            ProcessorStepRegistry.get(
+                "pi05_prepare_state_tokenizer_processor_step"
+            ).__name__
+            == "Pi05PrepareStateTokenizerProcessorStep"
+        )
+        assert PI05Policy._corl_pi05_checkpoint_compatibility_patch is True
+
+        old_key = (
+            "paligemma_with_expert.paligemma.model.vision_tower.vision_model."
+            "embeddings.patch_embedding.weight"
+        )
+        fixed_state_dict = PI05Policy()._fix_pytorch_state_dict_keys(
+            {old_key: object()},
+            model_config=None,
+        )
+
+        assert old_key not in fixed_state_dict
+        assert (
+            "paligemma_with_expert.paligemma.model.vision_tower."
+            "embeddings.patch_embedding.weight"
+            in fixed_state_dict
+        )
+    finally:
+        _clear_lerobot_modules()

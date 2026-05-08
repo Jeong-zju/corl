@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -103,6 +104,67 @@ def install_lerobot_policy_subpackage_shim_by_name(package_name: str) -> None:
         setattr(parent, package_name, module)
 
 
+def _remap_pi05_vision_tower_state_dict_keys(
+    state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Bridge PI05 checkpoints saved with HF's nested SigLIP vision module key."""
+    fixed_state_dict: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        new_key = key.replace("vision_tower.vision_model.", "vision_tower.")
+        if new_key != key and new_key in fixed_state_dict:
+            logging.warning(
+                "Skipping PI05 checkpoint key %s because remapped key %s already exists.",
+                key,
+                new_key,
+            )
+            continue
+        fixed_state_dict[new_key] = value
+    return fixed_state_dict
+
+
+class _SuppressPI05VisionEmbeddingWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith(
+            "Vision embedding key might need handling:"
+        )
+
+
+def install_pi05_checkpoint_compatibility_patch() -> None:
+    """Patch LeRobot 0.5.x PI05 checkpoint loading for current pi05_base keys."""
+    try:
+        modeling_pi05 = importlib.import_module("lerobot.policies.pi05.modeling_pi05")
+    except ModuleNotFoundError as exc:
+        if exc.name != "lerobot.policies.pi05.modeling_pi05":
+            raise
+        return
+
+    policy_cls = getattr(modeling_pi05, "PI05Policy", None)
+    if policy_cls is None or getattr(
+        policy_cls, "_corl_pi05_checkpoint_compatibility_patch", False
+    ):
+        return
+
+    original_fix_keys = getattr(policy_cls, "_fix_pytorch_state_dict_keys", None)
+    if original_fix_keys is None:
+        return
+
+    def _fix_pytorch_state_dict_keys_with_pi05_compat(self, state_dict, model_config):
+        state_dict = _remap_pi05_vision_tower_state_dict_keys(dict(state_dict))
+        root_logger = logging.getLogger()
+        warning_filter = _SuppressPI05VisionEmbeddingWarning()
+        root_logger.addFilter(warning_filter)
+        try:
+            fixed_state_dict = original_fix_keys(self, state_dict, model_config)
+        finally:
+            root_logger.removeFilter(warning_filter)
+        return _remap_pi05_vision_tower_state_dict_keys(dict(fixed_state_dict))
+
+    policy_cls._fix_pytorch_state_dict_keys = (
+        _fix_pytorch_state_dict_keys_with_pi05_compat
+    )
+    policy_cls._corl_pi05_checkpoint_compatibility_patch = True
+
+
 def ensure_lerobot_policy_imports(policy_type: str) -> None:
     """Install namespace shims for the active policy's LeRobot imports."""
     install_lerobot_policies_namespace_shim()
@@ -121,6 +183,11 @@ def ensure_lerobot_policy_imports(policy_type: str) -> None:
     # __init__ imports, so load the module explicitly to register that step.
     if policy_type == "smolvla":
         importlib.import_module("lerobot.policies.smolvla.processor_smolvla")
+    elif policy_type == "pi05":
+        # PI05's pretrained processor pipeline and pi05_base checkpoint both
+        # need side effects that would normally happen through package imports.
+        importlib.import_module("lerobot.policies.pi05.processor_pi05")
+        install_pi05_checkpoint_compatibility_patch()
 
 
 def import_lerobot_policy_submodule(policy_type: str, module_name: str):
@@ -242,6 +309,7 @@ __all__ = [
     "import_lerobot_policy_config_class",
     "install_lerobot_policies_namespace_shim",
     "install_lerobot_policy_subpackage_shim_by_name",
+    "install_pi05_checkpoint_compatibility_patch",
     "make_standard_pre_post_processors",
     "resolve_lerobot_policies_path",
 ]
