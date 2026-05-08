@@ -157,6 +157,31 @@ def test_train_parse_args_uses_smolvla_defaults() -> None:
     assert args.smolvla_freeze_vision_encoder is True
 
 
+def test_train_parse_args_uses_pi05_defaults() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "zeno-ai/DailyLaundryOrganization",
+            "--policy",
+            "pi05",
+        ]
+    )
+
+    assert args._policy_defaults_dataset_root == "data/zeno-ai/DailyLaundryOrganization"
+    assert args._policy_defaults_dataset_repo_id == "zeno-ai/DailyLaundryOrganization"
+    assert args.output_root.as_posix() == (
+        "outputs/train/zeno-ai/DailyLaundryOrganization/pi05"
+    )
+    assert args.policy_path == "lerobot/pi05_base"
+    assert args.n_obs_steps == 1
+    assert args.chunk_size == 50
+    assert args.n_action_steps == 50
+    assert args.batch_size == 1
+    assert args.pi05_dtype == "bfloat16"
+    assert args.pi05_gradient_checkpointing is True
+    assert args.pi05_train_expert_only is True
+
+
 def test_close_fridge_diffusion_eval_defaults_enable_robocasa_horizon_inference() -> None:
     defaults, defaults_path = load_policy_mode_defaults_for_dataset(
         mode="eval",

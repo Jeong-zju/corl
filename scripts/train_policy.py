@@ -65,10 +65,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 POLICY_CHOICES = (
     "act",
     "diffusion",
+    "pi05",
     "prism_diffusion",
     "streaming_act",
     "smolvla",
 )
+PI05_DEFAULT_POLICY_PATH = "lerobot/pi05_base"
 SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
 SIGNATURE_FEATURE_KEYS = (
     PATH_SIGNATURE_FEATURE_KEY,
@@ -2661,12 +2663,40 @@ def parse_int_pair(value: str) -> tuple[int, int]:
     )
 
 
+def parse_pi05_image_resolution(value: str) -> tuple[int, int]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--pi05-image-resolution",
+        item_type=int,
+    )
+
+
 def parse_float_pair(value: str) -> tuple[float, float]:
     return _parse_numeric_pair(
         value,
         option_name="--smolvla-optimizer-betas",
         item_type=float,
     )
+
+
+def parse_pi05_optimizer_betas(value: str) -> tuple[float, float]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--pi05-optimizer-betas",
+        item_type=float,
+    )
+
+
+def parse_json_mapping(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected a JSON object, got {value!r}."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(f"Expected a JSON object, got {value!r}.")
+    return parsed
 
 
 
@@ -2701,6 +2731,110 @@ def apply_policy_pretrained_path(
     pretrained_path = optional_pretrained_path(policy_path_value)
     if pretrained_path is not None:
         policy_cfg.pretrained_path = pretrained_path
+
+
+def coerce_policy_normalization_mapping(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = parse_json_mapping(value)
+    if not isinstance(value, dict):
+        raise ValueError(
+            "`normalization_mapping` must be a mapping such as "
+            '{"ACTION": "QUANTILES", "STATE": "QUANTILES", "VISUAL": "IDENTITY"}.'
+        )
+
+    from lerobot.configs.types import NormalizationMode
+
+    normalized = {}
+    for raw_key, raw_mode in value.items():
+        key = str(raw_key).strip().upper()
+        if not key:
+            raise ValueError(f"Invalid empty normalization mapping key in {value!r}.")
+        if isinstance(raw_mode, NormalizationMode):
+            normalized[key] = raw_mode
+            continue
+        mode_text = str(raw_mode).strip().upper()
+        try:
+            normalized[key] = NormalizationMode[mode_text]
+        except KeyError:
+            try:
+                normalized[key] = NormalizationMode(mode_text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid normalization mode {raw_mode!r} for {key!r}."
+                ) from exc
+    return normalized
+
+
+def build_pi05_policy_config(
+    args: argparse.Namespace,
+    *,
+    input_features_override,
+    output_features_override,
+):
+    PI05Config = import_lerobot_policy_config_class("pi05")
+    image_resolution = tuple(
+        coerce_numeric_pair(
+            args.pi05_image_resolution,
+            option_name="--pi05-image-resolution",
+            item_type=int,
+        )
+    )
+    optimizer_betas = tuple(
+        coerce_numeric_pair(
+            args.pi05_optimizer_betas,
+            option_name="--pi05-optimizer-betas",
+            item_type=float,
+        )
+    )
+    config_kwargs = {
+        "device": args.device,
+        "use_amp": bool(args.use_amp),
+        "push_to_hub": False,
+        "input_features": input_features_override,
+        "output_features": output_features_override,
+        "n_obs_steps": int(args.n_obs_steps),
+        "chunk_size": int(args.chunk_size),
+        "n_action_steps": int(args.n_action_steps),
+        "paligemma_variant": str(args.pi05_pali_gemma_variant),
+        "action_expert_variant": str(args.pi05_action_expert_variant),
+        "dtype": str(args.pi05_dtype),
+        "max_state_dim": int(args.pi05_max_state_dim),
+        "max_action_dim": int(args.pi05_max_action_dim),
+        "num_inference_steps": int(args.pi05_num_inference_steps),
+        "time_sampling_beta_alpha": float(args.pi05_time_sampling_beta_alpha),
+        "time_sampling_beta_beta": float(args.pi05_time_sampling_beta_beta),
+        "time_sampling_scale": float(args.pi05_time_sampling_scale),
+        "time_sampling_offset": float(args.pi05_time_sampling_offset),
+        "min_period": float(args.pi05_min_period),
+        "max_period": float(args.pi05_max_period),
+        "image_resolution": image_resolution,
+        "empty_cameras": int(args.pi05_empty_cameras),
+        "tokenizer_max_length": int(args.pi05_tokenizer_max_length),
+        "gradient_checkpointing": bool(args.pi05_gradient_checkpointing),
+        "compile_model": bool(args.pi05_compile_model),
+        "compile_mode": str(args.pi05_compile_mode),
+        "freeze_vision_encoder": bool(args.pi05_freeze_vision_encoder),
+        "train_expert_only": bool(args.pi05_train_expert_only),
+        "optimizer_lr": float(args.pi05_optimizer_lr),
+        "optimizer_betas": optimizer_betas,
+        "optimizer_eps": float(args.pi05_optimizer_eps),
+        "optimizer_weight_decay": float(args.pi05_optimizer_weight_decay),
+        "optimizer_grad_clip_norm": float(args.pi05_optimizer_grad_clip_norm),
+        "scheduler_warmup_steps": int(args.pi05_scheduler_warmup_steps),
+        "scheduler_decay_steps": int(args.pi05_scheduler_decay_steps),
+        "scheduler_decay_lr": float(args.pi05_scheduler_decay_lr),
+    }
+    normalization_mapping = coerce_policy_normalization_mapping(
+        getattr(args, "pi05_normalization_mapping", None)
+    )
+    if normalization_mapping is not None:
+        config_kwargs["normalization_mapping"] = normalization_mapping
+
+    policy_cfg = PI05Config(**config_kwargs)
+    apply_policy_pretrained_path(policy_cfg, getattr(args, "policy_path", None))
+    return policy_cfg
 
 
 def build_smolvla_policy_config(
@@ -2789,8 +2923,8 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train LeRobot ACT, Diffusion, PRISM Diffusion, Streaming ACT, "
-            "SmolVLA on a local LeRobot dataset."
+            "Train LeRobot ACT, Diffusion, Pi0.5, PRISM Diffusion, "
+            "Streaming ACT, SmolVLA on a local LeRobot dataset."
         )
     )
     parser.add_argument(
@@ -3105,7 +3239,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--n-action-steps",
         type=int,
-        default=defaults.get("n_action_steps", 1),
+        default=defaults.get(
+            "n_action_steps",
+            50 if known_args.policy in {"pi05", "smolvla"} else 1,
+        ),
         help=(
             "Number of predicted actions executed before querying the policy again. "
             "Set to 1 for per-step replanning."
@@ -3113,15 +3250,16 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     )
     if known_args.policy in {
         "diffusion",
+        "pi05",
         "prism_diffusion",
         "smolvla",
-        }:
+    }:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
             default=defaults.get(
                 "n_obs_steps",
-                1 if known_args.policy == "smolvla" else 2,
+                1 if known_args.policy in {"pi05", "smolvla"} else 2,
             ),
             help=(
                 "Number of observation steps passed to the policy "
@@ -3152,7 +3290,10 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         parser.add_argument(
             "--chunk-size",
             type=int,
-            default=defaults.get("chunk_size", 5),
+            default=defaults.get(
+                "chunk_size",
+                50 if known_args.policy in {"pi05", "smolvla"} else 5,
+            ),
             help="ACT-style action chunk size.",
         )
     parser.add_argument(
@@ -3580,6 +3721,238 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
                 "Optional prefix-image cache directory override. Defaults to a "
                 "hidden cache folder under the dataset root."
             ),
+        )
+    elif known_args.policy == "pi05":
+        parser.add_argument(
+            "--policy-path",
+            type=str,
+            default=defaults.get(
+                "policy_path",
+                defaults.get("pretrained_path", PI05_DEFAULT_POLICY_PATH),
+            ),
+            help=(
+                "Pi0.5 checkpoint to fine-tune. Defaults to the official "
+                "`lerobot/pi05_base` checkpoint. Pass an empty string to train "
+                "Pi0.5 from scratch."
+            ),
+        )
+        parser.add_argument(
+            "--pi05-pali-gemma-variant",
+            type=str,
+            choices=["gemma_300m", "gemma_2b"],
+            default=defaults.get("paligemma_variant", "gemma_2b"),
+            help="PaliGemma VLM size used by Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-action-expert-variant",
+            type=str,
+            choices=["gemma_300m", "gemma_2b"],
+            default=defaults.get("action_expert_variant", "gemma_300m"),
+            help="Gemma action expert size used by Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-dtype",
+            type=str,
+            choices=["bfloat16", "float32"],
+            default=defaults.get("dtype", "bfloat16"),
+            help="Internal Pi0.5 model dtype.",
+        )
+        parser.add_argument(
+            "--pi05-max-state-dim",
+            type=int,
+            default=defaults.get("max_state_dim", 32),
+            help="State vectors shorter than this are padded before Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-max-action-dim",
+            type=int,
+            default=defaults.get("max_action_dim", 32),
+            help="Action vectors shorter than this are padded before Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-image-resolution",
+            type=parse_pi05_image_resolution,
+            default=defaults.get("image_resolution", (224, 224)),
+            help="Pi0.5 image resize target as WIDTH,HEIGHT, e.g. 224,224.",
+        )
+        parser.add_argument(
+            "--pi05-empty-cameras",
+            type=int,
+            default=defaults.get("empty_cameras", 0),
+            help="Number of zero-filled placeholder cameras appended by Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-tokenizer-max-length",
+            type=int,
+            default=defaults.get("tokenizer_max_length", 200),
+            help="Maximum language-token length for Pi0.5 instructions.",
+        )
+        parser.add_argument(
+            "--pi05-num-inference-steps",
+            type=int,
+            default=defaults.get("num_inference_steps", 10),
+            help="Flow-matching denoising steps used by Pi0.5.",
+        )
+        parser.add_argument(
+            "--pi05-time-sampling-beta-alpha",
+            type=float,
+            default=defaults.get("time_sampling_beta_alpha", 1.5),
+            help="Pi0.5 flow-matching beta-distribution alpha.",
+        )
+        parser.add_argument(
+            "--pi05-time-sampling-beta-beta",
+            type=float,
+            default=defaults.get("time_sampling_beta_beta", 1.0),
+            help="Pi0.5 flow-matching beta-distribution beta.",
+        )
+        parser.add_argument(
+            "--pi05-time-sampling-scale",
+            type=float,
+            default=defaults.get("time_sampling_scale", 0.999),
+            help="Pi0.5 flow-matching sampled-time scale.",
+        )
+        parser.add_argument(
+            "--pi05-time-sampling-offset",
+            type=float,
+            default=defaults.get("time_sampling_offset", 0.001),
+            help="Pi0.5 flow-matching sampled-time offset.",
+        )
+        parser.add_argument(
+            "--pi05-min-period",
+            type=float,
+            default=defaults.get("min_period", 0.004),
+            help="Minimum timestep period for Pi0.5 positional encoding.",
+        )
+        parser.add_argument(
+            "--pi05-max-period",
+            type=float,
+            default=defaults.get("max_period", 4.0),
+            help="Maximum timestep period for Pi0.5 positional encoding.",
+        )
+        pi05_gradient_checkpointing_group = parser.add_mutually_exclusive_group()
+        pi05_gradient_checkpointing_group.add_argument(
+            "--pi05-gradient-checkpointing",
+            dest="pi05_gradient_checkpointing",
+            action="store_true",
+            help="Enable Pi0.5 gradient checkpointing to reduce memory usage.",
+        )
+        pi05_gradient_checkpointing_group.add_argument(
+            "--pi05-no-gradient-checkpointing",
+            dest="pi05_gradient_checkpointing",
+            action="store_false",
+            help="Disable Pi0.5 gradient checkpointing.",
+        )
+        parser.set_defaults(
+            pi05_gradient_checkpointing=defaults.get("gradient_checkpointing", True)
+        )
+        pi05_compile_group = parser.add_mutually_exclusive_group()
+        pi05_compile_group.add_argument(
+            "--pi05-compile-model",
+            dest="pi05_compile_model",
+            action="store_true",
+            help="Enable torch.compile for Pi0.5.",
+        )
+        pi05_compile_group.add_argument(
+            "--pi05-no-compile-model",
+            dest="pi05_compile_model",
+            action="store_false",
+            help="Disable torch.compile for Pi0.5.",
+        )
+        parser.set_defaults(pi05_compile_model=defaults.get("compile_model", False))
+        parser.add_argument(
+            "--pi05-compile-mode",
+            type=str,
+            default=defaults.get("compile_mode", "max-autotune"),
+            help="torch.compile mode used when Pi0.5 compilation is enabled.",
+        )
+        pi05_vision_group = parser.add_mutually_exclusive_group()
+        pi05_vision_group.add_argument(
+            "--pi05-freeze-vision-encoder",
+            dest="pi05_freeze_vision_encoder",
+            action="store_true",
+            help="Freeze the Pi0.5 vision encoder while fine-tuning.",
+        )
+        pi05_vision_group.add_argument(
+            "--pi05-unfreeze-vision-encoder",
+            dest="pi05_freeze_vision_encoder",
+            action="store_false",
+            help="Fine-tune the Pi0.5 vision encoder.",
+        )
+        parser.set_defaults(
+            pi05_freeze_vision_encoder=defaults.get("freeze_vision_encoder", False)
+        )
+        pi05_expert_group = parser.add_mutually_exclusive_group()
+        pi05_expert_group.add_argument(
+            "--pi05-train-expert-only",
+            dest="pi05_train_expert_only",
+            action="store_true",
+            help="Train only the Pi0.5 action expert and projections.",
+        )
+        pi05_expert_group.add_argument(
+            "--pi05-train-all-layers",
+            dest="pi05_train_expert_only",
+            action="store_false",
+            help="Allow all unfrozen Pi0.5 layers to train.",
+        )
+        parser.set_defaults(
+            pi05_train_expert_only=defaults.get("train_expert_only", False)
+        )
+        parser.add_argument(
+            "--pi05-normalization-mapping",
+            type=parse_json_mapping,
+            default=defaults.get("normalization_mapping"),
+            help=(
+                "Optional JSON normalization mapping, e.g. "
+                '\'{"ACTION":"MEAN_STD","STATE":"MEAN_STD","VISUAL":"IDENTITY"}\'.'
+            ),
+        )
+        parser.add_argument(
+            "--pi05-optimizer-lr",
+            type=float,
+            default=defaults.get("optimizer_lr", 2.5e-5),
+            help="Pi0.5 AdamW learning rate.",
+        )
+        parser.add_argument(
+            "--pi05-optimizer-betas",
+            type=parse_pi05_optimizer_betas,
+            default=defaults.get("optimizer_betas", (0.9, 0.95)),
+            help="Pi0.5 AdamW betas as beta1,beta2.",
+        )
+        parser.add_argument(
+            "--pi05-optimizer-eps",
+            type=float,
+            default=defaults.get("optimizer_eps", 1e-8),
+            help="Pi0.5 AdamW epsilon.",
+        )
+        parser.add_argument(
+            "--pi05-optimizer-weight-decay",
+            type=float,
+            default=defaults.get("optimizer_weight_decay", 0.01),
+            help="Pi0.5 AdamW weight decay.",
+        )
+        parser.add_argument(
+            "--pi05-optimizer-grad-clip-norm",
+            type=float,
+            default=defaults.get("optimizer_grad_clip_norm", 1.0),
+            help="Pi0.5 optimizer gradient clipping norm.",
+        )
+        parser.add_argument(
+            "--pi05-scheduler-warmup-steps",
+            type=int,
+            default=defaults.get("scheduler_warmup_steps", 1000),
+            help="Pi0.5 scheduler warmup steps.",
+        )
+        parser.add_argument(
+            "--pi05-scheduler-decay-steps",
+            type=int,
+            default=defaults.get("scheduler_decay_steps", 30000),
+            help="Pi0.5 scheduler cosine-decay steps.",
+        )
+        parser.add_argument(
+            "--pi05-scheduler-decay-lr",
+            type=float,
+            default=defaults.get("scheduler_decay_lr", 2.5e-6),
+            help="Pi0.5 scheduler final decay learning rate.",
         )
     elif known_args.policy == "smolvla":
         parser.add_argument(
@@ -4347,6 +4720,23 @@ def main(argv: list[str] | None = None) -> None:
             drop_n_last_frames=getattr(args, "drop_n_last_frames", None),
         )
 
+    if policy_supports_signature_features(args.policy):
+        kept_signature_feature_keys: set[str] = set()
+        if use_path_signature:
+            kept_signature_feature_keys.add(PATH_SIGNATURE_FEATURE_KEY)
+            if use_prefix_sequence_training:
+                kept_signature_feature_keys.add(PREFIX_PATH_SIGNATURE_FEATURE_KEY)
+        if use_delta_signature:
+            kept_signature_feature_keys.add(DELTA_SIGNATURE_FEATURE_KEY)
+            if use_prefix_sequence_training:
+                kept_signature_feature_keys.add(PREFIX_DELTA_SIGNATURE_FEATURE_KEY)
+        ignored_input_feature_keys = tuple(
+            key for key in SIGNATURE_FEATURE_KEYS if key not in kept_signature_feature_keys
+        )
+    else:
+        ignored_input_feature_keys = SIGNATURE_FEATURE_KEYS
+    configure_ignored_dataset_feature_keys(ignored_input_feature_keys)
+
     input_features_override, output_features_override = build_policy_feature_overrides(
         dataset_root,
         dataset_repo_id=dataset_repo_id,
@@ -4355,6 +4745,7 @@ def main(argv: list[str] | None = None) -> None:
         prefix_train_max_steps=int(getattr(args, "prefix_train_max_steps", 32)),
         use_path_signature=use_path_signature,
         use_delta_signature=use_delta_signature,
+        ignored_input_feature_keys=ignored_input_feature_keys,
     )
 
     prism_use_path_signature = use_path_signature
@@ -4483,6 +4874,12 @@ def main(argv: list[str] | None = None) -> None:
                 use_path_signature=bool(use_path_signature),
                 use_delta_signature=bool(use_delta_signature),
             )
+        )
+    elif args.policy == "pi05":
+        policy_cfg = build_pi05_policy_config(
+            args,
+            input_features_override=input_features_override,
+            output_features_override=output_features_override,
         )
     elif args.policy == "prism_diffusion":
         from lerobot_policy_prism_diffusion.configuration_diffusion import (
@@ -4824,7 +5221,7 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
-    elif args.policy == "smolvla":
+    elif args.policy in {"pi05", "smolvla"}:
         print(
             "- action_execution: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -4900,6 +5297,38 @@ def main(argv: list[str] | None = None) -> None:
             "- signature_runtime_normalization: "
             f"skip_keys={list(getattr(policy_cfg, 'pre_normalized_observation_keys', ()))}"
         )
+    elif args.policy == "pi05":
+        pi05_image_resolution = tuple(
+            coerce_numeric_pair(
+                args.pi05_image_resolution,
+                option_name="--pi05-image-resolution",
+                item_type=int,
+            )
+        )
+        print(
+            "- pi05: "
+            f"policy_path={args.policy_path or '<scratch>'}, "
+            f"paligemma={args.pi05_pali_gemma_variant}, "
+            f"action_expert={args.pi05_action_expert_variant}, "
+            f"dtype={args.pi05_dtype}, "
+            f"max_state_dim={int(args.pi05_max_state_dim)}, "
+            f"max_action_dim={int(args.pi05_max_action_dim)}, "
+            f"image_resolution={pi05_image_resolution}, "
+            f"tokenizer_max_length={int(args.pi05_tokenizer_max_length)}, "
+            f"num_inference_steps={int(args.pi05_num_inference_steps)}"
+        )
+        print(
+            "- pi05_finetune: "
+            f"gradient_checkpointing={bool(args.pi05_gradient_checkpointing)}, "
+            f"compile_model={bool(args.pi05_compile_model)}, "
+            f"freeze_vision_encoder={bool(args.pi05_freeze_vision_encoder)}, "
+            f"train_expert_only={bool(args.pi05_train_expert_only)}, "
+            f"optimizer_lr={float(args.pi05_optimizer_lr)}, "
+            f"scheduler_warmup_steps={int(args.pi05_scheduler_warmup_steps)}, "
+            f"scheduler_decay_steps={int(args.pi05_scheduler_decay_steps)}"
+        )
+        if args.pi05_normalization_mapping is not None:
+            print(f"- pi05_normalization_mapping: {args.pi05_normalization_mapping}")
     elif args.policy == "smolvla":
         smolvla_resize = tuple(
             coerce_numeric_pair(
