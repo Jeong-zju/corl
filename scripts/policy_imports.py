@@ -13,11 +13,13 @@ from typing import Any
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
     "diffusion": "diffusion",
+    "pi0": "pi0",
     "pi05": "pi05",
     "smolvla": "smolvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
+    "pi0": ("rtc",),
     "pi05": ("rtc",),
     "smolvla": ("rtc",),
 }
@@ -27,6 +29,7 @@ _LEROBOT_FACTORY_CONFIG_SUBPACKAGES = (
     # those parent packages as namespace shims so package __init__.py files do
     # not pull optional modeling dependencies for inactive policies.
     "groot",
+    "pi0",
     "pi05",
     "rtc",
 )
@@ -183,6 +186,8 @@ def ensure_lerobot_policy_imports(policy_type: str) -> None:
     # __init__ imports, so load the module explicitly to register that step.
     if policy_type == "smolvla":
         importlib.import_module("lerobot.policies.smolvla.processor_smolvla")
+    elif policy_type == "pi0":
+        importlib.import_module("lerobot.policies.pi0.processor_pi0")
     elif policy_type == "pi05":
         # PI05's pretrained processor pipeline and pi05_base checkpoint both
         # need side effects that would normally happen through package imports.
@@ -212,6 +217,10 @@ def import_lerobot_policy_config_class(policy_type: str):
         from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
         return PI05Config
+    if policy_type == "pi0":
+        from lerobot.policies.pi0.configuration_pi0 import PI0Config
+
+        return PI0Config
     if policy_type == "smolvla":
         from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 

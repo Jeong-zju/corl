@@ -126,6 +126,41 @@ class DeployConfig:
     command: CommandConfig
 
 
+_POLICY_COMMON_KEYS = {
+    "type",
+    "path",
+    "device",
+    "load_device",
+    "task",
+    "instruction",
+    "n_action_steps",
+    "state_dim",
+    "action_dim",
+    "arm_dof",
+    "base_action_dim",
+    "state_key",
+    "action_key",
+    "image_keys",
+}
+
+_POLICY_STREAMING_SIGNATURE_KEYS = {
+    "temporal_ensemble_coeff",
+    "use_path_signature",
+    "use_delta_signature",
+    "signature_depth",
+    "signature_dim",
+    "signature_backend",
+}
+
+_POLICY_ALLOWED_KEYS_BY_TYPE = {
+    "act": _POLICY_COMMON_KEYS | {"temporal_ensemble_coeff"},
+    "streaming_act": _POLICY_COMMON_KEYS | _POLICY_STREAMING_SIGNATURE_KEYS,
+    "pi0": _POLICY_COMMON_KEYS,
+    "pi05": _POLICY_COMMON_KEYS,
+    "smolvla": _POLICY_COMMON_KEYS,
+}
+
+
 def _as_mapping(data: dict, key: str) -> dict:
     value = data.get(key, {})
     if value is None:
@@ -181,6 +216,19 @@ def _parse_non_negative_int(data: dict[str, object], *, key: str) -> int:
     if value < 0:
         raise ValueError(f"`{key}` must be >= 0, got {value}.")
     return value
+
+
+def _validate_policy_config_keys(policy_type: str, policy_raw: dict[str, object]) -> None:
+    allowed_keys = _POLICY_ALLOWED_KEYS_BY_TYPE.get(policy_type)
+    if allowed_keys is None:
+        raise ValueError(f"Unsupported deploy policy type: {policy_type!r}.")
+
+    unknown_keys = sorted(str(key) for key in policy_raw if str(key) not in allowed_keys)
+    if unknown_keys:
+        raise ValueError(
+            f"Unsupported deploy policy keys for {policy_type!r}: "
+            + ", ".join(unknown_keys)
+        )
 
 
 def parse_command_mutual_exclusion_config(
@@ -262,6 +310,7 @@ def load_deploy_config(config_path: str | Path) -> DeployConfig:
 
     policy_raw = _as_mapping(raw, "policy")
     policy_type = str(policy_raw.get("type", "act"))
+    _validate_policy_config_keys(policy_type, policy_raw)
     use_streaming_signatures = policy_type == "streaming_act"
     runtime_raw = _as_mapping(raw, "runtime")
     debug_raw = _as_mapping(raw, "debug")

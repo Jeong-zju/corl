@@ -1,6 +1,6 @@
 policy:
-  type: smolvla
-  path: ../../outputs/train/zeno-ai/BookOriginRelocation/smolvla/20260505_154159/checkpoints/180000
+  type: pi05
+  path: ../../outputs/train/zeno-ai/BookOriginRelocation/pi05
   task: Return the book to its original location.
   device: cuda
   load_device: null
@@ -37,7 +37,7 @@ image:
   color_order: rgb
 
 ros:
-  node_name: zeno_smolvla_deploy
+  node_name: zeno_pi05_deploy
   queue_size: 1
   topics:
     image_left: /realsense_left/color/image_raw/compressed

@@ -21,6 +21,7 @@ from deploy.config import (
     RosConfig,
     RuntimeConfig,
     TopicConfig,
+    load_deploy_config,
 )
 from deploy.gripper_hysteresis import GripperHysteresisConfig
 import deploy.policy_runtime.loader as loader
@@ -114,7 +115,11 @@ def test_apply_deploy_policy_overrides_keeps_open_loop_when_coeff_is_zero() -> N
         temporal_ensemble_coeff=None,
     )
 
-    coeff, enabled = apply_deploy_policy_overrides(cfg, _make_policy_config())
+    coeff, enabled = apply_deploy_policy_overrides(
+        "act",
+        cfg,
+        _make_policy_config(),
+    )
 
     assert coeff == 0.0
     assert enabled is False
@@ -129,6 +134,7 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     )
 
     coeff, enabled = apply_deploy_policy_overrides(
+        "streaming_act",
         cfg,
         _make_policy_config(
             n_action_steps=50,
@@ -142,7 +148,25 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert cfg.n_action_steps == 1
 
 
-@pytest.mark.parametrize("policy_type", ["smolvla"])
+def test_apply_deploy_policy_overrides_rejects_temporal_ensemble_for_rtc_policy() -> None:
+    cfg = SimpleNamespace(
+        n_action_steps=25,
+        temporal_ensemble_coeff=None,
+    )
+
+    with pytest.raises(ValueError, match="not supported for policy type"):
+        apply_deploy_policy_overrides(
+            "pi05",
+            cfg,
+            _make_policy_config(
+                type="pi05",
+                n_action_steps=50,
+                temporal_ensemble_coeff=0.01,
+            ),
+        )
+
+
+@pytest.mark.parametrize("policy_type", ["pi0", "pi05", "smolvla"])
 def test_policy_runtime_requires_vla_task_before_importing_lerobot(
     policy_type: str,
 ) -> None:
@@ -157,6 +181,100 @@ def test_policy_runtime_requires_vla_task_before_importing_lerobot(
 
     with pytest.raises(ValueError, match="policy.task"):
         runtime.load()
+
+
+def test_load_deploy_config_rejects_temporal_ensemble_for_rtc_policy(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "deploy.yaml"
+    config_path.write_text(
+        """
+policy:
+  type: pi05
+  path: /tmp/pi05
+  device: cpu
+  load_device: null
+  task: return the book
+  n_action_steps: 50
+  temporal_ensemble_coeff: 0.01
+  state_dim: 17
+  action_dim: 17
+  arm_dof: 7
+  base_action_dim: 3
+  state_key: observation.state
+  action_key: action
+  image_keys:
+    left: observation.images.left
+    right: observation.images.right
+    top: observation.images.top
+runtime:
+  control_hz: 30.0
+image:
+  width: 224
+  height: 224
+  color_order: rgb
+ros:
+  node_name: deploy_test
+  queue_size: 1
+command:
+  publish_base: true
+  publish_arms: true
+  max_linear_x: 1.0
+  max_linear_y: 1.0
+  max_angular_z: 1.0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="temporal_ensemble_coeff"):
+        load_deploy_config(config_path)
+
+
+def test_load_deploy_config_accepts_pi05_without_temporal_ensemble(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "deploy.yaml"
+    config_path.write_text(
+        """
+policy:
+  type: pi05
+  path: /tmp/pi05
+  device: cpu
+  load_device: null
+  task: return the book
+  n_action_steps: 50
+  state_dim: 17
+  action_dim: 17
+  arm_dof: 7
+  base_action_dim: 3
+  state_key: observation.state
+  action_key: action
+  image_keys:
+    left: observation.images.left
+    right: observation.images.right
+    top: observation.images.top
+runtime:
+  control_hz: 30.0
+image:
+  width: 224
+  height: 224
+  color_order: rgb
+ros:
+  node_name: deploy_test
+  queue_size: 1
+command:
+  publish_base: true
+  publish_arms: true
+  max_linear_x: 1.0
+  max_linear_y: 1.0
+  max_angular_z: 1.0
+""",
+        encoding="utf-8",
+    )
+
+    cfg = load_deploy_config(config_path)
+    assert cfg.policy.type == "pi05"
+    assert cfg.policy.n_action_steps == 50
 
 
 def test_missing_vla_dependency_error_names_nested_module() -> None:

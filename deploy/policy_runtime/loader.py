@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 import importlib
 import importlib.machinery
 import importlib.util
@@ -39,28 +38,39 @@ from eval_helpers import (  # noqa: E402
     resolve_policy_dir,
     quiet_transformers_loading,
 )
+from policy_imports import ensure_lerobot_policy_imports  # noqa: E402
 from dataset_utils import find_dataset_split_file, load_dataset_split  # noqa: E402
 
 
-VLA_POLICY_TYPES = {"smolvla"}
+RTC_POLICY_TYPES = {"pi0", "pi05", "smolvla"}
+VLA_POLICY_TYPES = RTC_POLICY_TYPES
+TEMPORAL_ENSEMBLE_POLICY_TYPES = {"act", "streaming_act"}
 
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
+    "pi0": "pi0",
+    "pi05": "pi05",
     "diffusion": "diffusion",
     "smolvla": "smolvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
+    "pi0": ("rtc",),
+    "pi05": ("rtc",),
     "smolvla": ("rtc",),
 }
 
 _LEROBOT_CONFIG_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.configuration_act",
+    "pi0": "lerobot.policies.pi0.configuration_pi0",
+    "pi05": "lerobot.policies.pi05.configuration_pi05",
     "smolvla": "lerobot.policies.smolvla.configuration_smolvla",
 }
 
 _LEROBOT_PROCESSOR_MODULES_BY_TYPE = {
     "act": "lerobot.policies.act.processor_act",
+    "pi0": "lerobot.policies.pi0.processor_pi0",
+    "pi05": "lerobot.policies.pi05.processor_pi05",
     "smolvla": "lerobot.policies.smolvla.processor_smolvla",
 }
 
@@ -159,6 +169,13 @@ def _load_lerobot_pretrained_config_class(policy_type: str):
         )
 
         return StreamingACTConfig
+    if policy_type in {"pi0", "pi05"}:
+        ensure_lerobot_policy_imports(policy_type)
+        config_module_name = _LEROBOT_CONFIG_MODULES_BY_TYPE[policy_type]
+        module = importlib.import_module(config_module_name)
+        if policy_type == "pi0":
+            return module.PI0Config
+        return module.PI05Config
     config_module_name = _LEROBOT_CONFIG_MODULES_BY_TYPE.get(policy_type)
     if config_module_name is not None:
         module = _import_lerobot_policy_submodule(policy_type, config_module_name)
@@ -173,6 +190,9 @@ def _register_deploy_processor_steps(policy_type: str) -> None:
     if policy_type == "streaming_act":
         importlib.import_module("lerobot_policy_streaming_act.processor_streaming_act")
         return
+
+    if policy_type in {"pi0", "pi05"}:
+        ensure_lerobot_policy_imports(policy_type)
 
     processor_module_name = _LEROBOT_PROCESSOR_MODULES_BY_TYPE.get(policy_type)
     if processor_module_name is not None:
@@ -222,11 +242,18 @@ def _make_deploy_pre_post_processors(
 
 
 def apply_deploy_policy_overrides(
+    policy_type: str,
     cfg: Any,
     deploy_policy: PolicyConfig,
 ) -> tuple[float, bool]:
     temporal_ensemble_coeff = float(deploy_policy.temporal_ensemble_coeff)
     temporal_ensemble_enabled = temporal_ensemble_coeff != 0.0
+
+    if policy_type not in TEMPORAL_ENSEMBLE_POLICY_TYPES and temporal_ensemble_enabled:
+        raise ValueError(
+            f"Deploy `policy.temporal_ensemble_coeff` is not supported for policy "
+            f"type {policy_type!r}."
+        )
 
     if hasattr(cfg, "temporal_ensemble_coeff"):
         cfg.temporal_ensemble_coeff = (
@@ -281,6 +308,23 @@ def resolve_deploy_policy_class(policy_type: str, deploy_policy: PolicyConfig):
     _install_lerobot_policies_namespace_shim()
     if policy_type == "streaming_act":
         return import_local_streaming_act_policy_class()
+    if policy_type in {"pi0", "pi05"}:
+        try:
+            ensure_lerobot_policy_imports(policy_type)
+            module_name = (
+                "lerobot.policies.pi0.modeling_pi0"
+                if policy_type == "pi0"
+                else "lerobot.policies.pi05.modeling_pi05"
+            )
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            policy_name = "Pi0" if policy_type == "pi0" else "Pi0.5"
+            raise _missing_dependency_error(
+                policy_name=policy_name,
+                extra_name="pi" if policy_type == "pi0" else "pi",
+                exc=exc,
+            ) from exc
+        return module.PI0Policy if policy_type == "pi0" else module.PI05Policy
     if policy_type == "smolvla":
         try:
             module = _import_lerobot_policy_submodule(
@@ -325,8 +369,6 @@ class PolicyRuntime:
         self.temporal_ensemble_coeff = float(config.policy.temporal_ensemble_coeff)
         self.temporal_ensemble_enabled = self.temporal_ensemble_coeff != 0.0
         self.action_smoothing_enabled = False
-        self._supports_action_chunk_prediction = False
-        self._open_loop_action_queue: deque[tuple[np.ndarray, int]] = deque()
         self._smoothed_action: np.ndarray | None = None
 
     def load(self) -> None:
@@ -339,7 +381,7 @@ class PolicyRuntime:
             raise ValueError(
                 "Unsupported policy type for deploy runtime: 'prism_diffusion'. "
                 "The current deploy runtime supports 'act', 'streaming_act', "
-                "'smolvla'. "
+                "'pi0', 'pi05', 'smolvla'. "
                 "Use scripts/eval_policy.py for PRISM Diffusion checkpoints "
                 "until deploy support is added."
             )
@@ -363,7 +405,12 @@ class PolicyRuntime:
         if policy_type == "streaming_act":
             cfg = load_streaming_act_config_from_pretrained_dir(self.policy_dir)
         else:
-            policy_label = "ACT" if policy_type == "act" else "SmolVLA"
+            policy_label = {
+                "act": "ACT",
+                "pi0": "Pi0",
+                "pi05": "Pi0.5",
+                "smolvla": "SmolVLA",
+            }.get(policy_type, "policy")
             cfg = load_pretrained_config_from_pretrained_dir(
                 PreTrainedConfig,
                 self.policy_dir,
@@ -372,7 +419,11 @@ class PolicyRuntime:
         (
             self.temporal_ensemble_coeff,
             self.temporal_ensemble_enabled,
-        ) = apply_deploy_policy_overrides(cfg, self.deploy_config.policy)
+        ) = apply_deploy_policy_overrides(
+            policy_type,
+            cfg,
+            self.deploy_config.policy,
+        )
 
         load_device = (
             self.deploy_config.policy.load_device or self.deploy_config.policy.device
@@ -390,7 +441,11 @@ class PolicyRuntime:
         (
             self.temporal_ensemble_coeff,
             self.temporal_ensemble_enabled,
-        ) = apply_deploy_policy_overrides(cfg, self.deploy_config.policy)
+        ) = apply_deploy_policy_overrides(
+            policy_type,
+            cfg,
+            self.deploy_config.policy,
+        )
         self.action_smoothing_enabled = False
 
         if hasattr(policy, "to"):
@@ -418,8 +473,6 @@ class PolicyRuntime:
         self.state_key = resolve_state_key(cfg)
         self.action_key = resolve_action_key(cfg)
         self.visual_keys = select_visual_observation_keys(cfg)
-        self._supports_action_chunk_prediction = hasattr(policy, "predict_action_chunk")
-        self._open_loop_action_queue.clear()
 
         if self.deploy_config.gripper_hysteresis.enabled:
             gripper_config = self.deploy_config.gripper_hysteresis
@@ -444,7 +497,6 @@ class PolicyRuntime:
             self.gripper_hysteresis = GripperHysteresis(gripper_config)
 
     def reset(self) -> None:
-        self._open_loop_action_queue.clear()
         self._smoothed_action = None
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
@@ -535,42 +587,6 @@ class PolicyRuntime:
         action = predicted_action.detach().cpu().numpy().reshape(-1).astype(np.float32)
         return action, float(runtime_ms)
 
-    def _run_open_loop_chunk(
-        self,
-        obs: dict[str, Any],
-        *,
-        obs_seq: int,
-    ) -> tuple[np.ndarray, float]:
-        import torch
-
-        start_s = time.perf_counter()
-        with torch.no_grad():
-            predicted_chunk = self.policy.predict_action_chunk(obs)
-        predicted_chunk = self.postprocessor(predicted_chunk)
-        runtime_ms = (time.perf_counter() - start_s) * 1000.0
-
-        chunk = predicted_chunk.detach().cpu().numpy().astype(np.float32)
-        if chunk.ndim == 2:
-            chunk = chunk[None, ...]
-        if chunk.ndim != 3 or chunk.shape[0] != 1:
-            raise RuntimeError(
-                "Expected open-loop chunk prediction to have shape "
-                f"(1, chunk_size, action_dim), got {tuple(chunk.shape)}."
-            )
-
-        n_action_steps = max(1, int(getattr(self.cfg, "n_action_steps", 1)))
-        scheduled_actions = [
-            np.asarray(step, dtype=np.float32).reshape(-1)
-            for step in chunk[0, :n_action_steps]
-        ]
-        if not scheduled_actions:
-            raise RuntimeError("Policy returned an empty action chunk during open-loop deploy.")
-
-        self._open_loop_action_queue.extend(
-            (action, obs_seq) for action in scheduled_actions[1:]
-        )
-        return scheduled_actions[0], float(runtime_ms)
-
     def _build_inference_result(
         self,
         *,
@@ -604,29 +620,7 @@ class PolicyRuntime:
             self.reset()
 
         obs_seq = int(observation_packet.get("seq", 0))
-        if not self.temporal_ensemble_enabled and self._open_loop_action_queue:
-            action, source_obs_seq = self._open_loop_action_queue.popleft()
-            return self._build_inference_result(
-                action=action,
-                observation_packet=observation_packet,
-                runtime_ms=None,
-                obs_seq=source_obs_seq,
-                message="open_loop_cached",
-                include_debug=False,
-            )
-
         obs = self._preprocess_observation(observation_packet)
-        if not self.temporal_ensemble_enabled and self._supports_action_chunk_prediction:
-            action, runtime_ms = self._run_open_loop_chunk(obs, obs_seq=obs_seq)
-            return self._build_inference_result(
-                action=action,
-                observation_packet=observation_packet,
-                runtime_ms=runtime_ms,
-                obs_seq=obs_seq,
-                message="open_loop_predict",
-                include_debug=collect_debug,
-            )
-
         action, runtime_ms = self._run_select_action(obs)
         return self._build_inference_result(
             action=action,
