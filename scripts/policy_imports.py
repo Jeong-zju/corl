@@ -12,12 +12,23 @@ from typing import Any
 _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "act": "act",
     "diffusion": "diffusion",
+    "pi05": "pi05",
     "smolvla": "smolvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
+    "pi05": ("rtc",),
     "smolvla": ("rtc",),
 }
+
+_LEROBOT_FACTORY_CONFIG_SUBPACKAGES = (
+    # LeRobot's factory imports config modules for every built-in policy. Keep
+    # those parent packages as namespace shims so package __init__.py files do
+    # not pull optional modeling dependencies for inactive policies.
+    "groot",
+    "pi05",
+    "rtc",
+)
 
 
 def _make_namespace_package(name: str, package_path: Path) -> ModuleType:
@@ -95,6 +106,8 @@ def install_lerobot_policy_subpackage_shim_by_name(package_name: str) -> None:
 def ensure_lerobot_policy_imports(policy_type: str) -> None:
     """Install namespace shims for the active policy's LeRobot imports."""
     install_lerobot_policies_namespace_shim()
+    for package_name in _LEROBOT_FACTORY_CONFIG_SUBPACKAGES:
+        install_lerobot_policy_subpackage_shim_by_name(package_name)
     package_name = _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE.get(policy_type)
     if package_name is not None:
         install_lerobot_policy_subpackage_shim_by_name(package_name)
@@ -128,6 +141,10 @@ def import_lerobot_policy_config_class(policy_type: str):
         )
 
         return DiffusionConfig
+    if policy_type == "pi05":
+        from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+        return PI05Config
     if policy_type == "smolvla":
         from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
