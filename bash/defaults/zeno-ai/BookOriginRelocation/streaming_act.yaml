@@ -6,7 +6,7 @@ train:
   resume: false
   job_name: "streaming-act-prism"
   wandb_project: "BookOriginRelocation"
-  wandb_mode: "offline"
+  wandb_mode: "online"
   device: "cuda"
   use_amp: true
   amp_dtype: "auto"
