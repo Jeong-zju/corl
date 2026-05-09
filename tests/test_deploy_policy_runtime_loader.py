@@ -150,6 +150,26 @@ def test_apply_deploy_policy_overrides_forces_single_step_when_coeff_is_nonzero(
     assert cfg.n_action_steps == 1
 
 
+def test_policy_runtime_first_frame_anchor_summary_reports_loaded_config() -> None:
+    runtime = PolicyRuntime.__new__(PolicyRuntime)
+    runtime.cfg = SimpleNamespace(
+        use_first_frame_anchor=False,
+        use_first_frame_anchor_in_slot_routing=True,
+    )
+
+    assert (
+        runtime.first_frame_anchor_summary
+        == "encoder_token=False, slot_routing=True"
+    )
+
+
+def test_policy_runtime_first_frame_anchor_summary_unknown_before_load() -> None:
+    runtime = PolicyRuntime.__new__(PolicyRuntime)
+    runtime.cfg = None
+
+    assert runtime.first_frame_anchor_summary == "unknown"
+
+
 def test_apply_deploy_policy_overrides_rejects_temporal_ensemble_for_rtc_policy() -> None:
     cfg = SimpleNamespace(
         n_action_steps=25,

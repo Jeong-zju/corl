@@ -438,11 +438,12 @@ class DeployRosNode:
             )
         )
         self.rospy.loginfo(
-            "Deploy node started: policy=%s path=%s hz=%.2f execution=%s signatures=%s",
+            "Deploy node started: policy=%s path=%s hz=%.2f execution=%s first_frame_anchor=(%s) signatures=%s",
             self.config.policy.type,
             self.config.policy.path,
             self.config.runtime.control_hz,
             self.policy_runtime.execution_summary,
+            self.policy_runtime.first_frame_anchor_summary,
             signature_status,
         )
         if self.config.debug.enabled:

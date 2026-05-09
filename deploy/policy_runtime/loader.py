@@ -579,6 +579,17 @@ class PolicyRuntime:
         )
         return f"open_loop(n_action_steps={n_action_steps})"
 
+    @property
+    def first_frame_anchor_summary(self) -> str:
+        cfg = self.cfg
+        if cfg is None:
+            return "unknown"
+        encoder_token = bool(getattr(cfg, "use_first_frame_anchor", False))
+        slot_routing = bool(
+            getattr(cfg, "use_first_frame_anchor_in_slot_routing", False)
+        )
+        return f"encoder_token={encoder_token}, slot_routing={slot_routing}"
+
     def _reset_rtc_state(self) -> None:
         self._rtc_action_queue.clear()
         self._rtc_prev_chunk_left_over = None
