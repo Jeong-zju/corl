@@ -188,6 +188,34 @@ def test_train_parse_args_uses_pi05_defaults() -> None:
     }
 
 
+def test_train_parse_args_uses_xvla_defaults_for_5090() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "zeno-ai/DailyLaundryOrganization",
+            "--policy",
+            "xvla",
+        ]
+    )
+
+    assert args._policy_defaults_dataset_root == "data/zeno-ai/DailyLaundryOrganization"
+    assert args._policy_defaults_dataset_repo_id == "zeno-ai/DailyLaundryOrganization"
+    assert args.output_root.as_posix() == (
+        "outputs/train/zeno-ai/DailyLaundryOrganization/xvla"
+    )
+    assert args.policy_path == "lerobot/xvla-base"
+    assert args.n_obs_steps == 1
+    assert args.chunk_size == 16
+    assert args.n_action_steps == 16
+    assert args.batch_size == 1
+    assert args.xvla_dtype == "bfloat16"
+    assert args.xvla_action_mode == "auto"
+    assert args.xvla_freeze_vision_encoder is False
+    assert args.xvla_freeze_language_encoder is False
+    assert args.xvla_train_policy_transformer is True
+    assert args.xvla_train_soft_prompts is True
+
+
 def test_pi05_quantile_guard_rejects_near_zero_action_quantile_span(
     tmp_path: Path,
 ) -> None:

@@ -45,7 +45,7 @@ dependencies:
       - fsspec>=2026.2,<2027
       - huggingface-hub>=1.9,<2
       - jinja2>=3.1,<4.0
-      - lerobot[pi]==0.5.0
+      - lerobot[pi,xvla]==0.5.0
       - mujoco>=3.6,<3.7
       - num2words>=0.5.14,<0.6
       - opencv-python-headless>=4.11,<4.13

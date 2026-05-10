@@ -26,6 +26,7 @@ def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
     (package_root / "groot").mkdir(parents=True)
     (package_root / "pi05").mkdir(parents=True)
     (package_root / "rtc").mkdir(parents=True)
+    (package_root / "xvla").mkdir(parents=True)
     (tmp_path / "lerobot" / "__init__.py").write_text("", encoding="utf-8")
     (package_root / "__init__.py").write_text("", encoding="utf-8")
     (package_root / "groot" / "__init__.py").write_text(
@@ -52,6 +53,14 @@ def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
         "VALUE = 'rtc_config'\n",
         encoding="utf-8",
     )
+    (package_root / "xvla" / "__init__.py").write_text(
+        "raise RuntimeError('xvla package init imported')\n",
+        encoding="utf-8",
+    )
+    (package_root / "xvla" / "configuration_xvla.py").write_text(
+        "VALUE = 'xvla_config'\n",
+        encoding="utf-8",
+    )
 
     _clear_lerobot_modules()
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -66,10 +75,16 @@ def test_factory_config_namespace_shim_does_not_execute_inactive_package_init(
             "lerobot.policies.pi05.configuration_pi05"
         )
         rtc_config = importlib.import_module("lerobot.policies.rtc.configuration_rtc")
+        xvla_config = importlib.import_module(
+            "lerobot.policies.xvla.configuration_xvla"
+        )
 
         assert groot_config.VALUE == "groot_config"
         assert pi05_config.VALUE == "pi05_config"
         assert rtc_config.VALUE == "rtc_config"
+        assert xvla_config.VALUE == "xvla_config"
+        assert "lerobot.policies.xvla.processor_xvla" not in sys.modules
+        assert "lerobot.policies.xvla.modeling_xvla" not in sys.modules
     finally:
         _clear_lerobot_modules()
 
@@ -167,5 +182,75 @@ class PI05Policy:
             "embeddings.patch_embedding.weight"
             in fixed_state_dict
         )
+    finally:
+        _clear_lerobot_modules()
+
+
+def test_xvla_imports_register_processor_without_model_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "lerobot" / "policies"
+    (package_root / "groot").mkdir(parents=True)
+    (package_root / "pi05").mkdir(parents=True)
+    (package_root / "rtc").mkdir(parents=True)
+    (package_root / "xvla").mkdir(parents=True)
+    (tmp_path / "lerobot" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "lerobot" / "processor.py").write_text(
+        """
+class ProcessorStepRegistry:
+    _registry = {}
+
+    @classmethod
+    def register(cls, name):
+        def decorator(step_cls):
+            cls._registry[name] = step_cls
+            return step_cls
+        return decorator
+
+    @classmethod
+    def get(cls, name):
+        return cls._registry[name]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "groot" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "pi05" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "rtc" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "xvla" / "__init__.py").write_text(
+        "raise RuntimeError('xvla package init imported')\n",
+        encoding="utf-8",
+    )
+    (package_root / "xvla" / "processor_xvla.py").write_text(
+        """
+from lerobot.processor import ProcessorStepRegistry
+
+@ProcessorStepRegistry.register(name="xvla_image_to_float")
+class XVLAImageToFloatProcessorStep:
+    pass
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (package_root / "xvla" / "modeling_xvla.py").write_text(
+        "raise RuntimeError('xvla model imported')\n",
+        encoding="utf-8",
+    )
+
+    _clear_lerobot_modules()
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    try:
+        ensure_lerobot_policy_imports("xvla")
+
+        from lerobot.processor import ProcessorStepRegistry
+
+        assert (
+            ProcessorStepRegistry.get("xvla_image_to_float").__name__
+            == "XVLAImageToFloatProcessorStep"
+        )
+        assert "lerobot.policies.xvla.modeling_xvla" not in sys.modules
     finally:
         _clear_lerobot_modules()

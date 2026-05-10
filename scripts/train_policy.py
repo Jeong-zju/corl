@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,9 +71,11 @@ POLICY_CHOICES = (
     "prism_diffusion",
     "streaming_act",
     "smolvla",
+    "xvla",
 )
 PI05_DEFAULT_POLICY_PATH = "lerobot/pi05_base"
 SMOLVLA_DEFAULT_POLICY_PATH = "lerobot/smolvla_base"
+XVLA_DEFAULT_POLICY_PATH = "lerobot/xvla-base"
 PI05_QUANTILE_ACTION_MAX_ABS_NORMALIZED = 10_000.0
 SIGNATURE_FEATURE_KEYS = (
     PATH_SIGNATURE_FEATURE_KEY,
@@ -551,8 +554,42 @@ def ensure_prism_diffusion_importable(project_root: Path) -> None:
     if not prism_diffusion_src.exists():
         raise FileNotFoundError(
             f"PRISM Diffusion package source not found: {prism_diffusion_src}"
-        )
+    )
     sys.path.insert(0, str(prism_diffusion_src))
+
+
+def install_xvla_transformers_compat_patch() -> None:
+    """Backfill newer Transformers flash-attn helpers expected by X-VLA.
+
+    LeRobot 0.5.x X-VLA imports `is_flash_attn_greater_or_equal_2_10`, but some
+    compatible Transformers builds only expose the generic
+    `is_flash_attn_greater_or_equal(version)` helper. Patch the symbol in only
+    when needed so X-VLA can import without forcing a global Transformers bump.
+    """
+    try:
+        import transformers.utils as transformers_utils
+    except ModuleNotFoundError:
+        return
+
+    if hasattr(transformers_utils, "is_flash_attn_greater_or_equal_2_10"):
+        return
+
+    generic_helper = getattr(
+        transformers_utils,
+        "is_flash_attn_greater_or_equal",
+        None,
+    )
+    if not callable(generic_helper):
+        return
+
+    def _is_flash_attn_greater_or_equal_2_10() -> bool:
+        return bool(generic_helper("2.1.0"))
+
+    setattr(
+        transformers_utils,
+        "is_flash_attn_greater_or_equal_2_10",
+        _is_flash_attn_greater_or_equal_2_10,
+    )
 
 
 def _set_transformers_attention_implementation(config: object, value: str) -> None:
@@ -2689,6 +2726,22 @@ def parse_pi05_optimizer_betas(value: str) -> tuple[float, float]:
     )
 
 
+def parse_xvla_resize_imgs_with_padding(value: str) -> tuple[int, int]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--xvla-resize-imgs-with-padding",
+        item_type=int,
+    )
+
+
+def parse_xvla_optimizer_betas(value: str) -> tuple[float, float]:
+    return _parse_numeric_pair(
+        value,
+        option_name="--xvla-optimizer-betas",
+        item_type=float,
+    )
+
+
 def parse_json_mapping(value: str) -> dict:
     try:
         parsed = json.loads(value)
@@ -2733,6 +2786,66 @@ def apply_policy_pretrained_path(
     pretrained_path = optional_pretrained_path(policy_path_value)
     if pretrained_path is not None:
         policy_cfg.pretrained_path = pretrained_path
+
+
+def load_xvla_policy_config_from_pretrained(
+    config_cls,
+    pretrained_name_or_path: str | Path,
+):
+    """Load XVLA config from a pretrained checkpoint or Hub repo.
+
+    LeRobot's current `PreTrainedConfig.from_pretrained()` path rejects the
+    historical `type` field that exists in some XVLA `config.json` files.
+    We normalize the JSON first so we can keep fine-tuning older checkpoints
+    and the official `lerobot/xvla-base` snapshot.
+    """
+
+    from dataclasses import fields
+
+    import draccus
+
+    model_id = str(pretrained_name_or_path)
+    config_path: Path
+    if Path(model_id).is_dir():
+        config_path = Path(model_id) / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"XVLA config not found in {Path(model_id).resolve()}")
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Hugging Face Hub is required to load XVLA pretrained configs."
+            ) from exc
+
+        config_path = Path(
+            hf_hub_download(repo_id=model_id, filename="config.json")
+        )
+
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    raw_config.pop("type", None)
+
+    valid_fields = {field.name for field in fields(config_cls)}
+    filtered_config = {
+        key: value for key, value in raw_config.items() if key in valid_fields
+    }
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+            encoding="utf-8",
+        ) as handle:
+            json.dump(filtered_config, handle)
+            temp_path = Path(handle.name)
+
+        with draccus.config_type("json"):
+            return draccus.parse(config_cls, str(temp_path), args=[])
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def coerce_policy_normalization_mapping(value):
@@ -3019,6 +3132,92 @@ def build_smolvla_policy_config(
     return policy_cfg
 
 
+def build_xvla_policy_config(
+    args: argparse.Namespace,
+    *,
+    input_features_override,
+    output_features_override,
+):
+    XVLAConfig = import_lerobot_policy_config_class("xvla")
+    pretrained_path = optional_pretrained_path(getattr(args, "policy_path", None))
+    resize_imgs_with_padding = None
+    if args.xvla_resize_imgs_with_padding is not None:
+        resize_imgs_with_padding = tuple(
+            coerce_numeric_pair(
+                args.xvla_resize_imgs_with_padding,
+                option_name="--xvla-resize-imgs-with-padding",
+                item_type=int,
+            )
+        )
+    optimizer_betas = tuple(
+        coerce_numeric_pair(
+            args.xvla_optimizer_betas,
+            option_name="--xvla-optimizer-betas",
+            item_type=float,
+        )
+    )
+    config_kwargs = {
+        "device": args.device,
+        "use_amp": bool(args.use_amp),
+        "push_to_hub": False,
+        "input_features": input_features_override,
+        "output_features": output_features_override,
+        "n_obs_steps": int(args.n_obs_steps),
+        "chunk_size": int(args.chunk_size),
+        "n_action_steps": int(args.n_action_steps),
+        "dtype": str(args.xvla_dtype),
+        "tokenizer_name": str(args.xvla_tokenizer_name),
+        "tokenizer_max_length": int(args.xvla_tokenizer_max_length),
+        "pad_language_to": str(args.xvla_pad_language_to),
+        "action_mode": str(args.xvla_action_mode),
+        "num_denoising_steps": int(args.xvla_num_denoising_steps),
+        "use_proprio": bool(args.xvla_use_proprio),
+        "max_state_dim": int(args.xvla_max_state_dim),
+        "max_action_dim": int(args.xvla_max_action_dim),
+        "resize_imgs_with_padding": resize_imgs_with_padding,
+        "num_image_views": args.xvla_num_image_views,
+        "empty_cameras": int(args.xvla_empty_cameras),
+        "freeze_vision_encoder": bool(args.xvla_freeze_vision_encoder),
+        "freeze_language_encoder": bool(args.xvla_freeze_language_encoder),
+        "train_policy_transformer": bool(args.xvla_train_policy_transformer),
+        "train_soft_prompts": bool(args.xvla_train_soft_prompts),
+        "optimizer_lr": float(args.xvla_optimizer_lr),
+        "optimizer_betas": optimizer_betas,
+        "optimizer_eps": float(args.xvla_optimizer_eps),
+        "optimizer_weight_decay": float(args.xvla_optimizer_weight_decay),
+        "optimizer_grad_clip_norm": float(args.xvla_optimizer_grad_clip_norm),
+        "optimizer_soft_prompt_lr_scale": float(
+            args.xvla_optimizer_soft_prompt_lr_scale
+        ),
+        "optimizer_soft_prompt_warmup_lr_scale": (
+            None
+            if args.xvla_optimizer_soft_prompt_warmup_lr_scale is None
+            else float(args.xvla_optimizer_soft_prompt_warmup_lr_scale)
+        ),
+        "scheduler_warmup_steps": int(args.xvla_scheduler_warmup_steps),
+        "scheduler_decay_steps": int(args.xvla_scheduler_decay_steps),
+        "scheduler_decay_lr": float(args.xvla_scheduler_decay_lr),
+    }
+    normalization_mapping = coerce_policy_normalization_mapping(
+        getattr(args, "xvla_normalization_mapping", None)
+    )
+    if normalization_mapping is not None:
+        config_kwargs["normalization_mapping"] = normalization_mapping
+
+    if pretrained_path is not None:
+        policy_cfg = load_xvla_policy_config_from_pretrained(
+            XVLAConfig,
+            pretrained_path,
+        )
+        for key, value in config_kwargs.items():
+            setattr(policy_cfg, key, value)
+    else:
+        policy_cfg = XVLAConfig(**config_kwargs)
+
+    apply_policy_pretrained_path(policy_cfg, pretrained_path)
+    return policy_cfg
+
+
 def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--defaults-path", type=Path, default=None)
@@ -3049,7 +3248,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Train LeRobot ACT, Diffusion, Pi0.5, PRISM Diffusion, "
-            "Streaming ACT, SmolVLA on a local LeRobot dataset."
+            "Streaming ACT, SmolVLA, or X-VLA on a local LeRobot dataset."
         )
     )
     parser.add_argument(
@@ -3366,7 +3565,9 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         type=int,
         default=defaults.get(
             "n_action_steps",
-            50 if known_args.policy in {"pi05", "smolvla"} else 1,
+            32 if known_args.policy == "xvla" else (
+                50 if known_args.policy in {"pi05", "smolvla"} else 1
+            ),
         ),
         help=(
             "Number of predicted actions executed before querying the policy again. "
@@ -3378,13 +3579,14 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         "pi05",
         "prism_diffusion",
         "smolvla",
+        "xvla",
     }:
         parser.add_argument(
             "--n-obs-steps",
             type=int,
             default=defaults.get(
                 "n_obs_steps",
-                1 if known_args.policy in {"pi05", "smolvla"} else 2,
+                1 if known_args.policy in {"pi05", "smolvla", "xvla"} else 2,
             ),
             help=(
                 "Number of observation steps passed to the policy "
@@ -3417,7 +3619,9 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             type=int,
             default=defaults.get(
                 "chunk_size",
-                50 if known_args.policy in {"pi05", "smolvla"} else 5,
+                32 if known_args.policy == "xvla" else (
+                    50 if known_args.policy in {"pi05", "smolvla"} else 5
+                ),
             ),
             help="ACT-style action chunk size.",
         )
@@ -4363,6 +4567,246 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
             default=defaults.get("scheduler_decay_lr", 2.5e-6),
             help="SmolVLA scheduler final decay learning rate.",
         )
+    elif known_args.policy == "xvla":
+        parser.add_argument(
+            "--policy-path",
+            type=str,
+            default=defaults.get(
+                "policy_path",
+                defaults.get("pretrained_path", XVLA_DEFAULT_POLICY_PATH),
+            ),
+            help=(
+                "X-VLA checkpoint to fine-tune. Defaults to the official "
+                "`lerobot/xvla-base` checkpoint. Pass an empty string to train "
+                "X-VLA from scratch."
+            ),
+        )
+        parser.add_argument(
+            "--xvla-dtype",
+            type=str,
+            choices=["bfloat16", "float32"],
+            default=defaults.get("dtype", "bfloat16"),
+            help="X-VLA model dtype. Use bfloat16 for single RTX 5090 runs.",
+        )
+        parser.add_argument(
+            "--xvla-action-mode",
+            type=str,
+            default=defaults.get("action_mode", "auto"),
+            help=(
+                "X-VLA action mode. `auto` detects the dataset action dimension "
+                "and pads/trims against max_action_dim."
+            ),
+        )
+        parser.add_argument(
+            "--xvla-max-state-dim",
+            type=int,
+            default=defaults.get("max_state_dim", 32),
+            help="State vectors shorter than this are padded before X-VLA.",
+        )
+        parser.add_argument(
+            "--xvla-max-action-dim",
+            type=int,
+            default=defaults.get("max_action_dim", 20),
+            help="Action vectors shorter than this are padded before X-VLA.",
+        )
+        parser.add_argument(
+            "--xvla-resize-imgs-with-padding",
+            type=parse_xvla_resize_imgs_with_padding,
+            default=defaults.get("resize_imgs_with_padding", None),
+            help=(
+                "Optional X-VLA image resize target as WIDTH,HEIGHT, "
+                "e.g. 224,224. Omit to keep dataset camera shapes."
+            ),
+        )
+        parser.add_argument(
+            "--xvla-num-image-views",
+            type=int,
+            default=defaults.get("num_image_views"),
+            help=(
+                "Number of image views exposed to X-VLA. Defaults to the dataset "
+                "camera count plus empty cameras."
+            ),
+        )
+        parser.add_argument(
+            "--xvla-empty-cameras",
+            type=int,
+            default=defaults.get("empty_cameras", 0),
+            help="Number of zero-filled placeholder cameras appended by X-VLA.",
+        )
+        parser.add_argument(
+            "--xvla-tokenizer-name",
+            type=str,
+            default=defaults.get("tokenizer_name", "facebook/bart-large"),
+            help="Tokenizer used for X-VLA language instructions.",
+        )
+        parser.add_argument(
+            "--xvla-tokenizer-max-length",
+            type=int,
+            default=defaults.get("tokenizer_max_length", 64),
+            help="Maximum language-token length for X-VLA instructions.",
+        )
+        parser.add_argument(
+            "--xvla-pad-language-to",
+            type=str,
+            choices=["longest", "max_length"],
+            default=defaults.get("pad_language_to", "max_length"),
+            help="Language tokenizer padding mode for X-VLA.",
+        )
+        parser.add_argument(
+            "--xvla-num-denoising-steps",
+            type=int,
+            default=defaults.get("num_denoising_steps", 10),
+            help="Flow-matching denoising steps used by X-VLA.",
+        )
+        xvla_proprio_group = parser.add_mutually_exclusive_group()
+        xvla_proprio_group.add_argument(
+            "--xvla-use-proprio",
+            dest="xvla_use_proprio",
+            action="store_true",
+            help="Require and use observation.state as X-VLA proprioception.",
+        )
+        xvla_proprio_group.add_argument(
+            "--xvla-disable-proprio",
+            dest="xvla_use_proprio",
+            action="store_false",
+            help="Train X-VLA without proprioceptive state input.",
+        )
+        parser.set_defaults(xvla_use_proprio=defaults.get("use_proprio", True))
+        xvla_vision_group = parser.add_mutually_exclusive_group()
+        xvla_vision_group.add_argument(
+            "--xvla-freeze-vision-encoder",
+            dest="xvla_freeze_vision_encoder",
+            action="store_true",
+            help="Freeze X-VLA's VLM vision encoder while fine-tuning.",
+        )
+        xvla_vision_group.add_argument(
+            "--xvla-unfreeze-vision-encoder",
+            dest="xvla_freeze_vision_encoder",
+            action="store_false",
+            help="Fine-tune X-VLA's VLM vision encoder.",
+        )
+        parser.set_defaults(
+            xvla_freeze_vision_encoder=defaults.get("freeze_vision_encoder", False)
+        )
+        xvla_language_group = parser.add_mutually_exclusive_group()
+        xvla_language_group.add_argument(
+            "--xvla-freeze-language-encoder",
+            dest="xvla_freeze_language_encoder",
+            action="store_true",
+            help="Freeze X-VLA's VLM language encoder while fine-tuning.",
+        )
+        xvla_language_group.add_argument(
+            "--xvla-unfreeze-language-encoder",
+            dest="xvla_freeze_language_encoder",
+            action="store_false",
+            help="Fine-tune X-VLA's VLM language encoder.",
+        )
+        parser.set_defaults(
+            xvla_freeze_language_encoder=defaults.get("freeze_language_encoder", False)
+        )
+        xvla_policy_transformer_group = parser.add_mutually_exclusive_group()
+        xvla_policy_transformer_group.add_argument(
+            "--xvla-train-policy-transformer",
+            dest="xvla_train_policy_transformer",
+            action="store_true",
+            help="Train X-VLA policy transformer layers.",
+        )
+        xvla_policy_transformer_group.add_argument(
+            "--xvla-freeze-policy-transformer",
+            dest="xvla_train_policy_transformer",
+            action="store_false",
+            help="Freeze X-VLA policy transformer layers.",
+        )
+        parser.set_defaults(
+            xvla_train_policy_transformer=defaults.get(
+                "train_policy_transformer", True
+            )
+        )
+        xvla_soft_prompt_group = parser.add_mutually_exclusive_group()
+        xvla_soft_prompt_group.add_argument(
+            "--xvla-train-soft-prompts",
+            dest="xvla_train_soft_prompts",
+            action="store_true",
+            help="Train X-VLA embodiment/domain soft prompts.",
+        )
+        xvla_soft_prompt_group.add_argument(
+            "--xvla-freeze-soft-prompts",
+            dest="xvla_train_soft_prompts",
+            action="store_false",
+            help="Freeze X-VLA embodiment/domain soft prompts.",
+        )
+        parser.set_defaults(
+            xvla_train_soft_prompts=defaults.get("train_soft_prompts", True)
+        )
+        parser.add_argument(
+            "--xvla-normalization-mapping",
+            type=parse_json_mapping,
+            default=defaults.get("normalization_mapping"),
+            help=(
+                "Optional JSON normalization mapping, e.g. "
+                "'{\"ACTION\":\"IDENTITY\",\"STATE\":\"IDENTITY\",\"VISUAL\":\"IDENTITY\"}'."
+            ),
+        )
+        parser.add_argument(
+            "--xvla-optimizer-lr",
+            type=float,
+            default=defaults.get("optimizer_lr", 1e-4),
+            help="X-VLA AdamW base learning rate.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-betas",
+            type=parse_xvla_optimizer_betas,
+            default=defaults.get("optimizer_betas", (0.9, 0.99)),
+            help="X-VLA AdamW betas as beta1,beta2.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-eps",
+            type=float,
+            default=defaults.get("optimizer_eps", 1e-8),
+            help="X-VLA AdamW epsilon.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-weight-decay",
+            type=float,
+            default=defaults.get("optimizer_weight_decay", 0.0),
+            help="X-VLA AdamW weight decay.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-grad-clip-norm",
+            type=float,
+            default=defaults.get("optimizer_grad_clip_norm", 10.0),
+            help="X-VLA optimizer gradient clipping norm.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-soft-prompt-lr-scale",
+            type=float,
+            default=defaults.get("optimizer_soft_prompt_lr_scale", 1.0),
+            help="Scale factor for X-VLA soft-prompt learning rate.",
+        )
+        parser.add_argument(
+            "--xvla-optimizer-soft-prompt-warmup-lr-scale",
+            type=float,
+            default=defaults.get("optimizer_soft_prompt_warmup_lr_scale"),
+            help="Optional starting LR scale for X-VLA soft-prompt warmup.",
+        )
+        parser.add_argument(
+            "--xvla-scheduler-warmup-steps",
+            type=int,
+            default=defaults.get("scheduler_warmup_steps", 1000),
+            help="X-VLA scheduler warmup steps.",
+        )
+        parser.add_argument(
+            "--xvla-scheduler-decay-steps",
+            type=int,
+            default=defaults.get("scheduler_decay_steps", 30000),
+            help="X-VLA scheduler cosine-decay steps.",
+        )
+        parser.add_argument(
+            "--xvla-scheduler-decay-lr",
+            type=float,
+            default=defaults.get("scheduler_decay_lr", 2.5e-6),
+            help="X-VLA scheduler final decay learning rate.",
+        )
     elif known_args.policy == "prism_diffusion":
         path_signature_group = parser.add_mutually_exclusive_group()
         path_signature_group.add_argument(
@@ -4720,6 +5164,8 @@ def main(argv: list[str] | None = None) -> None:
     elif args.policy == "prism_diffusion":
         ensure_prism_diffusion_importable(PROJECT_ROOT)
         ensure_streaming_act_importable(PROJECT_ROOT)
+    elif args.policy == "xvla":
+        install_xvla_transformers_compat_patch()
 
     ensure_lerobot_policy_imports(args.policy)
 
@@ -5164,6 +5610,12 @@ def main(argv: list[str] | None = None) -> None:
             input_features_override=input_features_override,
             output_features_override=output_features_override,
         )
+    elif args.policy == "xvla":
+        policy_cfg = build_xvla_policy_config(
+            args,
+            input_features_override=input_features_override,
+            output_features_override=output_features_override,
+        )
     else:
         ACTConfig = import_lerobot_policy_config_class("act")
         policy_cfg = ACTConfig(
@@ -5374,7 +5826,7 @@ def main(argv: list[str] | None = None) -> None:
             "drop_n_last_frames="
             f"{int(resolved_diffusion_drop_n_last_frames)}"
         )
-    elif args.policy in {"pi05", "smolvla"}:
+    elif args.policy in {"pi05", "smolvla", "xvla"}:
         print(
             "- action_execution: "
             f"n_obs_steps={int(args.n_obs_steps)}, "
@@ -5510,6 +5962,44 @@ def main(argv: list[str] | None = None) -> None:
             f"scheduler_warmup_steps={int(args.smolvla_scheduler_warmup_steps)}, "
             f"scheduler_decay_steps={int(args.smolvla_scheduler_decay_steps)}"
         )
+    elif args.policy == "xvla":
+        xvla_resize = None
+        if args.xvla_resize_imgs_with_padding is not None:
+            xvla_resize = tuple(
+                coerce_numeric_pair(
+                    args.xvla_resize_imgs_with_padding,
+                    option_name="--xvla-resize-imgs-with-padding",
+                    item_type=int,
+                )
+            )
+        print(
+            "- xvla: "
+            f"policy_path={args.policy_path or '<scratch>'}, "
+            f"dtype={args.xvla_dtype}, "
+            f"action_mode={args.xvla_action_mode}, "
+            f"max_state_dim={int(args.xvla_max_state_dim)}, "
+            f"max_action_dim={int(args.xvla_max_action_dim)}, "
+            f"resize_imgs_with_padding={xvla_resize}, "
+            f"num_image_views={args.xvla_num_image_views}, "
+            f"empty_cameras={int(args.xvla_empty_cameras)}, "
+            f"tokenizer_max_length={int(args.xvla_tokenizer_max_length)}, "
+            f"num_denoising_steps={int(args.xvla_num_denoising_steps)}"
+        )
+        print(
+            "- xvla_finetune: "
+            f"freeze_vision_encoder={bool(args.xvla_freeze_vision_encoder)}, "
+            f"freeze_language_encoder={bool(args.xvla_freeze_language_encoder)}, "
+            "train_policy_transformer="
+            f"{bool(args.xvla_train_policy_transformer)}, "
+            f"train_soft_prompts={bool(args.xvla_train_soft_prompts)}, "
+            f"optimizer_lr={float(args.xvla_optimizer_lr)}, "
+            "soft_prompt_lr_scale="
+            f"{float(args.xvla_optimizer_soft_prompt_lr_scale)}, "
+            f"scheduler_warmup_steps={int(args.xvla_scheduler_warmup_steps)}, "
+            f"scheduler_decay_steps={int(args.xvla_scheduler_decay_steps)}"
+        )
+        if args.xvla_normalization_mapping is not None:
+            print(f"- xvla_normalization_mapping: {args.xvla_normalization_mapping}")
     elif args.policy in {"diffusion", "prism_diffusion"}:
         print(
             "- diffusion: "

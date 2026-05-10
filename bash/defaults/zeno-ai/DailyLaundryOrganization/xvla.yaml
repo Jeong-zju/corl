@@ -1,0 +1,93 @@
+# X-VLA defaults for zeno-ai/DailyLaundryOrganization.
+train:
+  dataset_root: "data/zeno-ai/DailyLaundryOrganization"
+  dataset_repo_id: "zeno-ai/DailyLaundryOrganization"
+  output_root: "outputs/train/zeno-ai/DailyLaundryOrganization/xvla"
+  resume: false
+  job_name: "xvla"
+  wandb_project: "DailyLaundryOrganization"
+  wandb_mode: "online"
+  device: "cuda"
+  use_amp: true
+  amp_dtype: "bf16"
+  distributed:
+    enabled: false
+    launcher: "accelerate"
+    num_processes: 1
+    gpu_ids: "all"
+    num_machines: 1
+    machine_rank: 0
+    main_process_ip: null
+    main_process_port: null
+  # Keep the official LeRobot X-VLA fine-tuning path on a single RTX 5090:
+  # bf16 weights/AMP, batch size 1, and a shorter action chunk than the
+  # upstream 32-step recipe while still training the VLM, transformer, and
+  # soft prompts as recommended by the X-VLA docs.
+  steps: 50000
+  batch_size: 1
+  num_workers: 8
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 2
+  video_backend: "torchcodec"
+  torch_sharing_strategy: "file_system"
+  torchcodec_decoder_cache_size: 16
+  seed: 42
+  log_freq: 100
+  save_freq: 10000
+  eval_freq: -1
+  test_ratio: 0
+  split_seed: 42
+  split_shuffle: true
+  chunk_size: 16
+  n_action_steps: 16
+  n_obs_steps: 1
+  enable_wandb: true
+  wandb_console: "off"
+  wandb_service_wait: 10
+
+  policy_path: "lerobot/xvla-base"
+  dtype: "bfloat16"
+  action_mode: "auto"
+  max_state_dim: 32
+  max_action_dim: 20
+  resize_imgs_with_padding: null
+  num_image_views: null
+  empty_cameras: 0
+  tokenizer_name: "facebook/bart-large"
+  tokenizer_max_length: 64
+  pad_language_to: "max_length"
+  num_denoising_steps: 10
+  use_proprio: true
+  freeze_vision_encoder: false
+  freeze_language_encoder: false
+  train_policy_transformer: true
+  train_soft_prompts: true
+  normalization_mapping:
+    VISUAL: "IDENTITY"
+    STATE: "IDENTITY"
+    ACTION: "IDENTITY"
+  optimizer_lr: 0.0001
+  optimizer_betas:
+    - 0.9
+    - 0.99
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 0.0
+  optimizer_grad_clip_norm: 10.0
+  optimizer_soft_prompt_lr_scale: 1.0
+  optimizer_soft_prompt_warmup_lr_scale: null
+  scheduler_warmup_steps: 1000
+  scheduler_decay_steps: 30000
+  scheduler_decay_lr: 2.5e-06
+
+eval:
+  train_output_root: "outputs/train/zeno-ai/DailyLaundryOrganization/xvla"
+  output_dir: "outputs/eval/zeno-ai/DailyLaundryOrganization/xvla/{run_tag}"
+  eval_split: "test"
+  test_ratio: 0.2
+  split_seed: 42
+  split_shuffle: true
+  max_episodes: 20
+  max_steps_per_episode: null
+  seed: 42
+  device: "cuda"
+  n_action_steps: 16

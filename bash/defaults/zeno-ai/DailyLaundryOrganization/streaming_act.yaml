@@ -19,10 +19,9 @@ train:
     machine_rank: 0
     main_process_ip: null
     main_process_port: null
-  # 60 episodes / 133,188 frames is smaller than the larger BookOrigin and
-  # CleanTableTop datasets, but the public-prefix branch still needs explicit
-  # path/delta memory. Keep a long prefix window so the source drawer cue is
-  # preserved through the shared table-side organization phase.
+  # This task is a binary source-branch problem with a long shared middle.
+  # Keep the route memory focused on source-to-center motion and give the
+  # slot router enough capacity to separate source identity from later phases.
   steps: 180000
   batch_size: 8
   num_workers: 8
@@ -47,25 +46,27 @@ train:
   use_delta_signature: true
   use_prefix_sequence_training: true
   prefix_train_max_steps: 32
-  prefix_frame_stride: 6
+  prefix_frame_stride: 4
   prefix_pad_value: 0.0
   use_visual_prefix_memory: true
   use_signature_conditioned_visual_prefix_memory: false
   use_signature_indexed_slot_memory: true
   use_memory_conditioned_encoder_film: true
   num_memory_slots: 1
-  slot_memory_num_slots: 4
+  slot_memory_num_slots: 6
   slot_memory_routing_hidden_dim: 512
   slot_memory_identity_scale: 0.5
-  slot_memory_routing_temperature: 1.0
+  slot_memory_routing_temperature: 0.7
   slot_memory_use_delta_routing: true
   use_first_frame_anchor_in_slot_routing: true
   slot_memory_use_softmax_routing: true
   slot_memory_use_readout_pooling: true
-  slot_memory_balance_loss_coef: 0.02
-  slot_memory_entropy_loss_coef: 0.003
-  slot_memory_consistency_loss_coef: 0.0
-  history_length: 0
+  slot_memory_balance_loss_coef: 0.05
+  slot_memory_entropy_loss_coef: 0.01
+  slot_memory_consistency_loss_coef: 0.003
+  # A finite signature window keeps routing sensitive to the source-side move,
+  # while the first-frame anchor still preserves the initial cue.
+  history_length: 128
   signature_dim: 0
   signature_depth: 3
   signature_hidden_dim: 512

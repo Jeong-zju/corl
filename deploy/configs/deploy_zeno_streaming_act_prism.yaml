@@ -2,11 +2,12 @@ policy:
   type: streaming_act
   # path: ../../outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism/20260502_164154/checkpoints/050000
   # path: ../../outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism/20260503_115336/checkpoints/030000
-  path: ../../outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism/20260504_103716/checkpoints/360000
+  # path: ../../outputs/train/zeno-ai/BookOriginRelocation/streaming-act-prism/20260504_103716/checkpoints/360000
+  path: ../../outputs/train/zeno-ai/DailyLaundryOrganization/streaming-act-prism/20260507_232327/checkpoints/160000
   device: cuda
   load_device: null
-  n_action_steps: 1
-  temporal_ensemble_coeff: 0.0025
+  n_action_steps: 100
+  temporal_ensemble_coeff: 0.01
   state_dim: 17
   action_dim: 17
   arm_dof: 7

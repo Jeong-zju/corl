@@ -16,6 +16,7 @@ _LEROBOT_POLICY_SUBPACKAGES_BY_TYPE = {
     "pi0": "pi0",
     "pi05": "pi05",
     "smolvla": "smolvla",
+    "xvla": "xvla",
 }
 
 _LEROBOT_POLICY_SUBPACKAGE_DEPENDENCIES = {
@@ -32,6 +33,7 @@ _LEROBOT_FACTORY_CONFIG_SUBPACKAGES = (
     "pi0",
     "pi05",
     "rtc",
+    "xvla",
 )
 
 
@@ -193,6 +195,11 @@ def ensure_lerobot_policy_imports(policy_type: str) -> None:
         # need side effects that would normally happen through package imports.
         importlib.import_module("lerobot.policies.pi05.processor_pi05")
         install_pi05_checkpoint_compatibility_patch()
+    elif policy_type == "xvla":
+        # X-VLA pretrained processor pipelines reference custom registry steps.
+        # Keep this import active-policy-only because it can pull the optional
+        # X-VLA dependency stack.
+        importlib.import_module("lerobot.policies.xvla.processor_xvla")
 
 
 def import_lerobot_policy_submodule(policy_type: str, module_name: str):
@@ -225,6 +232,10 @@ def import_lerobot_policy_config_class(policy_type: str):
         from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
         return SmolVLAConfig
+    if policy_type == "xvla":
+        from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+
+        return XVLAConfig
     raise ValueError(f"Unsupported LeRobot policy type: {policy_type!r}")
 
 

@@ -4,7 +4,9 @@ import datetime as dt
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -14,8 +16,11 @@ sys.path.insert(0, str(REPO_ROOT / "main" / "scripts"))
 from policy_defaults import load_policy_mode_defaults_for_dataset
 from policy_imports import ensure_lerobot_policy_imports
 from train_policy import (
+    build_xvla_policy_config,
     build_smolvla_policy_config,
     fresh_distributed_output_marker_matches,
+    install_xvla_transformers_compat_patch,
+    load_xvla_policy_config_from_pretrained,
     parse_args,
     register_lerobot_fresh_distributed_output_reservation,
     reserve_fresh_distributed_output_dir,
@@ -168,6 +173,124 @@ def test_build_smolvla_policy_config_maps_policy_path_to_pretrained_path(
     assert "policy_path" not in constructor_kwargs
     assert policy_cfg.pretrained_path == Path("lerobot/smolvla_base")
     assert constructor_kwargs["push_to_hub"] is False
+
+
+def test_build_xvla_policy_config_maps_official_defaults_to_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_kwargs: dict[str, object] = {}
+
+    class DummyXVLAConfig:
+        def __init__(self, **kwargs):
+            constructor_kwargs.update(kwargs)
+            self.pretrained_path = None
+            self.florence_config = kwargs.get("florence_config", {})
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    load_calls: list[object] = []
+
+    def fake_load_xvla_policy_config_from_pretrained(
+        config_cls,
+        pretrained_name_or_path,
+    ):
+        load_calls.append(pretrained_name_or_path)
+        return DummyXVLAConfig(
+            florence_config={
+                "vision_config": {"model_type": "davit"},
+                "text_config": {"model_type": "bart"},
+            }
+        )
+
+    monkeypatch.setattr(
+        "train_policy.import_lerobot_policy_config_class",
+        lambda policy_type: DummyXVLAConfig,
+    )
+    monkeypatch.setattr(
+        "train_policy.load_xvla_policy_config_from_pretrained",
+        fake_load_xvla_policy_config_from_pretrained,
+    )
+
+    args = parse_args(
+        [
+            "--dataset",
+            "local_xvla_smoke",
+            "--policy",
+            "xvla",
+        ]
+    )
+
+    policy_cfg = build_xvla_policy_config(
+        args,
+        input_features_override={"observation.state": {"shape": [1]}},
+        output_features_override={"action": {"shape": [1]}},
+    )
+
+    assert load_calls == [Path("lerobot/xvla-base")]
+    assert policy_cfg.pretrained_path == Path("lerobot/xvla-base")
+    assert policy_cfg.push_to_hub is False
+    assert policy_cfg.dtype == "bfloat16"
+    assert policy_cfg.action_mode == "auto"
+    assert policy_cfg.chunk_size == 32
+    assert policy_cfg.n_action_steps == 32
+    assert policy_cfg.train_soft_prompts is True
+    assert policy_cfg.florence_config == {
+        "vision_config": {"model_type": "davit"},
+        "text_config": {"model_type": "bart"},
+    }
+
+
+def test_load_xvla_policy_config_from_pretrained_strips_type_and_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class DummyXVLAConfig:
+        foo: int = 0
+
+    pretrained_dir = tmp_path / "pretrained"
+    pretrained_dir.mkdir(parents=True, exist_ok=True)
+    (pretrained_dir / "config.json").write_text(
+        json.dumps({"type": "streaming_act", "foo": 7, "extra": 123}),
+        encoding="utf-8",
+    )
+
+    cfg = load_xvla_policy_config_from_pretrained(DummyXVLAConfig, pretrained_dir)
+
+    assert cfg.foo == 7
+    assert not hasattr(cfg, "extra")
+
+
+def test_install_xvla_transformers_compat_patch_backfills_flash_attn_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_utils = ModuleType("transformers.utils")
+
+    calls: list[str] = []
+
+    def fake_is_flash_attn_greater_or_equal(version: str) -> bool:
+        calls.append(version)
+        return version == "2.1.0"
+
+    fake_transformers_utils.is_flash_attn_greater_or_equal = (
+        fake_is_flash_attn_greater_or_equal
+    )
+    fake_transformers.utils = fake_transformers_utils
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_transformers_utils)
+
+    install_xvla_transformers_compat_patch()
+
+    helper = getattr(
+        fake_transformers_utils,
+        "is_flash_attn_greater_or_equal_2_10",
+        None,
+    )
+    assert callable(helper)
+    assert helper() is True
+    assert calls == ["2.1.0"]
 
 
 def test_ensure_lerobot_policy_imports_registers_smolvla_processor_step() -> None:
